@@ -1,0 +1,18 @@
+# Allowlist: only what the container needs goes into the build context — the
+# Python packages, the configs and the entrypoint. Datasets and results are
+# mounted at run time (docker-compose.yml); everything else stays on the host.
+*
+!config.example.toml
+!configs/
+!dataset_preprocessor/
+!models/
+!predict/
+!train/
+!utils/
+!docker/entrypoint.sh
+!pyproject.toml
+
+# Python caches inside the included folders
+**/__pycache__
+**/*.pyc
+**/*.pyo

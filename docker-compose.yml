@@ -1,0 +1,41 @@
+# ============================================================
+# CrashDefNet — deforming_plate GPU training (Docker Desktop / WSL2 / Linux)
+# ============================================================
+#   docker compose build                          # build the image (no dataset inside)
+#   docker compose up                             # train on an existing dataset
+#   docker compose run --rm train --epochs 50     # extra arguments for train.py
+#
+# The dataset is NOT built inside the container but mounted from the host.
+# The host folder (with dataset.db, metadata.json, normalizer.json) is set as
+# DATASET_DIR in the .env file next to this file (template: .env.example):
+#   cp .env.example .env   # then adjust DATASET_DIR
+# See docs/docker.md for export and rollout inside the container.
+# ============================================================
+services:
+  train:
+    build: .
+    image: crashdefnet-deforming-plate:latest
+    environment:
+      DATA_DIR: "/data"
+      CONFIG: "${CONFIG:-config.example.toml}"   # selectable in .env, e.g. configs/my_run.toml
+      DEVICE: "auto"         # overrides [training].device of the TOML
+      # Against memory fragmentation: the number of contact edges varies per
+      # sample, otherwise the reserved VRAM grows towards the worst case.
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+    volumes:
+      # Existing dataset on the host (passed to train.py as --data-dir)
+      - ${DATASET_DIR:-./data/deforming_plate_s10_small}:/data
+      # Training results (checkpoints, best_model.pt, logs) end up on the host
+      - ./checkpoints:/app/checkpoints
+      # Rollout results, when predict/rollout.py is run in the container
+      - ./rollouts:/app/rollouts
+      # Own configs (folder configs/) can be edited without a rebuild
+      - ./configs:/app/configs
+    shm_size: "2gb"          # DataLoader workers need /dev/shm
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

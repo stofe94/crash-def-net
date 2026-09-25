@@ -1,0 +1,54 @@
+cff-version: 1.2.0
+message: "If you use CrashDefNet, please cite it as below."
+title: "CrashDefNet: Learned Deformation Prediction on Simulation Meshes"
+type: software
+authors:
+  - family-names: Stocker
+    given-names: Felix
+    email: felix.stocker@sto-eng.de
+version: 0.1.0
+date-released: "2026-09-24"
+license: Apache-2.0
+repository-code: "https://github.com/stofe94/crash-def-net"
+abstract: >-
+  CrashDefNet is a deep-learning tool for predicting structural deformation from
+  finite element simulations. It covers the chain from raw simulation data to the
+  predicted deformation and implements MeshGraphNet and the
+  MeshGraphNet-Transformer (MGN-T) in one pipeline, evaluated with the metrics of
+  the MGN-T paper on DeepMind's deforming_plate benchmark.
+keywords:
+  - graph neural networks
+  - MeshGraphNet
+  - MeshGraphNet-Transformer
+  - crash simulation
+  - CAE
+  - finite element method
+  - surrogate model
+references:
+  - type: conference-paper
+    title: "Learning Mesh-Based Simulation with Graph Networks"
+    authors:
+      - family-names: Pfaff
+        given-names: Tobias
+      - family-names: Fortunato
+        given-names: Meire
+      - family-names: Sanchez-Gonzalez
+        given-names: Alvaro
+      - family-names: Battaglia
+        given-names: Peter W.
+    collection-title: "International Conference on Learning Representations (ICLR)"
+    year: 2021
+    url: "https://arxiv.org/abs/2010.03409"
+  - type: article
+    title: "MeshGraphNet-Transformer: Scalable Mesh-Based Learned Simulation for Solid Mechanics"
+    authors:
+      - family-names: Iparraguirre
+        given-names: M. M.
+      - family-names: Alfaro
+        given-names: I.
+      - family-names: González
+        given-names: D.
+      - family-names: Cueto
+        given-names: E.
+    year: 2026
+    url: "https://arxiv.org/abs/2601.23177"

@@ -1,0 +1,98 @@
+# ============================================================
+# CrashDefNet — example training config (deforming_plate)
+# ============================================================
+# A small setup that trains on a CPU in minutes and runs every stage of the
+# pipeline: loading, training, rollout validation, early stopping,
+# checkpoints and test metrics. Accuracy is not the goal here.
+#
+# Dataset (small set, ~3 s, ~10 MB):
+#   python -m dataset_preprocessor.export
+# Training:
+#   python train/train.py --config config.example.toml
+#
+# For your own experiments copy this file (e.g. to configs/my_run.toml) and
+# adapt it. Values of the papers are given in the comments; see
+# docs/training.md for every key. Unknown keys are reported at start-up.
+# ============================================================
+
+[data]
+data_dir               = "data/deforming_plate_s10_small"   # folder written by the exporter
+num_dataloader_workers = 0       # CPU: 0; GPU: 2-4 (build graphs in worker processes)
+lazy                   = false   # true: read frames from dataset.db on access (large datasets)
+
+[model]
+architecture    = "meshgraphnet" # "meshgraphnet" or "mgn_t" (MeshGraphNet-Transformer)
+residual_target = false          # true: predict the change w.r.t. *_prev (needs --history 1)
+
+[model.meshgraphnet]
+# Paper (Pfaff et al. 2021): latent_size 128, 15 message passing steps.
+latent_size               = 64
+num_mlp_layers            = 2
+num_message_passing_steps = 8
+aggregation               = "sum"
+
+[model.mgn_t]
+# Paper (Iparraguirre et al. 2026, Tab. 2): 2+2 message passing steps,
+# 2 transformer blocks, 4 heads, 128 tokens, widths 64-32-64.
+latent_size            = 64
+token_dim              = 32
+num_tokens             = 128
+num_heads              = 4
+num_transformer_blocks = 2
+num_pre_mp_steps       = 2
+num_post_mp_steps      = 2
+num_mlp_layers         = 2
+aggregation            = "sum"
+pe_frequencies         = 8       # not given in the paper (see models/mgn_t.py)
+ffn_ratio              = 4       # not given in the paper
+tau_init               = 0.5     # not given in the paper
+
+[training]
+epochs        = 5
+batch_size    = 2        # paper: 2
+learning_rate = 1e-4     # paper: 1e-4
+weight_decay  = 0.0
+max_grad_norm = 1.0      # gradient clipping (not in the paper)
+seed          = 42
+device        = "auto"   # auto | cpu | cuda
+
+[training.scheduler]
+# Paper: exponential decay 1e-4 -> 1e-6. "auto" spreads the decay over the
+# whole run (epochs x optimizer steps per epoch).
+type        = "exponential"  # exponential | plateau | cosine | none
+min_lr      = 1e-6
+decay_steps = "auto"
+
+[training.rollout_validation]
+# Select the best model by the error of a full rollout on the val split
+# instead of the single-step val loss.
+enabled          = true
+every_n_epochs   = 1
+selection_metric = "pos_rmse"   # mse | pos_rmse | pos_rmse_final
+# max_sequences  = 4            # optional: roll out only the first N val sequences
+
+[training.early_stopping]
+# patience and the windows count evaluations, min_epochs counts epochs.
+enabled              = true
+patience             = 8
+min_delta            = 1e-4
+min_epochs           = 12
+smoothing_window     = 1
+efficiency_window    = 8
+efficiency_threshold = 0.1
+gap_weight           = 0.5
+
+[loss]
+type = "mse"             # mse | mae | huber | smooth_l1
+
+[noise]
+world_noise_std = 3e-3   # paper: 3e-3 m on the positions of the free nodes
+
+[scheduled_sampling]
+enabled = false          # needs --history 1; not in the paper
+
+[checkpointing]
+checkpoint_dir = "checkpoints/example_run"
+save_every     = 5       # checkpoint_epoch_N.pt every N epochs (best_model.pt always)
+log_every      = 1
+resume         = ""      # path to a checkpoint to continue training from

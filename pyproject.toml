@@ -1,0 +1,108 @@
+# ============================================================
+# CrashDefNet — graph neural networks for structural deformation prediction
+# ============================================================
+#
+# Installation:
+#   Option A (conda, recommended):
+#     conda env create -f environment.yml
+#     conda activate crashdefnet
+#
+#   Option B (pip, plain venv):
+#     python -m venv .venv && source .venv/bin/activate
+#     pip install -r requirements.txt      # GPU: requirements-gpu.txt
+#     pip install -e ".[dev]"
+# ============================================================
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crashdefnet"
+version = "0.1.0"
+description = "Graph neural networks (MeshGraphNet, MeshGraphNet-Transformer) that predict structural deformation from simulation data"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10,<3.13"
+
+authors = [
+    {name = "Felix Stocker", email = "felix.stocker@sto-eng.de"},
+]
+
+keywords = [
+    "graph-neural-network", "meshgraphnet", "transformer", "mgn-t",
+    "deforming-plate", "deformation-prediction", "crash-simulation", "cae",
+    "pytorch-geometric", "finite-element",
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# ── Core Dependencies ────────────────────────────────────────
+# PyTorch and torch-geometric are NOT listed here because their
+# installation depends on the platform / CUDA version.
+# See requirements.txt or environment.yml.
+dependencies = [
+    "numpy>=1.24,<3.0",
+    "tfrecord",
+    "toml>=0.10",
+    "tqdm>=4.60",
+]
+
+[project.urls]
+Repository = "https://github.com/stofe94/crash-def-net"
+Documentation = "https://github.com/stofe94/crash-def-net/tree/main/docs"
+
+# ── Optional Dependencies ────────────────────────────────────
+[project.optional-dependencies]
+# PyTorch + PyG (CPU or CUDA depending on the index URL, see requirements*.txt)
+torch = [
+    "torch>=2.6",
+    "torch-geometric>=2.5",
+]
+# .vtu export of the rollout, loss curves, paper comparison
+viz = [
+    "pyvista>=0.43",
+    "matplotlib>=3.7",
+]
+# Development / testing
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+]
+all = [
+    "crashdefnet[torch,viz,dev]",
+]
+
+[project.scripts]
+crashdefnet-export-dp = "dataset_preprocessor.export:main"
+
+# ── Package Discovery ────────────────────────────────────────
+[tool.setuptools.packages.find]
+include = [
+    "dataset_preprocessor*",
+    "models*",
+    "train*",
+    "predict*",
+    "utils*",
+]
+
+# ── Tool Configuration ───────────────────────────────────────
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+python_files = ["test_*.py"]

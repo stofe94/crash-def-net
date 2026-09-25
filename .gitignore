@@ -1,0 +1,22 @@
+# Raw data, exported datasets and results (not versioned)
+datasets/
+data/
+checkpoints/
+rollouts/
+evaluations/
+test/
+
+# Papers are kept locally next to the docs, but not redistributed
+docs/*.pdf
+
+# Python
+*.pyc
+__pycache__/
+
+# Editor and misc
+.vscode/
+*x_*.txt
+*.tar.gz
+
+# Machine-specific docker compose settings (template: .env.example)
+.env
