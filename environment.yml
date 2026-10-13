@@ -1,0 +1,36 @@
+# ============================================================
+# CrashDefNet — conda environment
+# ============================================================
+#
+# Create:   conda env create -f environment.yml
+# Activate: conda activate crashdefnet
+# Update:   conda env update -f environment.yml --prune
+# Remove:   conda env remove -n crashdefnet
+#
+# conda -> Python, numpy, utilities
+# pip   -> PyTorch, PyG, tfrecord, pyvista, matplotlib (packages with C++
+#          extensions come from one source only; mixing conda and pip builds
+#          causes libstdc++ ABI conflicts on Linux/WSL, e.g. when matplotlib
+#          is imported after torch)
+# ============================================================
+
+name: crashdefnet
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.12
+  - numpy>=1.24
+  - tqdm>=4.60
+  - pip>=23.0
+  - pip:
+      # --- PyTorch CPU (GPU: change the index URL to .../whl/cu126) ---
+      - --extra-index-url https://download.pytorch.org/whl/cpu
+      - torch>=2.6
+      - torch-geometric>=2.5
+      - tfrecord
+      - toml>=0.10
+      # --- optional: .vtu export of the rollout ---
+      - pyvista>=0.43
+      # --- optional: loss curves and paper comparison ---
+      - matplotlib>=3.7
