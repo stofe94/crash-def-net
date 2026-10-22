@@ -1,11 +1,12 @@
 # ============================================================
 # CrashDefNet — example training config (deforming_plate)
 # ============================================================
-# A small setup that trains on a CPU in minutes and runs every stage of the
-# pipeline: loading, training, rollout validation, early stopping,
-# checkpoints and test metrics. Accuracy is not the goal here.
+# MGN-T in a minimal size that trains on a CPU in about two minutes (5 epochs
+# of ~25 s) and runs every stage of the pipeline: loading, training, rollout
+# validation, early stopping, checkpoints and test metrics. Accuracy is not
+# the goal here. For MeshGraphNets set [model] architecture = "meshgraphnets".
 #
-# Dataset (small set, ~3 s, ~10 MB):
+# Dataset (small set, ~3 s, ~11 MB):
 #   python -m dataset_preprocessor.export
 # Training:
 #   python train/train.py --config config.example.toml
@@ -19,32 +20,40 @@
 data_dir               = "data/deforming_plate_s10_small"   # folder written by the exporter
 num_dataloader_workers = 0       # CPU: 0; GPU: 2-4 (build graphs in worker processes)
 lazy                   = false   # true: read frames from dataset.db on access (large datasets)
+# static_cache_mb      = 1024    # lazy: static graph data kept per process (MB)
 
 [model]
-architecture    = "meshgraphnet" # "meshgraphnet" or "mgn_t" (MeshGraphNet-Transformer)
+architecture    = "mgn_t"        # "mgn_t" (MeshGraphNet-Transformer) or "meshgraphnets"
 residual_target = false          # true: predict the change w.r.t. *_prev (needs --history 1)
+world_edges     = "self_contact_aware"   # contact between bodies and self-contact (MGN-T paper v4);
+                                        # "all" (MeshGraphNets paper) | "contact" (docs/data.md)
+world_edge_exclude_hops = 4      # self_contact_aware: pairs up to this many mesh edges apart get none
 
-[model.meshgraphnet]
-# Paper (Pfaff et al. 2021): latent_size 128, 15 message passing steps.
+[model.meshgraphnets]
+# Paper (Pfaff et al. 2021): latent_size 128, 15 message passing steps. The
+# values below train on a CPU too, at ~2 min per epoch (docs/installation.md).
 latent_size               = 64
 num_mlp_layers            = 2
 num_message_passing_steps = 8
 aggregation               = "sum"
 
 [model.mgn_t]
-# Paper (Iparraguirre et al. 2026, Tab. 2): 2+2 message passing steps,
-# 2 transformer blocks, 4 heads, 128 tokens, widths 64-32-64.
-latent_size            = 64
-token_dim              = 32
-num_tokens             = 128
-num_heads              = 4
-num_transformer_blocks = 2
-num_pre_mp_steps       = 2
-num_post_mp_steps      = 2
+# Paper (Iparraguirre et al. 2026, arXiv v4, Sec. 3.2 / 5.1): 2+2 message passing
+# steps, 2 transformer blocks, 4 heads, 16 tokens for deforming_plate; widths
+# 64-32-64 in v3 (Tab. 2). Smaller widths and 1+1 steps here (~50 k parameters),
+# so that it trains quickly on a CPU.
+latent_size            = 32      # v3: 64
+token_dim              = 16      # v3: 32
+num_tokens             = 16      # paper v4
+num_heads              = 4       # paper
+num_transformer_blocks = 2       # paper
+num_pre_mp_steps       = 1       # paper: 2
+num_post_mp_steps      = 1       # paper: 2
 num_mlp_layers         = 2
 aggregation            = "sum"
 pe_frequencies         = 8       # not given in the paper (see models/mgn_t.py)
 ffn_ratio              = 4       # not given in the paper
+transformer_nodes      = "structure"   # paper: global stage without the actuator; "all" = every node
 tau_init               = 0.5     # not given in the paper
 
 [training]
@@ -64,23 +73,24 @@ min_lr      = 1e-6
 decay_steps = "auto"
 
 [training.rollout_validation]
-# Select the best model by the error of a full rollout on the val split
-# instead of the single-step val loss.
+# Roll out the val split every N epochs; its errors become selection criteria.
 enabled          = true
 every_n_epochs   = 1
-selection_metric = "pos_rmse"   # mse | pos_rmse | pos_rmse_final
 # max_sequences  = 4            # optional: roll out only the first N val sequences
 
 [training.early_stopping]
-# patience and the windows count evaluations, min_epochs counts epochs.
-enabled              = true
-patience             = 8
-min_delta            = 1e-4
-min_epochs           = 12
-smoothing_window     = 1
-efficiency_window    = 8
-efficiency_threshold = 0.1
-gap_weight           = 0.5
+# Model selection and early stopping (docs/training.md). At every evaluation the
+# criteria are recorded; the selected model is the evaluation closest to the
+# best value in all of them at once. Training stops after `patience` evaluations
+# without a new low in any criterion (patience counts evaluations, min_epochs
+# epochs). The rules are tuned to deforming_plate with a small val split: check
+# and adapt them for your own data.
+enabled         = true  # false: train all epochs, the selection still applies
+patience        = 8
+min_epochs      = 12
+# val_loss | rollout_mse | rollout_pos_rmse | rollout_pos_rmse_final;
+# one entry = selection by that metric
+criteria        = ["val_loss", "rollout_mse", "rollout_pos_rmse", "rollout_pos_rmse_final"]
 
 [loss]
 type = "mse"             # mse | mae | huber | smooth_l1

@@ -19,8 +19,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crashdefnet"
-version = "0.2.0"
-description = "Graph neural networks (MeshGraphNet, MeshGraphNet-Transformer) that predict structural deformation from simulation data"
+version = "0.3.0"
+description = "Graph neural networks (MeshGraphNets, MeshGraphNet-Transformer) that predict structural deformation from simulation data"
 readme = "README.md"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10,<3.13"
@@ -30,7 +30,7 @@ authors = [
 ]
 
 keywords = [
-    "graph-neural-network", "meshgraphnet", "transformer", "mgn-t",
+    "graph-neural-network", "meshgraphnets", "transformer", "mgn-t",
     "deforming-plate", "deformation-prediction", "crash-simulation", "cae",
     "pytorch-geometric", "finite-element",
 ]
@@ -68,10 +68,14 @@ torch = [
     "torch>=2.6",
     "torch-geometric>=2.5",
 ]
-# .vtu export of the rollout, loss curves, paper comparison
+# .vtu export of the rollout, VTK raw format, loss curves, paper comparison, rollout animation
 viz = [
     "pyvista>=0.43",
     "matplotlib>=3.7",
+]
+# LS-DYNA runs as second raw format (tfrecord_to_d3plot.py, d3plot_reader.py)
+d3plot = [
+    "lasso-python>=2.0",
 ]
 # Development / testing
 dev = [

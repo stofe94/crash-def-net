@@ -12,6 +12,8 @@ docs/*.pdf
 # Python
 *.pyc
 __pycache__/
+.ruff_cache/
+.pytest_cache/
 
 # Editor and misc
 .vscode/
@@ -20,3 +22,5 @@ __pycache__/
 
 # Machine-specific docker compose settings (template: .env.example)
 .env
+
+

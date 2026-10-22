@@ -98,10 +98,10 @@ Copy the dataset folder separately. Alternatively copy the repository and run
 
 ## Memory hints
 
-- **VRAM:** the model of `config.example.toml` (~0.5 M parameters) fits into 4 GB at batch 2.
-  MeshGraphNet at paper size needs ~5–6 GB at batch 2 and ~15 GB at batch 4. MGN-T needs
-  considerably less. Per graph there are ~1,300 nodes, ~13 k mesh edges and up to
-  ~19 k world edges; memory grows with the batch size. `PYTORCH_CUDA_ALLOC_CONF` in
+- **VRAM:** the model of `config.example.toml` (MGN-T in a minimal size, ~50 k parameters) fits into 4 GB at batch 2.
+  MeshGraphNets at paper size needs ~5–6 GB at batch 2 and ~15 GB at batch 4. MGN-T needs
+  considerably less. Per graph there are ~1,300 nodes, ~13 k mesh edges and, with
+  `world_edges = "all"`, ~21 k world edges (up to ~40 k); memory grows with the batch size. `PYTORCH_CUDA_ALLOC_CONF` in
   `docker-compose.yml` counters fragmentation caused by the varying number of contact
   edges.
 - **RAM:** the dataset is held once in shared memory (`shm_size` 2 GB); each DataLoader

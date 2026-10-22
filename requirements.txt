@@ -31,3 +31,6 @@ pyvista>=0.43,<1.0
 # Optional: loss curves and paper comparison (utils/plot_losses.py,
 # utils/compare_paper.py)
 matplotlib>=3.7
+
+# Optional, not installed by default: raw data as LS-DYNA d3plot
+# (dataset_preprocessor/tfrecord_to_d3plot.py, d3plot_reader.py). pip install lasso-python

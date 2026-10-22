@@ -27,13 +27,13 @@ know the feature layout. `data` is a (batched) PyTorch Geometric graph with
 |---|---|---|
 | `x` | (N, node_in_dim) | normalized node features |
 | `edge_index`, `edge_attr` | (2, E_M), (E_M, mesh_edge_in_dim) | mesh edges and their normalized features |
-| `world_edge_index`, `world_edge_attr` | (2, E_W), (E_W, world_edge_in_dim) | contact edges; may be empty |
+| `world_edge_index`, `world_edge_attr` | (2, E_W), (E_W, world_edge_in_dim) | contact edges in the variant of `[model] world_edges`; may be empty |
 | `mesh_pos` | (N, 3) | undeformed positions (e.g. for positional encodings) |
 | `world_pos` | (N, 3) | current positions, raw units |
 | `batch` | (N,) | graph index of each node; missing for a single graph (e.g. in the rollout) |
 
 Details of the features: [data.md](data.md). The building blocks of the existing models
-can be reused, e.g. `make_mlp` and `GraphNetBlock` from `models/meshgraphnet.py`.
+can be reused, e.g. `make_mlp` and `GraphNetBlock` from `models/meshgraphnets.py`.
 
 ## 2. The config (`train/config.py`)
 
@@ -69,8 +69,9 @@ model summary at the start of `Trainer.train`.
 
 ## 4. Display name (optional)
 
-`ARCHITECTURE_NAMES` in `utils/compare_paper.py` sets the name used in the figures and
-tables of the comparison report (default: the architecture key).
+`ARCHITECTURE_NAMES` sets the name shown for the architecture (default: its key): in
+`utils/compare_paper.py` and `utils/check_protocol.py` the short name in the figures,
+tables and reports, in `utils/animate_rollout.py` the panel title of the animation.
 
 ## Testing the new architecture
 
@@ -78,11 +79,20 @@ tables of the comparison report (default: the architecture key).
 # quick check on the CPU with the small dataset (architecture = "my_model" in the config)
 python train/train.py --config configs/my_model.toml --epochs 1
 
-# full comparison: train, roll out and compare with MeshGraphNet and the paper
+# full comparison with MeshGraphNets under the comparison protocol:
+# copy protocols/deforming_plate_s8_t40.toml, change only [model], train, roll out
+python train/train.py --config configs/my_model_s8_t40.toml
 python predict/rollout.py --checkpoint checkpoints/<run>/best_model.pt \
-    --data-dir data/<dataset> --split test
-python utils/compare_paper.py rollouts/<my_model rollout> rollouts/<mgn rollout>
+    --data-dir data/deforming_plate_s8_t40 --split test
+python utils/check_protocol.py rollouts/<mgn rollout> rollouts/<my_model rollout> \
+    --exclude test_traj0038
+python utils/compare_paper.py rollouts/<my_model rollout> rollouts/<mgn rollout> \
+    --exclude test_traj0038
 ```
+
+The [comparison protocol](comparison-protocol.md) fixes dataset, seed, budget and
+training recipe, lists the allowed variations (world edges) and
+explains how to read the per-trajectory comparison.
 
 Everything else applies to the new model automatically: position noise, rollout
 validation and model selection, early stopping, the optional residual target, the

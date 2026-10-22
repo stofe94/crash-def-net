@@ -6,19 +6,20 @@ authors:
   - family-names: Stocker
     given-names: Felix
     email: felix.stocker@sto-eng.de
-version: 0.2.0
-date-released: "2026-10-13"
+version: 0.3.0
+date-released: "2026-10-22"
 license: Apache-2.0
 repository-code: "https://github.com/stofe94/crash-def-net"
 abstract: >-
-  CrashDefNet is a deep-learning tool for predicting structural deformation from
-  finite element simulations. It covers the chain from raw simulation data to the
-  predicted deformation and implements MeshGraphNet and the
-  MeshGraphNet-Transformer (MGN-T) in one pipeline, evaluated with the metrics of
-  the MGN-T paper on DeepMind's deforming_plate benchmark.
+  CrashDefNet is a deep-learning research tool for predicting structural
+  deformation from finite element simulations, designed for scientific purposes.
+  It covers the chain from raw simulation data (DeepMind TFRecords, LS-DYNA runs,
+  VTK time series) to the predicted deformation and implements MeshGraphNets and
+  the MeshGraphNet-Transformer (MGN-T) in one pipeline, evaluated with the metrics
+  of the MGN-T paper on DeepMind's deforming_plate benchmark.
 keywords:
   - graph neural networks
-  - MeshGraphNet
+  - MeshGraphNets
   - MeshGraphNet-Transformer
   - crash simulation
   - CAE
@@ -51,4 +52,4 @@ references:
       - family-names: Cueto
         given-names: E.
     year: 2026
-    url: "https://arxiv.org/abs/2601.23177"
+    url: "https://arxiv.org/abs/2601.23177v4"

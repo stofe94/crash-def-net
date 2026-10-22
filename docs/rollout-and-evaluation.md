@@ -6,7 +6,12 @@
 python predict/rollout.py --checkpoint checkpoints/<run>/best_model.pt \
     --data-dir data/<dataset> --split test \
     [--max-sequences N] [--max-steps N] [--no-export-vtu] [--no-one-step] [--device cuda]
+    [--lazy | --no-lazy]
 ```
+
+`--lazy` reads the frames from `dataset.db` on access instead of loading the split
+(default: as in the training). The normalizer comes from the checkpoint; checkpoints
+written before it was stored there use `normalizer.json` of `--data-dir`.
 
 The model is applied autoregressively to its own predictions, for every trajectory of
 the split:
@@ -33,7 +38,7 @@ Every call writes into a folder of its own and never overwrites an earlier rollo
 
 | File | Content |
 |---|---|
-| `rollout_info.json` | traceability: checkpoint (path, SHA-256, modification time, epoch, full training config), dataset (path, SHA-256 of `dataset.db` and `normalizer.json`, split, trajectories, check against the training dataset), options, command line, git commit including uncommitted changes, package versions, status, duration and metrics |
+| `rollout_info.json` | traceability: checkpoint (path, SHA-256, modification time, epoch, training config with its source TOML file, SHA-256 and command-line overrides), dataset (path, content fingerprint of `dataset.db` — the SHA-256 of the file for exports before format v4 —, SHA-256 of `normalizer.json`, `normalizer_source`, split, trajectories, check against the training dataset), options, command line, git commit including uncommitted changes, package versions, status, duration and metrics |
 | `<split>_rollout_summary.json` | paper metrics, normalized MSE, RMSE / MAE per target and position RMSE, each per step and per trajectory |
 | `rollout.log` | log of the run |
 | `<split>/<trajectory>/tNNNN.vtu` | per step: predicted mesh with prediction, ground truth and error as point data (needs pyvista; skip with `--no-export-vtu`) |
@@ -47,11 +52,35 @@ data contains `world_pos_gt` (ground-truth positions), `position_error`, and
 stress. Colouring by `position_error` or `stress_error` shows where the prediction
 deviates.
 
+### Animation
+
+```bash
+python utils/animate_rollout.py rollouts/<a> [rollouts/<b> ...] --trajectory test_traj0037
+```
+
+Renders one trajectory as an animated GIF: the ground truth (FEM) next to the prediction
+of every given rollout, coloured by von Mises stress on one scale, the actuator in grey
+(node types from the rollout's `dataset.db`). The rollouts need the `.vtu` export and
+must come from the same dataset with the same steps; the first one also provides the
+ground truth. Writes `rollout_<trajectory>.gif` into a new folder
+`evaluations/<YYYYMMDD_HHMMSS>_animation/`, or to the file given with `--output`.
+
+| Option | Default | |
+|---|---|---|
+| `--trajectory` | first trajectory of the split | trajectory to render |
+| `--labels` | architecture and parameter count | panel titles, one per rollout |
+| `--stress-max` | 99.9th percentile of the ground-truth stress, rounded up to 50 kPa | upper end of the colour scale in kPa |
+| `--output` | new folder in `evaluations/` | GIF file |
+
+Rendering runs off-screen in software (Mesa), so it needs neither a GPU nor a display
+and gives the same frames on every machine; 48 steps with three panels take about 20 s.
+Needs `pyvista`.
+
 ## Metrics
 
 ### Paper metrics
 
-The rollout computes the metrics of the MGN-T paper (Iparraguirre et al., Tab. 4/5) for
+The rollout computes the metrics of the MGN-T paper (Iparraguirre et al., arXiv v4, App. A on p. 12) for
 the position q (m) and the von Mises stress σ (Pa). They are stored as `paper_metrics`
 in the rollout summary, in `rollout_info.json` and in `test_metrics.json`:
 
@@ -67,7 +96,7 @@ the trajectories. The log shows the values in the units of the paper's tables
 (q ×10⁻³ m, σ ×10³ Pa, R-RMSE in %).
 
 Paper values for `deforming_plate` (400 steps, stride 1): MGN-T q RMSE-all
-3.16 ± 0.25 ×10⁻³ m, σ 5.83 ± 0.34 ×10³ Pa; MeshGraphNet q 15.1 ×10⁻³ m. With a
+3.16 ± 0.25 ×10⁻³ m, σ 5.83 ± 0.34 ×10³ Pa; MeshGraphNets q 15.1 ×10⁻³ m. With a
 different stride or fewer steps the numbers are only partly comparable.
 
 ### Internal metrics
@@ -85,7 +114,9 @@ python utils/compare_paper.py                      # every finished rollout in r
 python utils/compare_paper.py rollouts/<a> rollouts/<b> --exclude test_traj0038
 ```
 
-Sets the paper metrics of the rollouts against Tables 4/5 of the MGN-T paper and writes
+Sets the paper metrics of the rollouts against MGN-T (arXiv v4, Tab. 3 on p. 7) and
+MeshGraphNets (Pfaff et al. 2021, Tab. 1 on p. 7, with the standard error over the 100
+test trajectories; the MGN-T paper repeats these values without it in Tab. 2) and writes
 a new folder `evaluations/<YYYYMMDD_HHMMSS>_paper_comparison/`:
 
 | File | Content |

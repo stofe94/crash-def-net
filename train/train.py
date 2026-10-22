@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-train.py — Train a MeshGraphNet on a deforming_plate ``dataset.db``.
+train.py — Train a model (MeshGraphNets or MGN-T, ``[model] architecture``) on a ``dataset.db``.
 
 All settings come from the TOML config; command-line options override it only
 when they are given explicitly.
@@ -28,6 +28,7 @@ import torch  # noqa: E402
 from train.config import TrainingConfig  # noqa: E402
 from train.trainer import (  # noqa: E402
     Trainer,
+    checkpoint_normalizer,
     create_dataloaders,
     create_model,
     new_run_name,
@@ -41,7 +42,7 @@ DEFAULT_CONFIG = _REPO_ROOT / "config.example.toml"
 def parse_args(argv=None) -> argparse.Namespace:
     """Only options given on the command line end up in the namespace."""
     parser = argparse.ArgumentParser(
-        description="Train a MeshGraphNet on deforming_plate (config: TOML, "
+        description="Train a MeshGraphNets on deforming_plate (config: TOML, "
                     "options below override it).",
         argument_default=argparse.SUPPRESS)
     parser.add_argument("--config", default=str(DEFAULT_CONFIG),
@@ -76,7 +77,12 @@ def main(argv=None) -> None:
     data_dir = Path(config.data_dir)
     with open(data_dir / "metadata.json") as f:
         metadata = json.load(f)
-    normalizer = Normalizer.load(str(data_dir / "normalizer.json"))
+    if config.resume:   # continue with the scale the weights were trained with
+        checkpoint = torch.load(config.resume, map_location="cpu", weights_only=False)
+        normalizer, _ = checkpoint_normalizer(checkpoint, data_dir, config.resume)
+        del checkpoint
+    else:
+        normalizer = Normalizer.load(str(data_dir / "normalizer.json"))
 
     train_loader, val_loader, test_loader = create_dataloaders(config, normalizer)
     config.resolve_lr_decay_steps(len(train_loader))

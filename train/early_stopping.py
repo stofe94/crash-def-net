@@ -1,136 +1,164 @@
 """
-early_stopping.py — Overfitting-aware early stopping and best-model selection.
+early_stopping.py — Model selection and early stopping by several criteria.
 
-Two signals are tracked per evaluation:
+At every evaluation the trainer records the selection criteria, each to be as
+low as possible (``CRITERIA``):
 
-* **Stagnation**: the validation loss has not improved by ``min_delta`` for
-  ``patience`` evaluations.
-* **Inefficiency**: the generalization gap ``max(0, val - train)`` grows while
-  the validation loss barely falls. Over ``efficiency_window`` evaluations
+* ``val_loss``                single-step loss on the val split,
+* ``rollout_mse``             normalized MSE of the val rollout,
+* ``rollout_pos_rmse``        position error of the val rollout, mean over the steps,
+* ``rollout_pos_rmse_final``  position error at the last rollout step.
 
-      efficiency = -Δ(smoothed val loss) / Δ(smoothed gap)
+The generalization gap (val loss / train loss without noise), which the trainer
+records at every evaluation, is deliberately no criterion: its lowest value
+belongs to early, undertrained evaluations, and a model that keeps learning
+almost always widens it. As a criterion it pulls the selection back to early
+evaluations and stops runs that still improve.
 
-  is the validation gain per unit of added gap. It only counts as inefficient
-  (< ``efficiency_threshold``) when the gap actually grew; ``patience``
-  consecutive inefficient evaluations also stop training.
+Every evaluation is scored by its worst criterion: the relative excess
+``value / lowest value - 1`` over the lowest value of that criterion among all
+evaluations so far. The selected model is the evaluation with the lowest score,
+i.e. close to the best value in every criterion at the same time; a lucky
+minimum of a single criterion does not win. With one criterion this is the
+plain minimum of that criterion.
 
-Neither signal stops before ``min_epochs``. The best epoch is the one with the
-lowest composite score ``smoothed_val + gap_weight * smoothed_gap``.
+When a criterion reaches a new low, the earlier scores change and an earlier
+evaluation can be selected again; the trainer therefore keeps the weights of
+every evaluation until the run has ended.
 
-``step`` is called once per *evaluation*. With rollout validation every N
-epochs, ``patience``, ``smoothing_window`` and ``efficiency_window`` therefore
-count evaluations (N epochs each); ``min_epochs`` always counts epochs.
+Early stopping, only after at least ``min_epochs`` epochs: no criterion reached
+a new low in the last ``patience`` evaluations (with rollout validation every N
+epochs, N epochs each). The age of the selected evaluation is no trigger: on a
+small val split the criteria scatter by several % per evaluation, so the
+selected evaluation is the one that was lucky in every criterion at once, and a
+model that still improves often needs longer than ``patience`` evaluations to
+beat that luck with its worst criterion.
+
+The gap is no trigger either. A stop on a growing gap while the val loss
+reaches no new low fires earlier than this rule only while another criterion
+still reaches new lows, i.e. while the model still improves on the val split.
+The selection already guards against overfitting; training on only costs time.
 """
 
 from __future__ import annotations
 
-from typing import List
+import math
+from typing import Dict, List, Sequence
 
-
-def _mean_of_last(values: List[float], window: int) -> float:
-    recent = values[-window:]
-    return sum(recent) / len(recent)
+ROLLOUT_CRITERIA = ("rollout_mse", "rollout_pos_rmse", "rollout_pos_rmse_final")
+CRITERIA = ("val_loss",) + ROLLOUT_CRITERIA
 
 
 class EarlyStopping:
-    """Decide per evaluation whether it is the best so far and whether to stop."""
+    """Select the model by ``criteria`` and decide when to stop (see module docstring)."""
 
-    _SCORE_EPS = 1e-8   # a new best must beat the old score by more than this
-
-    def __init__(
-        self,
-        patience: int = 30,
-        min_delta: float = 0.0,
-        min_epochs: int = 30,
-        gap_weight: float = 0.5,
-        smoothing_window: int = 3,
-        efficiency_window: int = 30,
-        efficiency_threshold: float = 0.1,
-    ):
+    def __init__(self, criteria: Sequence[str] = CRITERIA, patience: int = 8,
+                 min_epochs: int = 30, stop: bool = True):
+        unknown = [name for name in criteria if name not in CRITERIA]
+        if unknown or not criteria:
+            raise ValueError(f"criteria must be a non-empty subset of {CRITERIA}, "
+                             f"got {list(criteria)}")
+        self.criteria = list(criteria)
         self.patience = patience
-        self.min_delta = min_delta
         self.min_epochs = min_epochs
-        self.gap_weight = gap_weight
-        self.smoothing_window = max(1, smoothing_window)
-        self.efficiency_window = max(2, efficiency_window)
-        self.efficiency_threshold = efficiency_threshold
-
-        self.val_losses: List[float] = []
-        self.gaps: List[float] = []
-
-        self.best_score = float("inf")
-        self.best_epoch = -1                  # 0-based
-        self.best_val_loss = float("inf")     # raw val loss of the best-score epoch
-
-        self._lowest_val_loss = float("inf")  # drives the stagnation counter
-        self.evaluations_without_improvement = 0
-        self.inefficient_evaluations = 0
-        self.last_efficiency = float("inf")
+        self.stop = stop
+        self.epochs: List[int] = []                  # 0-based, one per evaluation
+        self.values: List[Dict[str, float]] = []
+        self.best_index = -1
+        self.best_score = math.inf
+        self.progress_index = -1                     # last evaluation with a new low
         self.should_stop = False
+        self._stop_reason = ""
 
-    def step(self, epoch: int, val_loss: float, train_loss: float) -> bool:
-        """Record an evaluation after epoch ``epoch`` (0-based); True if it is the new best."""
-        gap = max(0.0, val_loss - train_loss)
-        self.val_losses.append(val_loss)
-        self.gaps.append(gap)
+    @property
+    def best_epoch(self) -> int:
+        """0-based epoch of the selected evaluation (-1 before the first)."""
+        return self.epochs[self.best_index] if self.values else -1
 
-        score = (_mean_of_last(self.val_losses, self.smoothing_window)
-                 + self.gap_weight * _mean_of_last(self.gaps, self.smoothing_window))
-        is_best = score < self.best_score - self._SCORE_EPS
-        if is_best:
-            self.best_score = score
-            self.best_epoch = epoch
-            self.best_val_loss = val_loss
+    def _lowest(self) -> Dict[str, float]:
+        lowest = {}
+        for name in self.criteria:
+            finite = [v[name] for v in self.values if math.isfinite(v[name])]
+            lowest[name] = min(finite) if finite else math.inf
+        return lowest
 
-        if val_loss < self._lowest_val_loss - self.min_delta:
-            self._lowest_val_loss = val_loss
-            self.evaluations_without_improvement = 0
-        else:
-            self.evaluations_without_improvement += 1
+    def _excess(self, value: float, lowest: float) -> float:
+        """Relative excess over the lowest value; inf for a non-finite value."""
+        if not math.isfinite(value) or not math.isfinite(lowest):
+            return math.inf
+        return value / max(lowest, 1e-12) - 1.0
 
-        self.last_efficiency = self._efficiency()
-        if self.last_efficiency < self.efficiency_threshold:
-            self.inefficient_evaluations += 1
-        else:
-            self.inefficient_evaluations = 0
+    def scores(self) -> List[float]:
+        """Current score of every evaluation (worst relative excess, 0 = best in all)."""
+        lowest = self._lowest()
+        return [max(self._excess(v[name], lowest[name]) for name in self.criteria)
+                for v in self.values]
 
-        self.should_stop = epoch + 1 >= self.min_epochs and (
-            self.evaluations_without_improvement >= self.patience
-            or self.inefficient_evaluations >= self.patience)
-        return is_best
+    def step(self, epoch: int, values: Dict[str, float]) -> int:
+        """Record an evaluation after epoch ``epoch`` (0-based); returns the
+        0-based epoch of the selected evaluation."""
+        missing = [name for name in self.criteria if name not in values]
+        if missing:
+            raise ValueError(f"model selection needs {', '.join(missing)}")
+        previous = self._lowest()
+        self.epochs.append(epoch)
+        self.values.append({name: float(values[name]) for name in self.criteria})
+        if any(self.values[-1][name] < previous[name] for name in self.criteria):
+            self.progress_index = len(self.values) - 1
+        scores = self.scores()
+        # Ties go to the later evaluation (trained longer at the same quality).
+        self.best_index = min(range(len(scores)), key=lambda i: (scores[i], -i))
+        self.best_score = scores[self.best_index]
+        self.should_stop = (self.stop and epoch + 1 >= self.min_epochs
+                            and self.evaluations_without_progress >= self.patience)
+        self._stop_reason = (f"no criterion reached a new low in the last "
+                             f"{self.evaluations_without_progress} evaluations"
+                             if self.should_stop else "")
+        return self.best_epoch
 
-    def _efficiency(self) -> float:
-        """Validation gain per unit of gap growth over ``efficiency_window`` evaluations.
+    @property
+    def evaluations_without_progress(self) -> int:
+        """Evaluations since the last one that set a new low in any criterion."""
+        return len(self.values) - 1 - self.progress_index
 
-        ``inf`` (= efficient) while there is not enough history or the gap did
-        not grow.
-        """
-        n = len(self.val_losses)
-        past_end = n - self.efficiency_window
-        if past_end <= 0:
-            return float("inf")
-        past_start = max(0, past_end - self.smoothing_window)
-        past_val = self.val_losses[past_start:past_end]
-        past_gap = self.gaps[past_start:past_end]
-
-        val_change = (_mean_of_last(self.val_losses, self.smoothing_window)
-                      - sum(past_val) / len(past_val))
-        gap_change = (_mean_of_last(self.gaps, self.smoothing_window)
-                      - sum(past_gap) / len(past_gap))
-        if gap_change <= 0:
-            return float("inf")
-        return -val_change / (gap_change + self._SCORE_EPS)
+    def dominated_by_latest(self) -> List[int]:
+        """0-based epochs of earlier evaluations that the latest one matches or
+        beats in every criterion. Their score can never be lower (ties go to the
+        later one), so they cannot be selected again and need no weights."""
+        latest = self.values[-1]
+        return [self.epochs[i] for i, v in enumerate(self.values[:-1])
+                if all(latest[name] <= v[name] for name in self.criteria)]
 
     def status(self) -> str:
         """One-line state for the epoch log."""
-        return (f"no improvement {self.evaluations_without_improvement}/{self.patience}, "
-                f"inefficient {self.inefficient_evaluations}/{self.patience}, "
-                f"best epoch {self.best_epoch + 1}")
+        if not self.values:
+            return "no evaluation yet"
+        text = f"selected epoch {self.best_epoch + 1}"
+        if len(self.criteria) > 1:
+            text += f" (score {100 * self.best_score:.1f} %)"
+        if self.stop:
+            text += (f", {self.evaluations_without_progress}/{self.patience} "
+                     f"evaluations without a new low")
+        return text
 
     def stop_reason(self) -> str:
         """Why ``should_stop`` became True."""
-        if self.evaluations_without_improvement >= self.patience:
-            return (f"val loss did not improve by {self.min_delta} for "
-                    f"{self.evaluations_without_improvement} evaluations")
-        return (f"efficiency {self.last_efficiency:.3f} below "
-                f"{self.efficiency_threshold} for {self.inefficient_evaluations} evaluations")
+        return self._stop_reason
+
+    def report(self) -> List[str]:
+        """Lines for the end of training: every criterion of the selected
+        evaluation next to its lowest value, so the choice can be checked."""
+        if not self.values:
+            return []
+        lowest = self._lowest()
+        chosen = self.values[self.best_index]
+        lines = [f"Selected epoch {self.best_epoch + 1} of {len(self.values)} evaluations"
+                 + (f", score {100 * self.best_score:.1f} %:" if len(self.criteria) > 1
+                    else ":")]
+        for name in self.criteria:
+            best = min(range(len(self.values)),
+                       key=lambda i: (self.values[i][name], -i))
+            lines.append(f"    {name:24s} {chosen[name]:.4g} (lowest {lowest[name]:.4g} "
+                         f"at epoch {self.epochs[best] + 1}, "
+                         f"+{100 * self._excess(chosen[name], lowest[name]):.1f} %)")
+        return lines

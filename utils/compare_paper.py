@@ -3,9 +3,10 @@
 compare_paper.py — Own rollout results next to the MGN-T paper.
 
 Reads rollout folders written by ``predict/rollout.py`` (``rollouts/<...>/``)
-and compares their paper metrics with Tables 4 and 5 of Iparraguirre et al.,
-"MeshGraphNet-Transformer", arXiv:2601.23177 (deforming_plate). Writes a new
-folder ``evaluations/<YYYYMMDD_HHMMSS>_paper_comparison/`` with
+and compares their paper metrics on deforming_plate with MGN-T (Iparraguirre et
+al., "MeshGraphNet-Transformer", arXiv:2601.23177v4, Table 3 on p. 7) and with
+MeshGraphNets (Pfaff et al., ICLR 2021, arXiv:2010.03409, Table 1 on p. 7). Writes
+a new folder ``evaluations/<YYYYMMDD_HHMMSS>_paper_comparison/`` with
 
 - ``01_absolute_errors.png``       RMSE-1 and RMSE-all of position q and stress
 - ``02_relative_errors.png``       R-RMSE (%) of position q and stress
@@ -67,33 +68,43 @@ EVALUATIONS_DIR = _REPO_ROOT / "evaluations"
 # the paper rows are reference values and stay neutral.
 SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
 PAPER_COLOR = TEXT_MUTED
-ARCHITECTURE_NAMES = {"mgn_t": "MGN-T", "meshgraphnet": "MGN"}
+# "meshgraphnet": misspelling of rollouts from v0.2.0 checkpoints (see train/config.py)
+ARCHITECTURE_NAMES = {"mgn_t": "MGN-T", "meshgraphnets": "MGN", "meshgraphnet": "MGN"}
+# Single selection metric of configs written before the criteria list.
 SELECTION_NAMES = {"mse": "rollout MSE (normalized)", "pos_rmse": "position error",
                    "pos_rmse_final": "position error at the last step"}
+CRITERIA_NAMES = {"val_loss": "val loss", "rollout_mse": "rollout MSE (normalized)",
+                  "rollout_pos_rmse": "position error",
+                  "rollout_pos_rmse_final": "position error at the last step",
+                  "gap": "train/val gap"}
 
 # ── paper values ─────────────────────────────────────────────────────────────
 
-PAPER_SOURCE = ("Iparraguirre et al., MeshGraphNet-Transformer, arXiv:2601.23177, "
-                "Tab. 4/5 (deforming_plate)")
-# Table 5, MGN-T: (value, standard error over the test trajectories) in SI units
-# (q in m, stress in Pa, R-RMSE as a fraction).
+PAPER_SOURCE = ("MGN-T: Iparraguirre et al., arXiv:2601.23177v4, Tab. 3 (p. 7); "
+                "MGN: Pfaff et al., ICLR 2021, Tab. 1 (p. 7); deforming_plate")
+# MGN-T paper v4, Table 3 (p. 7; Table 5 in v3), MGN-T: (value, standard error over
+# the test trajectories) in SI units (q in m, stress in Pa, R-RMSE as a fraction).
 PAPER_MGN_T = {
     "q_rmse_1": (0.10e-3, 0.005e-3), "q_rmse_all": (3.16e-3, 0.25e-3),
     "stress_rmse_1": (3.87e3, 0.17e3), "stress_rmse_all": (5.83e3, 0.34e3),
     "q_r_rmse_1": (0.02e-2, 0.001e-2), "q_r_rmse_all": (0.63e-2, 0.05e-2),
     "stress_r_rmse_1": (2.5e-2, 0.13e-2), "stress_r_rmse_all": (3.61e-2, 0.21e-2),
 }
-# Table 4: position RMSE (x1e-3 m) of MGN-T and the baselines, no standard errors.
-PAPER_TABLE_4 = [  # model, RMSE-1, RMSE-all, parameters
-    ("MGN", 0.25, 15.1, "2.0M"), ("BSMS-GNN", 0.29, 16.0, "2.8M"),
-    ("EvoMesh", 0.28, 12.9, "3.2M"), ("HCMT", None, 7.3, "2.5M"),
+# MeshGraphNets paper, Table 1 right (p. 7): position RMSE, ± = standard error over the
+# 100 test trajectories (App. A.5.2, p. 17). The MGN-T paper repeats the values without ±.
+PAPER_MGN = {"q_rmse_1": (0.25e-3, 0.05e-3), "q_rmse_all": (15.1e-3, 4.0e-3)}
+# MGN-T paper v4, Table 2 (p. 7): position RMSE (x1e-3 m) of MGN-T and the baselines
+# as reported by their papers, no standard errors.
+PAPER_BASELINES = [  # model, RMSE-1, RMSE-all, parameters
+    ("MGN", 0.25, 15.1, "2.0M"), ("EvoMesh", 0.28, 12.9, "3.2M"),
+    ("HCMT", None, 7.3, "2.5M"), ("EAGLE", 0.36, 3.8, "2.0M (estimated)"),
     ("M4GN", 0.26, 2.6, "2.0M (estimated)"), ("MGN-T", 0.10, 3.2, "0.5M")]
 PAPER_CONDITIONS = {
     "Dataset": "DeepMind deforming_plate; number of trajectories not stated in the paper",
     "Rollout": "400 steps, stride 1",
-    "Nodes per mesh": "~1,250 (Tab. 1)",
-    "Parameters": "MGN-T 0.5 M, MGN 2.0 M (Tab. 2/4)",
-    "Training": "MGN-T ~8 h on an RTX 4090",
+    "Nodes per mesh": "1,271 on average (Pfaff et al., Tab. 1)",
+    "Parameters": "MGN-T 0.5 M, MGN 2.0 M (Tab. 2)",
+    "Training": "MGN-T: 25 epochs, batch 32, cosine LR 1e-4 → 1e-6 (Sec. 5.1)",
     "Spread (±)": "standard error over the test trajectories",
 }
 
@@ -230,8 +241,7 @@ def tint(color: str, amount: float = 0.5) -> str:
 def build_entries(rollouts: List[Rollout], exclude: Sequence[str]) -> List[Entry]:
     entries = [
         Entry("MGN-T · paper", PAPER_COLOR, dict(PAPER_MGN_T), "paper", reference=True),
-        Entry("MGN · paper (Tab. 4)", PAPER_COLOR,
-              {"q_rmse_1": (0.25e-3, None), "q_rmse_all": (15.1e-3, None)}, "paper"),
+        Entry("MGN · Pfaff et al. 2021", PAPER_COLOR, dict(PAPER_MGN), "paper"),
     ]
     names = [r.name for r in rollouts]
     for index, rollout in enumerate(rollouts):
@@ -517,10 +527,22 @@ def training_summary(rollout: Rollout) -> Dict[str, str]:
         "Parameters": f"{model['parameters'] / 1e6:.2f} M",
         "Evaluated epoch": f"{model['epoch']} ({Path(model['checkpoint']['path']).name})",
         "Training": f"{trained}, batch {config['batch_size']}",
-        "Model selection": SELECTION_NAMES.get(config.get("rollout_selection_metric", "mse"),
-                                               config.get("rollout_selection_metric")),
+        "Model selection": _selection_description(config),
         "Nodes per mesh": f"{min(nodes):,}–{max(nodes):,}" if nodes else "–",
     }
+
+
+def _selection_description(config: Dict) -> str:
+    """Model selection of a stored training config: its criteria, or the single
+    metric of configs written before the criteria."""
+    criteria = config.get("early_stopping_criteria")
+    if criteria:
+        names = ", ".join(CRITERIA_NAMES.get(name, name) for name in criteria)
+        return names if len(criteria) == 1 else f"closest to the best in all of: {names}"
+    if not config.get("rollout_validation", True):
+        return "single-step val loss"
+    metric = config.get("rollout_selection_metric", "mse")
+    return SELECTION_NAMES.get(metric, metric)
 
 
 def condition_rows(own: List[Entry]) -> Tuple[List[str], List[List[str]]]:
@@ -581,7 +603,9 @@ def main(argv=None) -> int:
         print(f"No finished rollouts found for split {args.split!r}.")
         return 1
     finished.sort(key=lambda r: (r.model["architecture"] != "mgn_t", r.model["epoch"]))
-    datasets = {r.info["data"]["dataset_db"]["sha256"] for r in finished}
+    # content fingerprint of dataset.db; SHA-256 of the file for exports before v4
+    datasets = {r.info["data"]["dataset_db"].get("fingerprint")
+                or r.info["data"]["dataset_db"]["sha256"] for r in finished}
     if len(datasets) > 1:
         print("Warning: the rollouts come from different datasets — "
               "the values are not directly comparable.")
@@ -598,8 +622,8 @@ def main(argv=None) -> int:
                     out / "01_absolute_errors.png")
     plot_bar_panels(entries, RELATIVE, "Relative errors (R-RMSE) compared with the MGN-T paper",
                     "RMSE divided by the infinity norm of the trajectory (largest |q| "
-                    f"component or |σ|); {split_note}. MGN from Tab. 4 with absolute values "
-                    "only.", out / "02_relative_errors.png")
+                    f"component or |σ|); {split_note}. MGN: Pfaff et al. report absolute "
+                    "values only.", out / "02_relative_errors.png")
     plot_steps(own, out / "03_error_per_step.png")
     plot_trajectories(own, args.exclude, out / "04_error_per_trajectory.png")
 
@@ -617,8 +641,8 @@ def main(argv=None) -> int:
                "the numbers.", out / "06_table_conditions.png", first_width=0.14,
                numeric=False)
 
-    table_4 = [[m, f"{r1:.2f}" if r1 is not None else "–", f"{ra:.1f}", p]
-               for m, r1, ra, p in PAPER_TABLE_4]
+    baselines = [[m, f"{r1:.2f}" if r1 is not None else "–", f"{ra:.1f}", p]
+                 for m, r1, ra, p in PAPER_BASELINES]
     report = [
         f"# Comparison with the MGN-T paper ({now():%Y-%m-%d %H:%M})",
         "",
@@ -653,9 +677,13 @@ def main(argv=None) -> int:
         "8 times as far per step as in the paper. RMSE-all instead covers the same physical "
         "time span, but with fewer rollout steps (less opportunity for error accumulation).",
         "",
-        "### Table 4 of the paper (q, ×10⁻³ m)",
+        "### Baselines in the MGN-T paper (q, ×10⁻³ m)",
         "",
-        markdown_table(["Model", "RMSE-1", "RMSE-all", "Parameters"], table_4),
+        "Table 2 on p. 7 of arXiv v4 (Table 4 on p. 8 of v3), values as reported by the "
+        "papers of the models. MGN comes from Pfaff et al. 2021, Table 1 on p. 7, where it "
+        "has a standard error over the 100 test trajectories: 0.25 ± 0.05 and 15.1 ± 4.0.",
+        "",
+        markdown_table(["Model", "RMSE-1", "RMSE-all", "Parameters"], baselines),
         "",
         "## Conditions",
         "",

@@ -8,10 +8,14 @@ by ``train/train.py``) and writes ``loss_curves.png`` next to it:
   the validation curves),
 * single-step validation loss,
 * validation rollout MSE (if rollout validation was on),
+* train loss without noise on fixed train samples (at every evaluation; in
+  older histories only with the ``gap`` criterion): its distance to the
+  validation loss is the generalization gap,
 
-all in normalized target units on one log axis. The selected model (last
-epoch flagged ``is_best``) is marked on the curve it was selected by. The
-values are also printed as a table.
+all in normalized target units on one log axis. The selected model (epoch
+flagged ``selected``, in older histories the last one flagged ``is_best``) is
+marked on the rollout MSE or validation curve. The values are also printed as
+a table.
 
 Usage
 -----
@@ -44,6 +48,7 @@ SERIES = [
     ("train_loss", "Train loss", "#2a78d6"),
     ("val_loss", "Validation loss (single step)", "#eb6834"),
     ("val_rollout_mse", "Validation rollout MSE", "#1baf7a"),
+    ("train_loss_clean", "Train loss without noise", "#eda100"),
 ]
 
 
@@ -109,10 +114,11 @@ def plot_loss_curves(run_dir: Path) -> Path:
 def _selected_epoch(history: list, present: list):
     """(label, epoch, value, color) of the selected model on its selection curve.
 
-    With rollout validation the model is selected by the rollout MSE, else by
-    the single-step validation loss. The selected model is the last epoch
-    flagged ``is_best``; histories written before that flag existed get the
-    minimum of the selection curve instead.
+    The marker sits on the rollout MSE curve with rollout validation, else on
+    the single-step validation loss. The selected model is the epoch flagged
+    ``selected`` (the selection by several criteria may return to an earlier epoch),
+    else the last epoch flagged ``is_best``; histories written before these
+    flags existed get the minimum of the curve instead.
     """
     keys = [key for key, _, _ in present]
     key = "val_rollout_mse" if "val_rollout_mse" in keys else "val_loss"
@@ -120,8 +126,9 @@ def _selected_epoch(history: list, present: list):
         return None
     color = next(c for k, _, c in present if k == key)
     candidates = [r for r in history if r.get(key) is not None]
-    if any("is_best" in r for r in history):
-        best = [r for r in candidates if r.get("is_best")]
+    flag = next((f for f in ("selected", "is_best") if any(f in r for r in history)), None)
+    if flag is not None:
+        best = [r for r in candidates if r.get(flag)]
         if not best:
             return None
         return "selected model", best[-1]["epoch"], best[-1][key], color

@@ -34,3 +34,5 @@ dependencies:
       - pyvista>=0.43
       # --- optional: loss curves and paper comparison ---
       - matplotlib>=3.7
+      # --- optional, not installed by default: LS-DYNA d3plot (conversion and reader) ---
+      # - lasso-python

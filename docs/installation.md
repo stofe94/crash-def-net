@@ -5,7 +5,20 @@
 - Linux or Windows with WSL2 (tested: Ubuntu under WSL2, Python 3.12)
 - Python 3.10–3.12
 - Optional: an NVIDIA GPU with a current driver (CUDA 12.x). Everything also runs on
-  the CPU; `config.example.toml` is made for it.
+  the CPU, so CrashDefNet can be tried on simple hardware: with the small dataset of the
+  quick start and a reduced model, a training run takes minutes to a few hours. Measured
+  on a 6-core desktop CPU (AMD Ryzen 5 5600GE, 5 GB RAM under WSL2):
+
+  | Config (small dataset, 8/2/2 trajectories) | Parameters | per epoch | Memory |
+  |---|---|---|---|
+  | `config.example.toml` (MGN-T, minimal size) | 50 k | ~25 s, 5 epochs in ~2 min | 0.7 GB |
+  | same with `architecture = "meshgraphnets"` (latent 64, 8 steps) | 0.53 M | ~2 min 10 s, 30 epochs in ~1 h | 1.7 GB |
+- Large datasets need no machine with much RAM: the export and lazy loading keep only
+  one block of a run or one sample in memory ([data.md](data.md#large-datasets)).
+  LS-DYNA runs need `lasso-python`, VTK files `pyvista` ([Dependencies](#dependencies)).
+- Everything runs locally: once installed, export, training, rollout and evaluation
+  need no network connection, cloud service or account, so simulation data never
+  leaves your machines.
 
 ## Python environment
 
@@ -40,8 +53,9 @@ pip install -e ".[dev]"                  # optional: package install + pytest, r
 | `torch`, `torch-geometric` | models, training, graph batching |
 | `numpy`, `tfrecord` | reading DeepMind's raw data during export |
 | `toml`, `tqdm` | configs, progress bars |
-| `pyvista` (optional) | `.vtu` export of the rollout for ParaView |
-| `matplotlib` (optional) | loss curves, comparison with the paper |
+| `pyvista` (optional) | `.vtu` export of the rollout for ParaView, rollout animation; third raw format: VTK time series ([data.md](data.md#third-raw-format-vtk-time-series-vtu--vtp--vtk)) |
+| `matplotlib` (optional) | loss curves, comparison with the paper, rollout animation |
+| `lasso-python` (optional) | second raw format: LS-DYNA runs ([data.md](data.md#second-raw-format-ls-dyna-runs-d3plot)) |
 
 ## Raw data
 
@@ -71,7 +85,7 @@ python train/train.py --config config.example.toml --epochs 1
 ```
 
 The first command prints the exported sample counts. The second one trains one epoch
-on the CPU (~4–5 min) and ends with test metrics.
+on the CPU (~25 s) and ends with test metrics.
 
 ## Troubleshooting
 

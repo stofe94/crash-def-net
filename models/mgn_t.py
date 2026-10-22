@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 """
-mgn_t.py — MeshGraphNet-Transformer (MGN-T), Iparraguirre et al., arXiv:2601.23177.
+mgn_t.py — MeshGraphNet-Transformer (MGN-T), Iparraguirre et al., arXiv:2601.23177v4.
 
-Instead of a deep stack of message passing steps (MeshGraphNet: 15) MGN-T uses a
-Transformer as the global processor (paper Sec. 2.2):
+Independent implementation based on the paper; not affiliated with or endorsed
+by the authors.
+
+Instead of a deep stack of message passing steps (MeshGraphNets: 15) MGN-T uses a
+Transformer as the global processor (paper Sec. 3.2):
 
     Encoder (3 MLPs)
       -> pre-processing MPNN   2 message passing steps (local, uses edges)
-      -> Transformer           2 blocks with physics attention (global)
+      -> Transformer           2 blocks with physics attention (global, over the
+                               simulated structure only)
       -> refinement MPNN       2 message passing steps (local, uses edges)
     -> Decoder
+
+The transformer and its positional encoding see only the nodes of the simulated
+structure (paper Sec. 3.1-3.3, 5.1): obstacles such as the actuator act through the
+contact edges of the pre-processor and take no tokens. ``transformer_nodes = "all"``
+restores the behaviour up to v0.2.0, where every node took part.
 
 Physics attention (Transolver, arXiv:2402.02366, with the eidetic states of
 Transolver++, arXiv:2502.02414) maps the N nodes onto P << N physical tokens,
@@ -21,30 +30,33 @@ attends over the tokens (O(P²) instead of O(N²)) and scatters the result back:
     z'   = Softmax(Q K^T / sqrt(c)) V                    attention over tokens
     x'_i = sum_j w_ij z'_j                               de-slicing
 
-Paper settings (Table 2): 2 + 2 message passing steps, 4 heads, P = 128 tokens,
-widths 64-32-64, ~0.5 M parameters. Every MLP has 2 hidden layers, LeakyReLU
-and LayerNorm.
+Paper settings for deforming_plate (Sec. 5.1, Table 2): 2 + 2 message passing
+steps, 2 transformer blocks, 4 heads, P = 16 tokens, ~0.5 M parameters; tau_0 = 1.0
+(Sec. 3.3). The defaults here (P = 128, widths 64-32-64) come from Table 2 of v3,
+which belongs to its Pi-beam example. Every MLP has 2 hidden layers, LeakyReLU and
+LayerNorm (Sec. 3.2).
 
 Assumptions where the paper leaves a gap (chosen here, flagged in the code):
 
-1. De-slicing is only described as "projects P back onto N"; done with the same
-   slice weights, as in Transolver.
-2. Gumbel noise drawn from U(0, 1) (the standard) and only while training; the
-   paper writes eps ~ N(0, 1), for which -log(-log(eps)) is undefined.
+1. De-slicing ("projects P back onto N" in the paper): with the same slice
+   weights as slicing, as in Transolver.
+2. Gumbel noise -log(-log(eps)) with eps ~ U(0, 1), the standard form of the
+   Gumbel trick, and only while training (the paper states eps ~ N(0, 1)).
 3. tau kept positive with softplus, otherwise the temperature could reach zero.
+   The paper writes tau = tau_0 + Linear(x) with tau_0 = 1.0; with softplus the
+   initial tau is ``tau_init`` + ln 2 (about 1.19 for the default 0.5).
 4. Positional encoding: 3 axes x sin/cos x ``pe_frequencies`` frequencies
    (2^0 .. 2^(F-1)), normalized per graph to [0, 1]. The paper only cites
    Vaswani et al. and gives no dimension.
-5. Widths "64-32-64" read as MPNN 64, Transformer 32, refinement 64.
+5. Widths "64-32-64" (v3 only) read as MPNN 64, Transformer 32, refinement 64.
 6. Residual connection around the transformer stage, pre-norm blocks (standard,
    not described in the paper).
-7. Decoder without LayerNorm (as in MeshGraphNet); normalizing the output would
+7. Decoder without LayerNorm (as in MeshGraphNets); normalizing the output would
    destroy the magnitude of the prediction.
 8. A batch may mix samples of different trajectories — slicing and attention run
-   per graph. The paper requires one trajectory per batch only because of its
-   matrix reshaping.
+   per graph. The paper batches the snapshots of one trajectory.
 
-Input as in ``models/meshgraphnet.py``, plus ``data.mesh_pos`` (undeformed node
+Input as in ``models/meshgraphnets.py``, plus ``data.mesh_pos`` (undeformed node
 positions) for the positional encoding.
 """
 
@@ -54,9 +66,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.meshgraphnet import GraphNetBlock, count_parameters, make_mlp  # noqa: F401
+from dataset_preprocessor.graph_features import structure_node_mask
+from models.meshgraphnets import GraphNetBlock, count_parameters, make_mlp  # noqa: F401
 
 _ACTIVATION = nn.LeakyReLU   # paper: LeakyReLU in every MLP
+# Nodes of the global stage: the simulated structure (paper) or every node (up to v0.2.0).
+TRANSFORMER_NODES = ("structure", "all")
 
 
 def _graph_batch(data, num_nodes: int) -> torch.Tensor:
@@ -68,7 +83,7 @@ def _graph_batch(data, num_nodes: int) -> torch.Tensor:
 
 
 class SinusoidalPositionEncoding(nn.Module):
-    """Stationary waves over the undeformed geometry (paper Sec. 2.1).
+    """Stationary waves over the undeformed geometry (paper Sec. 3.1).
 
     One sine and one cosine per axis and frequency, i.e. ``6 * num_frequencies``
     features. Coordinates are normalized per graph to [0, 1], so the encoding
@@ -98,7 +113,7 @@ class SinusoidalPositionEncoding(nn.Module):
 
 
 class PhysicsAttention(nn.Module):
-    """Slice onto P tokens, attend over the tokens, scatter back (paper Sec. 2.3)."""
+    """Slice onto P tokens, attend over the tokens, scatter back (paper Sec. 3.3)."""
 
     def __init__(self, dim: int, num_heads: int, num_tokens: int, tau_init: float = 0.5):
         super().__init__()
@@ -172,7 +187,7 @@ class MgnTransformer(nn.Module):
     """Local message passing stages around a global transformer.
 
     ``forward`` returns the normalized node predictions (N, ``output_dim``),
-    the same interface as ``MeshGraphNet``.
+    the same interface as ``MeshGraphNets``.
     """
 
     def __init__(
@@ -193,8 +208,13 @@ class MgnTransformer(nn.Module):
         ffn_ratio: int = 4,
         tau_init: float = 0.5,
         aggregation: str = "sum",
+        transformer_nodes: str = "structure",
     ):
         super().__init__()
+        if transformer_nodes not in TRANSFORMER_NODES:
+            raise ValueError(f"transformer_nodes must be one of {TRANSFORMER_NODES}, "
+                             f"got {transformer_nodes!r}")
+        self.transformer_nodes = transformer_nodes
         self.output_dim = output_dim
         self.world_edge_in_dim = world_edge_in_dim
         self.use_world_edges = world_edge_in_dim > 0
@@ -216,7 +236,7 @@ class MgnTransformer(nn.Module):
         self.pre_processor = mp_stack(num_pre_mp_steps)
         self.refinement_processor = mp_stack(num_post_mp_steps)
 
-        # Node latents + positional encoding -> transformer width (paper Sec. 2.2)
+        # Node latents + positional encoding -> transformer width (paper Sec. 3.2)
         self.position_encoding = SinusoidalPositionEncoding(pe_frequencies)
         self.to_token_dim = nn.Linear(latent_size + self.position_encoding.dim, token_dim)
         self.transformer = nn.ModuleList([
@@ -241,12 +261,17 @@ class MgnTransformer(nn.Module):
             nodes, edge_sets = block(nodes, edge_sets)
 
         batch = _graph_batch(data, nodes.shape[0])
+        latents, mesh_pos = nodes, self._mesh_positions(data)
+        if self.transformer_nodes == "structure":   # without the actuator (paper Sec. 3.3)
+            index = structure_node_mask(data.x).nonzero().squeeze(1)
+            latents, batch, mesh_pos = nodes[index], batch[index], mesh_pos[index]
         tokens = self.to_token_dim(
-            torch.cat((nodes, self.position_encoding(self._mesh_positions(data), batch)),
-                      dim=-1))
+            torch.cat((latents, self.position_encoding(mesh_pos, batch)), dim=-1))
         for block in self.transformer:
             tokens = block(tokens, batch)
-        nodes = nodes + self.from_token_dim(tokens)   # residual around the global stage
+        update = self.from_token_dim(tokens)   # residual around the global stage
+        nodes = nodes + update if self.transformer_nodes == "all" else \
+            nodes.index_add(0, index, update)
 
         for block in self.refinement_processor:
             nodes, edge_sets = block(nodes, edge_sets)

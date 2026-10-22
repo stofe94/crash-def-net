@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-rollout.py — Autoregressive rollout of a trained model (MeshGraphNet or MGN-T) on deforming_plate.
+rollout.py — Autoregressive rollout of a trained model (MeshGraphNets or MGN-T) on a ``dataset.db``.
 
 For every trajectory of a split (``dataset.db``) the model is applied step by
 step to its own predictions:
@@ -21,9 +21,11 @@ rollout: ``rollouts/<YYYYMMDD_HHMMSS>_<training run>_<checkpoint>_<split>/``
 (or ``--output-dir``, which must not exist yet or be empty). It holds
 
 - ``rollout_info.json``: what was rolled out and how — checkpoint (path,
-  SHA-256, epoch, full training config), dataset (path, SHA-256 of dataset.db
-  and normalizer.json, split, trajectories, check against the dataset the model
-  was trained on), options, command line, git commit, versions, results;
+  SHA-256, epoch, full training config), dataset (path, the content fingerprint
+  of dataset.db — the SHA-256 of the file for exports before format v4 —, the
+  SHA-256 of normalizer.json and where the normalizer came from, split,
+  trajectories, check against the dataset the model was trained on), options,
+  command line, git commit, versions, results;
 - ``<split>_rollout_summary.json``: the metrics of the MGN-T paper
   (``paper_metrics``: RMSE-1, RMSE-all and R-RMSE of position and stress, see
   ``_PaperMetrics``) plus normalized MSE, RMSE/MAE per target field and position
@@ -62,9 +64,14 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 from dataset_preprocessor import DeformingPlateDataset  # noqa: E402
+from dataset_preprocessor.dataset import DEFAULT_STATIC_CACHE_MB, dataset_fingerprint  # noqa: E402
 from dataset_preprocessor.graph_features import (  # noqa: E402
+    CELL_NUM_NODES,
+    CELL_TETRA,
+    DEFAULT_WORLD_EDGE_EXCLUDE_HOPS,
     TARGET_FEATURE_NAMES,
     VELOCITY_TARGET_COLUMNS,
+    add_world_edges,
     free_node_mask,
     prev_to_target_columns,
     rebuild_edges,
@@ -75,8 +82,12 @@ logger = logging.getLogger("rollout")
 
 ROLLOUTS_DIR = _REPO_ROOT / "rollouts"
 STRESS_COLUMN = TARGET_FEATURE_NAMES.index("stress")
-# metadata.json keys that may differ between machines without changing the data
-_MACHINE_SPECIFIC_METADATA = {"raw_dir"}
+# Nodes per VTK cell type, indexed by the type number.
+_NODES_OF_CELL_TYPE = np.zeros(max(CELL_NUM_NODES) + 1, dtype=np.int64)
+_NODES_OF_CELL_TYPE[list(CELL_NUM_NODES)] = list(CELL_NUM_NODES.values())
+# metadata.json keys that may differ without changing the samples: the machine
+# (raw_dir) and the storage format of dataset.db (db_format)
+_MACHINE_SPECIFIC_METADATA = {"raw_dir", "db_format"}
 
 
 class RolloutRunner:
@@ -98,10 +109,20 @@ class RolloutRunner:
         Input layout the model was trained with; checked against the dataset.
     lazy : bool
         Read the frames from the DB on access instead of loading the split.
+    world_edges, world_edge_exclude_hops
+        World edge variant the model was trained with (``TrainingConfig``).
+    static_cache_mb : float
+        Lazy: static graph data kept per split (``DeformingPlateDataset``).
+
+    The world edges are built on ``device`` (``add_world_edges`` /
+    ``rebuild_edges``), not by the dataset.
     """
 
     def __init__(self, model, normalizer, db_path, device, output_dir=None,
-                 node_feature_names: Optional[List[str]] = None, lazy: bool = False):
+                 node_feature_names: Optional[List[str]] = None, lazy: bool = False,
+                 world_edges: str = "all",
+                 world_edge_exclude_hops: int = DEFAULT_WORLD_EDGE_EXCLUDE_HOPS,
+                 static_cache_mb: float = DEFAULT_STATIC_CACHE_MB):
         self.model = model
         self.normalizer = normalizer
         self.db_path = Path(db_path)
@@ -109,6 +130,9 @@ class RolloutRunner:
         self.output_dir = Path(output_dir) if output_dir is not None else None
         self.expected_node_names = node_feature_names
         self.lazy = lazy
+        self.world_edges = world_edges
+        self.world_edge_exclude_hops = world_edge_exclude_hops
+        self.static_cache_mb = static_cache_mb
         self._datasets: Dict[tuple, DeformingPlateDataset] = {}
 
     @classmethod
@@ -123,11 +147,17 @@ class RolloutRunner:
         return cls.from_trained(trained, data_dir, output_dir)
 
     @classmethod
-    def from_trained(cls, trained, data_dir: str, output_dir: Optional[str] = None
-                     ) -> "RolloutRunner":
-        """Runner around a model restored with ``load_trained_model``."""
+    def from_trained(cls, trained, data_dir: str, output_dir: Optional[str] = None,
+                     lazy: Optional[bool] = None) -> "RolloutRunner":
+        """Runner around a model restored with ``load_trained_model``; ``lazy``
+        defaults to the loading mode of the training."""
+        config = trained.config
         return cls(trained.model, trained.normalizer, Path(data_dir) / "dataset.db",
-                   trained.device, output_dir, trained.metadata["node_feature_names"])
+                   trained.device, output_dir, trained.metadata["node_feature_names"],
+                   lazy=config.lazy_loading if lazy is None else lazy,
+                   world_edges=config.world_edges,
+                   world_edge_exclude_hops=config.world_edge_exclude_hops,
+                   static_cache_mb=config.static_cache_mb)
 
     # ── main loop ───────────────────────────────────────────────────────────
 
@@ -199,7 +229,9 @@ class RolloutRunner:
         exported_steps: List[int] = []
 
         for step, idx in enumerate(sample_indices):
-            data = dataset[idx].to(self.device)
+            # World edges on the device: from the ground truth only where the model
+            # sees it (one_step), else rebuilt from the prediction below.
+            data = dataset.sample(idx, world_edges=False).to(self.device)
             target = self.normalizer.denormalize(data.y, "target")
             true_pos = data.world_pos
             free = free_node_mask(data.x)
@@ -209,6 +241,7 @@ class RolloutRunner:
             paper.observe(true_pos, target[:, STRESS_COLUMN])
 
             if one_step:   # from the ground-truth state: x_{t+1} error = velocity error
+                add_world_edges(data, self.normalizer, dataset.contact_radius)
                 single = torch.where(prescribed, target, self.normalizer.denormalize(
                     self.model(data), "target"))
                 paper.add("q_1", (single - target)[:, VELOCITY_TARGET_COLUMNS])
@@ -250,11 +283,19 @@ class RolloutRunner:
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
+    def share_dataset(self, split: str, dataset: DeformingPlateDataset) -> None:
+        """Roll out ``split`` on an existing dataset (e.g. of the trainer's val loader)
+        instead of loading it a second time; it must use the same settings."""
+        self._datasets[(split, dataset.with_cells)] = dataset
+
     def _dataset(self, split: str, with_cells: bool) -> DeformingPlateDataset:
         key = (split, with_cells)
         if key not in self._datasets:
             self._datasets[key] = DeformingPlateDataset(
-                self.db_path, split, self.normalizer, with_cells=with_cells, lazy=self.lazy)
+                self.db_path, split, self.normalizer, with_cells=with_cells, lazy=self.lazy,
+                world_edges=self.world_edges,
+                world_edge_exclude_hops=self.world_edge_exclude_hops,
+                static_cache_mb=self.static_cache_mb, build_world_edges=False)
         return self._datasets[key]
 
     @staticmethod
@@ -271,9 +312,17 @@ class RolloutRunner:
         import pyvista as pv
 
         points = data.world_pos.cpu().numpy().astype("float64")
-        cells = data.cells.cpu().numpy().astype("int64")                  # (C, 4)
-        cell_array = np.hstack([np.full((cells.shape[0], 1), 4, dtype="int64"), cells]).ravel()
-        cell_types = np.full(cells.shape[0], pv.CellType.TETRA, dtype=np.uint8)
+        cells = data.cells.cpu().numpy().astype("int64")       # (C, 4) or (C, W) padded
+        cell_types = getattr(data, "cell_types", None)
+        if cell_types is None:                                  # tetrahedra
+            cell_types = np.full(cells.shape[0], CELL_TETRA, dtype=np.uint8)
+        else:
+            cell_types = cell_types.cpu().numpy().astype(np.uint8)
+        nodes_per_cell = _NODES_OF_CELL_TYPE[cell_types]
+        # VTK layout: [n, id_1 .. id_n] per cell, padding dropped
+        keep = np.hstack([np.ones((cells.shape[0], 1), dtype=bool),
+                          np.arange(cells.shape[1]) < nodes_per_cell[:, None]])
+        cell_array = np.hstack([nodes_per_cell[:, None], cells])[keep]
         mesh = pv.UnstructuredGrid(cell_array, cell_types, points)
 
         true_points = true_pos.cpu().numpy().astype("float32")
@@ -364,8 +413,8 @@ class _StepMetrics:
 
 
 class _PaperMetrics:
-    """Error metrics of the MGN-T paper (Iparraguirre et al., arXiv:2601.23177,
-    Tables 4/5) for one trajectory, for the position q (m) and the von Mises
+    """Error metrics of the MGN-T paper (Iparraguirre et al., arXiv:2601.23177v4,
+    App. A and Table 3) for one trajectory, for the position q (m) and the von Mises
     stress (Pa):
 
     - RMSE-1: one step from the ground-truth state (``one_step``),
@@ -376,7 +425,7 @@ class _PaperMetrics:
     As in the paper the squared errors are averaged over all nodes (the
     prescribed ones with error 0), the components of q, the steps and, in
     ``aggregate``, the trajectories before taking the root; the ± value there is
-    the standard error over the trajectories. MeshGraphNet (Pfaff et al.) reports
+    the standard error over the trajectories. MeshGraphNets (Pfaff et al.) reports
     the position RMSE the same way.
     """
 
@@ -460,7 +509,7 @@ def format_paper_metrics(paper: Dict) -> List[str]:
 
 def _log_summary(summary: Dict, vtu_dir: Optional[Path]) -> None:
     logger.info(f"Rollout of {summary['num_sequences']} sequence(s):")
-    logger.info("  paper metrics (MGN-T, Tab. 4/5; ± = standard error over trajectories):")
+    logger.info("  paper metrics (MGN-T v4, Tab. 3; ± = standard error over trajectories):")
     for line in format_paper_metrics(summary["paper_metrics"]):
         logger.info(line)
     logger.info(f"  normalized MSE (mean over steps): {summary['mean_mse_normalized']:.6f}")
@@ -525,14 +574,26 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _file_record(path: Path) -> Dict:
+def _file_record(path: Path, sha256: bool = True) -> Dict:
     """Path, size, modification time and SHA-256: identifies the exact file even if
     a later training overwrites it (best_model.pt)."""
     stat = path.stat()
-    return {"path": str(path), "absolute_path": str(path.resolve()),
-            "size_bytes": stat.st_size,
-            "modified": from_timestamp(stat.st_mtime).isoformat(timespec="seconds"),
-            "sha256": _sha256(path)}
+    record = {"path": str(path), "absolute_path": str(path.resolve()),
+              "size_bytes": stat.st_size,
+              "modified": from_timestamp(stat.st_mtime).isoformat(timespec="seconds")}
+    if sha256:
+        record["sha256"] = _sha256(path)
+    return record
+
+
+def _dataset_record(path: Path) -> Dict:
+    """``_file_record`` of a dataset.db with its content fingerprint (export format
+    v4) instead of the SHA-256 of the whole file, which would take minutes for a
+    large dataset; older exports have no fingerprint and keep the SHA-256."""
+    fingerprint = dataset_fingerprint(path)
+    if fingerprint is None:
+        return _file_record(path)
+    return {**_file_record(path, sha256=False), "fingerprint": fingerprint}
 
 
 def _git_state() -> Dict:
@@ -556,7 +617,7 @@ def _rollout_info(args, trained, checkpoint: Path, data_dir: Path) -> Dict:
     """Everything needed to trace a rollout back to model, data and code."""
     import torch_geometric
 
-    from models.meshgraphnet import count_parameters
+    from models.meshgraphnets import count_parameters
 
     with open(data_dir / "metadata.json") as f:
         data_metadata = json.load(f)
@@ -579,8 +640,10 @@ def _rollout_info(args, trained, checkpoint: Path, data_dir: Path) -> Dict:
         },
         "data": {
             "data_dir": str(data_dir),
-            "dataset_db": _file_record(data_dir / "dataset.db"),
+            "dataset_db": _dataset_record(data_dir / "dataset.db"),
             "normalizer": _file_record(data_dir / "normalizer.json"),
+            # "checkpoint", or for older checkpoints the normalizer.json used
+            "normalizer_source": trained.normalizer_source,
             "split": args.split,
             "max_sequences": args.max_sequences,
             "max_steps": args.max_steps,
@@ -605,7 +668,7 @@ def _write_json(path: Path, content: Dict) -> None:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        description="Autoregressive rollout of a trained model (MeshGraphNet or MGN-T) "
+        description="Autoregressive rollout of a trained model (MeshGraphNets or MGN-T) "
                     "on deforming_plate",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--checkpoint", default=str(
@@ -629,9 +692,12 @@ def main(argv=None) -> int:
     parser.add_argument("--one-step", action=argparse.BooleanOptionalAction, default=True,
                         help="also compute the one-step paper metrics RMSE-1 (a second "
                              "model call per step)")
+    parser.add_argument("--lazy", action=argparse.BooleanOptionalAction, default=None,
+                        help="read the frames from dataset.db on access instead of loading "
+                             "the split (default: as in the training)")
     args = parser.parse_args(argv)
 
-    from train.trainer import load_trained_model
+    from train.trainer import describe_config_source, load_trained_model
 
     checkpoint, data_dir = Path(args.checkpoint), Path(args.data_dir)
     trained = load_trained_model(str(checkpoint), device=args.device, data_dir=str(data_dir))
@@ -640,6 +706,7 @@ def main(argv=None) -> int:
     _setup_logging(output_dir)
     logger.info(f"Rollout folder: {output_dir}")
     logger.info(f"Loaded {checkpoint} (epoch {trained.epoch}) on {trained.device}")
+    logger.info(f"Training config: {describe_config_source(trained.config)}")
 
     info_path = output_dir / "rollout_info.json"
     info = _rollout_info(args, trained, checkpoint, data_dir)
@@ -651,7 +718,7 @@ def main(argv=None) -> int:
 
     start = time.time()
     try:
-        runner = RolloutRunner.from_trained(trained, str(data_dir), output_dir)
+        runner = RolloutRunner.from_trained(trained, str(data_dir), output_dir, lazy=args.lazy)
         summary = runner.run(split=args.split, max_sequences=args.max_sequences,
                              max_steps=args.max_steps, export_vtu=args.export_vtu,
                              one_step=args.one_step)

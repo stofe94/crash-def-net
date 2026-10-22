@@ -4,8 +4,9 @@ normalizer.py — Per-group z-score statistics with JSON persistence.
 Every feature group (``node_features``, ``target``, ``mesh_edge_features``,
 ``world_edge_features`` and, with history, ``target_delta``) stores one mean
 and one standard deviation per column. The exporter fits them once on the
-train split and writes ``normalizer.json`` next to the dataset; training,
-validation and rollout all read that file, so every stage uses the same scale.
+train split and writes ``normalizer.json`` next to the dataset; training reads
+that file and stores a copy in every checkpoint, which rollout and resumed
+training use — so a model keeps its scale even if the dataset is exported anew.
 
 File format (unchanged since the first export)::
 
@@ -63,25 +64,40 @@ class Normalizer:
         mean, std = self._stats_like(values, group)
         return values * std + mean
 
-    def save(self, path: str) -> None:
-        """Write all groups to ``path`` (JSON)."""
+    def to_dict(self) -> Dict:
+        """All groups in the file format (plain lists; stored in checkpoints too)."""
         state = {group: {key: value.tolist() for key, value in stats.items()}
                  for group, stats in self.stats.items()}
-        with open(path, "w") as f:
-            json.dump({"method": _METHOD, "stats": state}, f, indent=2)
+        return {"method": _METHOD, "stats": state}
 
     @classmethod
-    def load(cls, path: str) -> "Normalizer":
-        """Read a file written by ``save``."""
-        with open(path, "r") as f:
-            data = json.load(f)
+    def from_dict(cls, data: Dict, source: str = "normalizer") -> "Normalizer":
+        """Inverse of ``to_dict``."""
         if data.get("method") != _METHOD:
-            raise ValueError(f"{path}: unsupported normalization method "
+            raise ValueError(f"{source}: unsupported normalization method "
                              f"{data.get('method')!r} (expected {_METHOD!r})")
         normalizer = cls()
         for group, stats in data["stats"].items():
             normalizer.set_stats(group, np.array(stats["mean"]), np.array(stats["std"]))
         return normalizer
+
+    def save(self, path: str) -> None:
+        """Write all groups to ``path`` (JSON)."""
+        with open(path, "w") as f:
+            json.dump(self.to_dict(), f, indent=2)
+
+    @classmethod
+    def load(cls, path: str) -> "Normalizer":
+        """Read a file written by ``save``."""
+        with open(path, "r") as f:
+            return cls.from_dict(json.load(f), path)
+
+    def __eq__(self, other) -> bool:
+        """Same groups with exactly the same statistics."""
+        if not isinstance(other, Normalizer) or self.stats.keys() != other.stats.keys():
+            return False
+        return all(np.array_equal(stats[key], other.stats[group][key])
+                   for group, stats in self.stats.items() for key in ("mean", "std"))
 
     # ── internals ───────────────────────────────────────────────────────────
 

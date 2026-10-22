@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-meshgraphnet.py — MeshGraphNet (Pfaff et al., ICLR 2021) with mesh + world edges.
+meshgraphnets.py — MeshGraphNets (Pfaff et al., ICLR 2021) with mesh + world edges.
 
 PyTorch implementation of the Encode-Process-Decode model described in the
 paper for Lagrangian systems with two edge sets, as used for DEFORMING PLATE
@@ -51,7 +51,7 @@ def make_mlp(in_dim: int, out_dim: int, latent_size: int, num_layers: int,
     """``num_layers`` hidden layers of width ``latent_size`` -> ``out_dim``.
 
     The output layer has no activation; ``layer_norm`` appends a LayerNorm.
-    ``activation`` is ReLU for MeshGraphNet and LeakyReLU for MGN-T; both are
+    ``activation`` is ReLU for MeshGraphNets and LeakyReLU for MGN-T; both are
     parameter-free, so the ``state_dict`` layout does not depend on it.
     """
     layers: List[nn.Module] = []
@@ -116,8 +116,8 @@ class GraphNetBlock(nn.Module):
         return nodes, edge_sets
 
 
-class MeshGraphNet(nn.Module):
-    """Encode-Process-Decode MeshGraphNet with mesh and (optional) world edges.
+class MeshGraphNets(nn.Module):
+    """Encode-Process-Decode MeshGraphNets with mesh and (optional) world edges.
 
     ``world_edge_in_dim = 0`` builds a mesh-only model with one edge set.
     ``forward`` returns the normalized node predictions (N, ``output_dim``).

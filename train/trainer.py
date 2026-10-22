@@ -1,5 +1,5 @@
 """
-trainer.py — One-step training of the MeshGraphNet on deforming_plate.
+trainer.py — One-step training of the MeshGraphNets on deforming_plate.
 
 Per batch (in this order):
 
@@ -13,9 +13,17 @@ Per batch (in this order):
 4. Loss on the normalized targets of the nodes in ``loss_mask``, gradient
    clipping, optimizer step; the exponential LR schedule steps per batch.
 
-After every epoch the single-step validation loss and, if enabled, the
-autoregressive rollout error on the val split are computed. The latter then
-drives model selection, early stopping and the plateau scheduler.
+After every epoch the single-step validation loss is computed; with rollout
+validation every N epochs also the autoregressive rollout error on the val
+split, and at every such evaluation the single-step loss on fixed train samples
+without noise (with the val loss: the generalization gap). ``EarlyStopping``
+(train/early_stopping.py) selects the model by the configured criteria and
+decides when to stop. Since it may return to an earlier evaluation, the weights
+of the evaluations it can still select are kept in ``candidates/`` until the
+run has ended.
+
+The last history record notes how the run ended (``end``: ``early_stopping`` or
+``epochs``); an aborted run has none.
 """
 
 from __future__ import annotations
@@ -24,6 +32,7 @@ import copy
 import json
 import logging
 import math
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -35,7 +44,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, ReduceLROnPlateau
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch_geometric.data import Batch
 from tqdm import tqdm
 
@@ -47,13 +56,14 @@ from dataset_preprocessor import (
 from dataset_preprocessor.graph_features import (
     PREV_STRESS_NAMES,
     PREV_VELOCITY_NAMES,
+    add_world_edges,
     displace_nodes,
     free_node_mask,
     prev_to_target_columns,
 )
-from models.meshgraphnet import MeshGraphNet, count_parameters
+from models.meshgraphnets import MeshGraphNets, count_parameters
 from train.config import TrainingConfig
-from train.early_stopping import EarlyStopping
+from train.early_stopping import ROLLOUT_CRITERIA, EarlyStopping
 from utils.normalizer import Normalizer
 from utils.timezone import Formatter, now
 
@@ -84,15 +94,26 @@ def create_dataloaders(config: TrainingConfig, normalizer: Normalizer
     if not db_path.exists():
         raise FileNotFoundError(f"{db_path} not found — export it first: "
                                 "python -m dataset_preprocessor.export")
-    loading = dict(lazy=config.lazy_loading, cache_frames=config.cache_frames)
-    train_set = DeformingPlateDataset(db_path, "train", normalizer, **loading)
+    loading = dict(lazy=config.lazy_loading, cache_frames=config.cache_frames,
+                   static_cache_mb=config.static_cache_mb, world_edges=config.world_edges,
+                   world_edge_exclude_hops=config.world_edge_exclude_hops)
+    # With position noise every train batch gets its world edges anew on the
+    # device (displace_nodes): the contact search in the loader would be wasted.
+    world_edges_in_loader = config.world_noise_std <= 0
+    train_set = DeformingPlateDataset(db_path, "train", normalizer,
+                                      build_world_edges=world_edges_in_loader, **loading)
     val_set = DeformingPlateDataset(db_path, "val", normalizer, **loading)
     test_set = DeformingPlateDataset(db_path, "test", normalizer, **loading)
-    mode = (f"lazy, cache {config.cache_frames} frames per worker" if config.lazy_loading
-            else "in memory")
+    mode = (f"lazy, cache {config.cache_frames} frames and {config.static_cache_mb:g} MB "
+            "of static data per worker" if config.lazy_loading else "in memory")
+    world = config.world_edges
+    if world == "self_contact_aware":
+        world += f", > {config.world_edge_exclude_hops} hops"
+    if not world_edges_in_loader:
+        world += f"; train: built on {config.device}"
     logger.info(f"Data: {db_path} — train {len(train_set)}, val {len(val_set)}, "
                 f"test {len(test_set)} samples (history {train_set.history}, {mode}, "
-                f"{config.num_dataloader_workers} workers)")
+                f"{config.num_dataloader_workers} workers, world edges: {world})")
 
     train_collate = Batch.from_data_list
     if config.scheduled_sampling:
@@ -143,9 +164,10 @@ def create_model(config: TrainingConfig, metadata: Dict,
             ffn_ratio=config.mgn_t_ffn_ratio,
             tau_init=config.mgn_t_tau_init,
             aggregation=config.aggregation,
+            transformer_nodes=config.mgn_t_transformer_nodes,
         )
     else:
-        model = MeshGraphNet(
+        model = MeshGraphNets(
             **dims,
             latent_size=config.latent_size,
             num_mlp_layers=config.num_mlp_layers,
@@ -171,14 +193,35 @@ class TrainedModel:
     normalizer: Normalizer
     epoch: int
     device: torch.device
+    normalizer_source: str = "checkpoint"   # or the normalizer.json it was read from
+
+
+def checkpoint_normalizer(checkpoint: Dict, data_dir, source: str = "checkpoint"
+                          ) -> Tuple[Normalizer, str]:
+    """Statistics a model was trained with, and where they come from.
+
+    Checkpoints store them; older ones fall back to ``<data_dir>/normalizer.json``.
+    If that file differs from the stored statistics (dataset exported anew or
+    grown), the stored ones win and a warning is logged.
+    """
+    path = Path(data_dir) / "normalizer.json"
+    if checkpoint.get("normalizer") is None:
+        return Normalizer.load(str(path)), str(path)
+    normalizer = Normalizer.from_dict(checkpoint["normalizer"], source)
+    if path.exists() and Normalizer.load(str(path)) != normalizer:
+        logger.warning(f"{path} differs from the statistics the model was trained with — "
+                       f"using those of {source}")
+    return normalizer, "checkpoint"
 
 
 def load_trained_model(checkpoint_path: str, device: str = "auto",
                        data_dir: Optional[str] = None) -> TrainedModel:
-    """Restore model, config and metadata of a ``Trainer`` checkpoint (eval mode).
+    """Restore model, config, metadata and normalizer of a ``Trainer`` checkpoint
+    (eval mode).
 
-    The normalizer is read from ``data_dir`` (default: the training data_dir),
-    which must be the dataset the model was trained on.
+    The normalizer comes from the checkpoint; checkpoints without one read it
+    from ``data_dir`` (default: the training data_dir), which must then be the
+    dataset the model was trained on.
     """
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -186,12 +229,23 @@ def load_trained_model(checkpoint_path: str, device: str = "auto",
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = TrainingConfig.from_dict(checkpoint["config"])
     metadata = checkpoint["metadata"]
-    normalizer = Normalizer.load(str(Path(data_dir or config.data_dir) / "normalizer.json"))
+    normalizer, source = checkpoint_normalizer(checkpoint, data_dir or config.data_dir,
+                                               str(checkpoint_path))
 
     model = create_model(config, metadata)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device).eval()
-    return TrainedModel(model, config, metadata, normalizer, checkpoint["epoch"], device)
+    return TrainedModel(model, config, metadata, normalizer, checkpoint["epoch"], device,
+                        source)
+
+
+def describe_config_source(config: TrainingConfig) -> str:
+    """TOML file of the settings plus the command-line options that overrode it."""
+    source = config.config_file or "unknown (checkpoint without config_file)"
+    if config.config_overrides:
+        source += " with " + ", ".join(f"{key}={value}"
+                                       for key, value in config.config_overrides.items())
+    return source
 
 
 def format_duration(seconds: float) -> str:
@@ -204,6 +258,18 @@ def format_duration(seconds: float) -> str:
     if minutes:
         return f"{minutes}m {secs:02d}s"
     return f"{secs}s"
+
+
+def gap_ratio(val_loss: float, train_loss_clean: float) -> float:
+    """Generalization gap as ``max(1, val / train)``: 1 = no gap. Recorded, but no
+    selection criterion (see train/early_stopping.py).
+
+    ``train_loss_clean`` is the single-step loss on train samples without
+    noise, measured like the val loss, so both are directly comparable.
+    """
+    if train_loss_clean <= 0:
+        return math.inf if val_loss > 0 else 1.0
+    return max(1.0, val_loss / train_loss_clean)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -236,33 +302,38 @@ class Trainer:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate,
                                           weight_decay=config.weight_decay)
         self.scheduler = self._create_scheduler()
-        self.early_stopper = EarlyStopping(
-            patience=config.early_stopping_patience,
-            min_delta=config.early_stopping_min_delta,
-            min_epochs=config.early_stopping_min_epochs,
-            gap_weight=config.early_stopping_gap_weight,
-            smoothing_window=config.early_stopping_smoothing_window,
-            efficiency_window=config.early_stopping_efficiency_window,
-            efficiency_threshold=config.early_stopping_efficiency_threshold,
-        ) if config.early_stopping else None
+        # Model selection and early stopping by criteria; those of the rollout need
+        # rollout validation and are left out without it.
+        criteria = [name for name in config.early_stopping_criteria
+                    if config.rollout_validation or name not in ROLLOUT_CRITERIA]
+        if not criteria:
+            raise ValueError(f"criteria {config.early_stopping_criteria} need rollout "
+                             "validation — enable it or add val_loss")
+        self.selection = EarlyStopping(criteria, patience=config.early_stopping_patience,
+                                       min_epochs=config.early_stopping_min_epochs,
+                                       stop=config.early_stopping)
 
         self.rollout_runner = self._new_rollout_runner() if config.rollout_validation else None
         self._last_rollout_metrics: Optional[Dict[str, float]] = None
 
         self.history: List[Dict] = []
-        self.best_selection_loss = float("inf")
         self.best_epoch: Optional[int] = None          # 1-based, of this run
         self._best_model_state: Optional[Dict] = None
 
         self.checkpoint_dir = Path(config.checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # Weights of the evaluations the selection may still return to.
+        self.candidates_dir = self.checkpoint_dir / "candidates"
         self.run_name = run_name or new_run_name()
 
     def _new_rollout_runner(self):
         from predict.rollout import RolloutRunner
         return RolloutRunner(self.model, self.normalizer,
                              Path(self.config.data_dir) / "dataset.db", self.device,
-                             lazy=self.config.lazy_loading)
+                             lazy=self.config.lazy_loading,
+                             world_edges=self.config.world_edges,
+                             world_edge_exclude_hops=self.config.world_edge_exclude_hops,
+                             static_cache_mb=self.config.static_cache_mb)
 
     def _check_history_options(self) -> None:
         """Options that need the history layout (``*_prev`` inputs)."""
@@ -323,6 +394,7 @@ class Trainer:
         was_training = self.model.training
         self.model.eval()
         with torch.no_grad():
+            prev_batch = self._with_world_edges(prev_batch)
             prediction = self.normalizer.denormalize(self.model(prev_batch), "target")
         self.model.train(was_training)
 
@@ -389,8 +461,10 @@ class Trainer:
 
             if prev_batch is not None and epoch > 0:
                 batch = self._apply_scheduled_sampling(batch, prev_batch, epoch)
-            if self.config.world_noise_std > 0:
+            if self.config.world_noise_std > 0:   # also builds the world edges
                 batch = self._apply_position_noise(batch)
+            else:
+                batch = self._with_world_edges(batch)
             if self.config.stress_noise_std > 0 and self.stress_prev_column is not None:
                 batch = self._apply_stress_noise(batch)
 
@@ -413,11 +487,22 @@ class Trainer:
         """Mean single-step loss per graph (no noise, no scheduled sampling)."""
         self.model.eval()
         total_loss, num_graphs = 0.0, 0
-        for batch in loader:
-            batch = batch.to(self.device)
+        for batch in self._prepared(loader):
             total_loss += self._loss(batch, self.model(batch)).item() * batch.num_graphs
             num_graphs += batch.num_graphs
         return total_loss / max(num_graphs, 1)
+
+    def _with_world_edges(self, batch):
+        """``batch`` with world edges; samples built without them
+        (``build_world_edges=False``) get them here, on the device."""
+        if getattr(batch, "world_edge_index", None) is None:
+            add_world_edges(batch, self.normalizer, self.contact_radius)
+        return batch
+
+    def _prepared(self, loader: DataLoader):
+        """The batches of ``loader`` on the device, with world edges."""
+        for batch in loader:
+            yield self._with_world_edges(batch.to(self.device))
 
     def validate_rollout(self) -> Dict[str, float]:
         """Autoregressive rollout over the val split with the current weights."""
@@ -435,37 +520,49 @@ class Trainer:
             "rollout_pos_rmse_final": float(position_rmse[-1]),
         }
 
-    def _selection_loss(self, epoch: int, val_loss: float
-                        ) -> Tuple[float, Optional[Dict[str, float]]]:
-        """Loss used for model selection, plus fresh rollout metrics if computed.
-
-        Without rollout validation this is the single-step val loss. With it,
-        the rollout runs every ``rollout_validation_every`` epochs and in the
-        last epoch; in between the last rollout result is reused. Which rollout
-        metric counts is set by ``rollout_selection_metric``.
-        """
+    def _rollout_metrics(self, epoch: int) -> Optional[Dict[str, float]]:
+        """Val rollout metrics if a rollout validation is due after ``epoch``:
+        every ``rollout_validation_every`` epochs, in the first and in the last
+        epoch. None in between and without rollout validation."""
         if self.rollout_runner is None:
-            return val_loss, None
+            return None
         every = max(1, int(self.config.rollout_validation_every))
-        fresh = None
         if ((epoch + 1) % every == 0 or epoch + 1 == self.config.epochs
                 or self._last_rollout_metrics is None):
-            fresh = self._last_rollout_metrics = self.validate_rollout()
-        metric = f"rollout_{self.config.rollout_selection_metric}"
-        return self._last_rollout_metrics[metric], fresh
+            self._last_rollout_metrics = self.validate_rollout()
+            return self._last_rollout_metrics
+        return None
+
+    def _train_eval_loader(self, train_loader: DataLoader, val_loader: DataLoader
+                           ) -> DataLoader:
+        """Fixed train samples, evenly spread and as many as the val split, for the
+        single-step loss without noise (comparable to the val loss). Loaded in the
+        main process: workers started anew at every evaluation took 7-8 s for the
+        392 samples of the s8 dataset, the main process 0.5 s."""
+        train_set = train_loader.dataset
+        if isinstance(train_set, PredecessorPairDataset):
+            train_set = train_set.base
+        count = min(len(train_set), len(val_loader.dataset))
+        indices = sorted({round(i * (len(train_set) - 1) / max(count - 1, 1))
+                          for i in range(count)})
+        return DataLoader(Subset(train_set, indices), batch_size=val_loader.batch_size,
+                          shuffle=False, collate_fn=Batch.from_data_list,
+                          pin_memory=val_loader.pin_memory)
 
     def train(self, train_loader: DataLoader, val_loader: DataLoader,
               start_epoch: int = 0) -> None:
         """Main loop: train, validate, select, checkpoint, early-stop."""
         cfg = self.config
         logger.info(f"Run {self.run_name} on {self.device}, output: {self.checkpoint_dir}")
-        if cfg.architecture == "meshgraphnet":
+        logger.info(f"Config: {describe_config_source(cfg)}")
+        if cfg.architecture == "meshgraphnets":
             architecture = (f"latent {cfg.latent_size}, {cfg.num_message_passing_steps} "
                             "message passing steps")
         elif cfg.architecture == "mgn_t":
             architecture = (f"mgn_t: {cfg.mgn_t_num_pre_mp_steps}+{cfg.mgn_t_num_post_mp_steps} "
                             f"message passing steps, {cfg.mgn_t_num_transformer_blocks} "
-                            f"transformer blocks, {cfg.mgn_t_num_tokens} tokens, "
+                            f"transformer blocks over {cfg.mgn_t_transformer_nodes} nodes, "
+                            f"{cfg.mgn_t_num_tokens} tokens, "
                             f"widths {cfg.mgn_t_latent_size}-{cfg.mgn_t_token_dim}")
         else:
             architecture = cfg.architecture
@@ -477,6 +574,17 @@ class Trainer:
             json.dump(cfg.to_dict(), f, indent=2)
         history_path = self.checkpoint_dir / "history.json"
 
+        # Single-step loss without noise on fixed train samples at every
+        # evaluation: with the val loss it gives the generalization gap (recorded,
+        # no selection criterion).
+        train_eval_loader = self._train_eval_loader(train_loader, val_loader)
+        if self.rollout_runner is not None:   # no second copy of the val split
+            self.rollout_runner.share_dataset("val", val_loader.dataset)
+        for record in self.history:   # resumed: the run goes on
+            record.pop("end", None)
+        # With one criterion the selection never returns to an earlier evaluation.
+        keep_candidates = len(self.selection.criteria) > 1
+
         start_time = time.time()
         epoch_durations: List[float] = []
         epoch = start_epoch - 1
@@ -484,31 +592,34 @@ class Trainer:
             epoch_start = time.time()
             train_loss = self.train_epoch(train_loader, epoch)
             val_loss = self.validate(val_loader)
-            selection_loss, rollout_metrics = self._selection_loss(epoch, val_loss)
+            rollout_metrics = self._rollout_metrics(epoch)
             learning_rate = self.optimizer.param_groups[0]["lr"]
-            # With rollout validation every N epochs the epochs in between reuse
-            # the last value; only fresh values may count as (no) improvement.
-            fresh = self.rollout_runner is None or rollout_metrics is not None
+            # An evaluation: every epoch without rollout validation, else every
+            # rollout validation. Only evaluations select the model and stop.
+            evaluated = self.rollout_runner is None or rollout_metrics is not None
+            values = {"val_loss": val_loss, **(rollout_metrics or {})}
+            train_loss_clean = self.validate(train_eval_loader) if evaluated else None
 
             if isinstance(self.scheduler, ReduceLROnPlateau):
-                if fresh:
-                    self.scheduler.step(selection_loss)
+                if evaluated:   # follows the first criterion
+                    self.scheduler.step(values[self.selection.criteria[0]])
             elif isinstance(self.scheduler, CosineAnnealingLR):
                 self.scheduler.step()
 
-            if not fresh:
-                is_best = False
-            elif self.early_stopper is not None:
-                # With rollout validation the train loss (with noise and scheduled
-                # sampling) is not comparable to the rollout error: no gap term.
-                reference = selection_loss if self.rollout_runner else train_loss
-                is_best = self.early_stopper.step(epoch, selection_loss, reference)
-            else:
-                is_best = selection_loss < self.best_selection_loss
-            if is_best:
-                self.best_selection_loss = selection_loss
-                self.best_epoch = epoch + 1
-                self._best_model_state = copy.deepcopy(self.model.state_dict())
+            is_best, selected = False, None   # selected: 1-based epoch for best_model.pt
+            if evaluated:
+                if keep_candidates:
+                    self._save_candidate(epoch + 1)
+                best = self.selection.step(epoch, values) + 1
+                is_best = best == epoch + 1
+                if best != self.best_epoch:   # new, or back to an earlier evaluation
+                    selected = self.best_epoch = best
+                    self._best_model_state = (copy.deepcopy(self.model.state_dict())
+                                              if is_best else self._load_candidate(best))
+                if keep_candidates:
+                    for dominated in self.selection.dominated_by_latest():
+                        (self.candidates_dir / f"epoch_{dominated + 1:04d}.pt").unlink(
+                            missing_ok=True)
 
             epoch_durations.append(time.time() - epoch_start)
             record = {
@@ -521,24 +632,37 @@ class Trainer:
             }
             if rollout_metrics is not None:
                 record.update({f"val_{key}": value for key, value in rollout_metrics.items()})
+            if train_loss_clean is not None:
+                record["train_loss_clean"] = train_loss_clean
+                record["gap_ratio"] = gap_ratio(val_loss, train_loss_clean)
             self.history.append(record)
+            if evaluated:
+                self._mark_selection()
             with open(history_path, "w") as f:
                 json.dump(self.history, f, indent=2)
 
-            if is_best:
-                self.save_checkpoint(self.checkpoint_dir / "best_model.pt", epoch + 1)
+            if selected is not None:
+                self._save_best(selected, current=is_best)
             if (epoch + 1) % cfg.save_every == 0:
                 self.save_checkpoint(self.checkpoint_dir / f"checkpoint_epoch_{epoch + 1}.pt",
                                      epoch + 1)
             if (epoch + 1) % cfg.log_every == 0:
                 self._log_epoch(epoch, record, rollout_metrics, epoch_durations, start_time)
 
-            if self.early_stopper is not None and self.early_stopper.should_stop:
+            if self.selection.should_stop:
                 logger.info(f"Early stopping after epoch {epoch + 1}: "
-                            f"{self.early_stopper.stop_reason()}")
+                            f"{self.selection.stop_reason()}")
                 break
 
         last_epoch = epoch + 1
+        if last_epoch > start_epoch:
+            # How the run ended; an aborted run has no such record.
+            self.history[-1]["end"] = ("early_stopping" if self.selection.should_stop
+                                       else "epochs")
+            if self.selection.should_stop:
+                self.history[-1]["stop_reason"] = self.selection.stop_reason()
+            with open(history_path, "w") as f:
+                json.dump(self.history, f, indent=2)
         if last_epoch > start_epoch and last_epoch % cfg.save_every != 0:
             # Final state, so the run can be resumed.
             self.save_checkpoint(self.checkpoint_dir / f"checkpoint_epoch_{last_epoch}.pt",
@@ -546,8 +670,11 @@ class Trainer:
         # Test evaluation and later use start from the selected model.
         if self._best_model_state is not None:
             self.model.load_state_dict(self._best_model_state)
-            logger.info(f"Restored best model from epoch {self.best_epoch} "
-                        f"(selection loss {self.best_selection_loss:.4f})")
+            for line in self.selection.report():
+                logger.info(line)
+            logger.info(f"Restored the selected model (epoch {self.best_epoch})")
+            if self.candidates_dir.exists():
+                shutil.rmtree(self.candidates_dir)
         elif (self.checkpoint_dir / "best_model.pt").exists():   # resumed, no new best
             best = torch.load(self.checkpoint_dir / "best_model.pt",
                               map_location=self.device, weights_only=False)
@@ -569,22 +696,27 @@ class Trainer:
             logger.info(f"Scheduled sampling: teacher forcing {cfg.scheduled_sampling_start_ratio}"
                         f" -> {cfg.scheduled_sampling_end_ratio} over "
                         f"{cfg.scheduled_sampling_warmup_epochs} epochs")
-        if self.rollout_runner is not None:
-            metric = {"mse": "MSE", "pos_rmse": "position RMSE",
-                      "pos_rmse_final": "final position RMSE"}[cfg.rollout_selection_metric]
-            logger.info(f"Model selection: val rollout {metric} every "
-                        f"{cfg.rollout_validation_every} epoch(s)")
-        if self.early_stopper is not None:
-            es = self.early_stopper
-            logger.info(f"Early stopping: patience {es.patience}, min_epochs {es.min_epochs}, "
-                        f"min_delta {es.min_delta}, gap_weight {es.gap_weight}, "
-                        f"smoothing {es.smoothing_window}, efficiency window "
-                        f"{es.efficiency_window} / threshold {es.efficiency_threshold}")
+        selection = self.selection
+        when = (f"every {cfg.rollout_validation_every} epoch(s) with a val rollout"
+                if self.rollout_runner else "every epoch")
+        logger.info(f"Model selection {when} by {', '.join(selection.criteria)}"
+                    + (" — the evaluation closest to the best in all of them"
+                       if len(selection.criteria) > 1 else ""))
+        left_out = [c for c in cfg.early_stopping_criteria if c not in selection.criteria]
+        if left_out:
+            logger.info(f"    without rollout validation not used: {', '.join(left_out)}")
+        if cfg.early_stopping:
+            logger.info(f"Early stopping after at least {selection.min_epochs} epochs: "
+                        f"{selection.patience} evaluations without a new low in any "
+                        f"criterion")
 
     def _log_epoch(self, epoch: int, record: Dict, rollout_metrics: Optional[Dict],
                    epoch_durations: List[float], start_time: float) -> None:
         message = (f"Epoch {epoch + 1:4d}/{self.config.epochs} | "
                    f"train {record['train_loss']:.4f} | val {record['val_loss']:.4f}")
+        if record.get("train_loss_clean") is not None:
+            message += (f" | train (no noise) {record['train_loss_clean']:.4f}, "
+                        f"gap x{record['gap_ratio']:.2f}")
         if rollout_metrics is not None:
             message += (f" | rollout mse {rollout_metrics['rollout_mse']:.4f}, "
                         f"pos rmse {rollout_metrics['rollout_pos_rmse']:.4f} "
@@ -600,38 +732,74 @@ class Trainer:
                   f"elapsed {format_duration(time.time() - start_time)}, "
                   f"remaining ~{format_duration(remaining)} "
                   f"(finish ~{finish:%d.%m. %H:%M})")
-        if self.early_stopper is not None:
-            timing += f" | early stopping: {self.early_stopper.status()}"
+        timing += f" | {self.selection.status()}"
         logger.info(timing)
 
     # ── checkpoints ─────────────────────────────────────────────────────────
 
-    def save_checkpoint(self, path: Path, epoch: int) -> None:
-        """Save the current state; ``epoch`` = number of completed epochs."""
+    def save_checkpoint(self, path: Path, epoch: int,
+                        model_state: Optional[Dict] = None) -> None:
+        """Save the current state; ``epoch`` = number of completed epochs.
+
+        With ``model_state`` (weights of an earlier evaluation) the optimizer and
+        scheduler state are left out: they belong to the current weights.
+        """
+        current = model_state is None
         torch.save({
             "epoch": epoch,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
-            "best_val_loss": self.best_selection_loss,
+            "model_state_dict": self.model.state_dict() if current else model_state,
+            "optimizer_state_dict": self.optimizer.state_dict() if current else None,
+            "scheduler_state_dict": (self.scheduler.state_dict()
+                                     if current and self.scheduler else None),
+            "best_val_loss": self.selection.best_score,   # selection score (0 = best in all)
             "config": self.config.to_dict(),
             "metadata": self.metadata,
+            "normalizer": self.normalizer.to_dict(),   # the scale the weights belong to
             "history": self.history,
         }, path)
         logger.debug(f"Saved {path}")
 
+    def _save_best(self, epoch: int, current: bool) -> None:
+        """``best_model.pt`` with the selected weights (``self._best_model_state``)."""
+        self.save_checkpoint(self.checkpoint_dir / "best_model.pt", epoch,
+                             model_state=None if current else self._best_model_state)
+
+    def _save_candidate(self, epoch: int) -> None:
+        """Weights after ``epoch``; the consistent selection may return to them."""
+        self.candidates_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(self.model.state_dict(), self.candidates_dir / f"epoch_{epoch:04d}.pt")
+
+    def _load_candidate(self, epoch: int) -> Dict:
+        return torch.load(self.candidates_dir / f"epoch_{epoch:04d}.pt",
+                          map_location=self.device, weights_only=True)
+
+    def _mark_selection(self) -> None:
+        """Flag the selected epoch in the history (``selected``) and store the
+        current score of every evaluation, which changes as the lowest values of
+        the criteria move."""
+        scores = {epoch + 1: score for epoch, score
+                  in zip(self.selection.epochs, self.selection.scores())}
+        for record in self.history:
+            record["selected"] = record["epoch"] == self.best_epoch
+            if record["epoch"] in scores:
+                record["selection_score"] = scores[record["epoch"]]
+            else:
+                record.pop("selection_score", None)
+
     def load_checkpoint(self, path: str) -> int:
         """Continue from ``path``; returns the number of completed epochs.
 
-        The early-stopping state is not stored and starts fresh, so the first
-        resumed epoch counts as a new best for the early stopper.
+        The selection state is not stored and starts fresh: only the evaluations
+        after the resume are candidates, and the first one is selected at first.
         """
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if checkpoint.get("optimizer_state_dict") is not None:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        else:   # best_model.pt of an earlier evaluation
+            logger.warning(f"{path} holds no optimizer state — the optimizer starts fresh")
         if self.scheduler is not None and checkpoint.get("scheduler_state_dict"):
             self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        self.best_selection_loss = checkpoint["best_val_loss"]
         self.history = list(checkpoint.get("history", []))
         logger.info(f"Resumed from {path} after epoch {checkpoint['epoch']}")
         return checkpoint["epoch"]
@@ -643,33 +811,38 @@ class Trainer:
         """Single-step test metrics on the nodes in ``loss_mask``.
 
         Normalized MSE/MAE over all targets, plus RMSE/MAE per target field in
-        raw units (velocity in m per selected frame, stress in Pa).
+        raw units (velocity in m per selected frame, stress in Pa). The errors
+        are summed per batch (float64), so memory does not grow with the split.
         """
         self.model.eval()
-        predictions, targets = [], []
-        for batch in loader:
-            batch = batch.to(self.device)
+        sums = torch.zeros(4, len(self.target_names), dtype=torch.float64)
+        rows = 0
+        for batch in self._prepared(loader):
             mask = batch.loss_mask
-            predictions.append(self.model(batch)[mask].cpu())
-            targets.append(batch.y[mask].cpu())
-        prediction = torch.cat(predictions)
-        target = torch.cat(targets)
-        error = prediction - target
-        raw_error = (self.normalizer.denormalize(prediction, "target")
-                     - self.normalizer.denormalize(target, "target"))
+            prediction, target = self.model(batch)[mask], batch.y[mask]
+            raw_error = (self.normalizer.denormalize(prediction, "target")
+                         - self.normalizer.denormalize(target, "target"))
+            error = prediction - target
+            sums += torch.stack((error.pow(2).sum(0), error.abs().sum(0),
+                                 raw_error.pow(2).sum(0), raw_error.abs().sum(0))).double().cpu()
+            rows += int(mask.sum())
+        squared, absolute, raw_squared, raw_absolute = sums / max(rows, 1)
         return {
-            "mse_normalized": error.pow(2).mean().item(),
-            "mae_normalized": error.abs().mean().item(),
-            "rmse_per_field": {name: math.sqrt(raw_error[:, i].pow(2).mean().item())
+            "mse_normalized": squared.mean().item(),
+            "mae_normalized": absolute.mean().item(),
+            "rmse_per_field": {name: math.sqrt(raw_squared[i].item())
                                for i, name in enumerate(self.target_names)},
-            "mae_per_field": {name: raw_error[:, i].abs().mean().item()
+            "mae_per_field": {name: raw_absolute[i].item()
                               for i, name in enumerate(self.target_names)},
         }
 
-    def evaluate_rollout(self, split: str = "test") -> Dict:
+    def evaluate_rollout(self, split: str = "test", dataset=None) -> Dict:
         """Full rollout of every trajectory of ``split`` with the paper metrics
-        (RMSE-1, RMSE-all, R-RMSE of position and stress, see predict/rollout.py)."""
+        (RMSE-1, RMSE-all, R-RMSE of position and stress, see predict/rollout.py);
+        ``dataset`` (that split, e.g. of the test loader) is used instead of a new one."""
         runner = self.rollout_runner or self._new_rollout_runner()
+        if dataset is not None:
+            runner.share_dataset(split, dataset)
         was_training = self.model.training
         try:
             summary = runner.run(split=split, export_vtu=False, verbose=False, one_step=True)
@@ -699,7 +872,7 @@ class Trainer:
             logger.info(f"    {name:12s} RMSE {metrics['rmse_per_field'][name]:.4e}  "
                         f"MAE {metrics['mae_per_field'][name]:.4e}")
         from predict.rollout import format_paper_metrics
-        metrics["rollout"] = self.evaluate_rollout("test")
+        metrics["rollout"] = self.evaluate_rollout("test", loader.dataset)
         logger.info(f"Test (full rollout, {len(metrics['rollout']['sequences'])} trajectories), "
                     "paper metrics (± = standard error over trajectories):")
         for line in format_paper_metrics(metrics["rollout"]["paper_metrics"]):
