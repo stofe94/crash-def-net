@@ -17,6 +17,7 @@ and config, and ``test_metrics.json``.
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -85,7 +86,7 @@ def main(argv=None) -> None:
         normalizer = Normalizer.load(str(data_dir / "normalizer.json"))
 
     train_loader, val_loader, test_loader = create_dataloaders(config, normalizer)
-    config.resolve_lr_decay_steps(len(train_loader))
+    config.resolve_lr_decay_steps(math.ceil(len(train_loader) / config.accumulation_steps))
     model = create_model(config, metadata, normalizer)
     trainer = Trainer(model, config, normalizer, metadata, run_name)
 

@@ -38,8 +38,8 @@ Every call writes into a folder of its own and never overwrites an earlier rollo
 
 | File | Content |
 |---|---|
-| `rollout_info.json` | traceability: checkpoint (path, SHA-256, modification time, epoch, training config with its source TOML file, SHA-256 and command-line overrides), dataset (path, content fingerprint of `dataset.db` — the SHA-256 of the file for exports before format v4 —, SHA-256 of `normalizer.json`, `normalizer_source`, split, trajectories, check against the training dataset), options, command line, git commit including uncommitted changes, package versions, status, duration and metrics |
-| `<split>_rollout_summary.json` | paper metrics, normalized MSE, RMSE / MAE per target and position RMSE, each per step and per trajectory |
+| `rollout_info.json` | traceability: checkpoint (path, SHA-256, epoch, training config and its source), dataset (path, content fingerprint, normalizer, split, check against the training dataset), options, command line, git commit, package versions, status, duration, metrics |
+| `<split>_rollout_summary.json` | paper metrics, normalized MSE, RMSE / MAE per target, position RMSE and RMS displacement of the ground truth ([internal metrics](#internal-metrics)), per step, for every trajectory and as their mean |
 | `rollout.log` | log of the run |
 | `<split>/<trajectory>/tNNNN.vtu` | per step: predicted mesh with prediction, ground truth and error as point data (needs pyvista; skip with `--no-export-vtu`) |
 | `<split>/<trajectory>/<trajectory>.vtu.series` | opens the whole trajectory in ParaView as a time series (time = rollout step) |
@@ -55,7 +55,7 @@ deviates.
 ### Animation
 
 ```bash
-python utils/animate_rollout.py rollouts/<a> [rollouts/<b> ...] --trajectory test_traj0037
+python utils/animate_rollout.py rollouts/<a> [rollouts/<b> ...] --trajectory test_traj0136
 ```
 
 Renders one trajectory as an animated GIF: the ground truth (FEM) next to the prediction
@@ -73,7 +73,7 @@ ground truth. Writes `rollout_<trajectory>.gif` into a new folder
 | `--output` | new folder in `evaluations/` | GIF file |
 
 Rendering runs off-screen in software (Mesa), so it needs neither a GPU nor a display
-and gives the same frames on every machine; 48 steps with three panels take about 20 s.
+and gives the same frames on every machine; 98 steps with three panels take about 20 s.
 Needs `pyvista`.
 
 ## Metrics
@@ -90,28 +90,57 @@ in the rollout summary, in `rollout_info.json` and in `test_metrics.json`:
 | RMSE-all | over the whole rollout |
 | R-RMSE | as above, error divided by the infinity norm of the trajectory (largest \|q\| component or \|σ\|) |
 
-As in the paper, the squared error is averaged over all nodes, the components of q,
-all steps and all trajectories before taking the root. `_se` is the standard error over
-the trajectories. The log shows the values in the units of the paper's tables
-(q ×10⁻³ m, σ ×10³ Pa, R-RMSE in %).
-
-Paper values for `deforming_plate` (400 steps, stride 1): MGN-T q RMSE-all
-3.16 ± 0.25 ×10⁻³ m, σ 5.83 ± 0.34 ×10³ Pa; MeshGraphNets q 15.1 ×10⁻³ m. With a
-different stride or fewer steps the numbers are only partly comparable.
+As in the paper, the squared error is averaged over all nodes, components, steps and
+trajectories before taking the root: one RMSE over all trajectories together
+(**pooled**). A trajectory with a large error weighs more than in the median: RMSEs of
+2, 2 and 8 mm on three equal trajectories give √((2² + 2² + 8²) / 3) = 4.9 mm pooled and
+2.0 mm as median. Median, best and worst first take one RMSE per trajectory, then the
+median, the smallest and the largest of them: here 2.0, 2 and 8 mm. `_se` is the standard
+error over the trajectories. The log shows the
+units of the paper's tables (q ×10⁻³ m, σ ×10³ Pa, R-RMSE in %).
 
 ### Internal metrics
 
 Used for model selection and logged during training: `rollout mse` (normalized MSE) and
-`pos rmse` (length of the position error vector per node, free and clamped nodes, mean
-of the per-step RMSEs). `pos rmse` is therefore larger than q RMSE-all (among other
-things by a factor of ≈ √3, since it uses the vector length instead of the component
-mean) and not directly comparable with the paper.
+`pos rmse` (length of the position error vector per node, mean of the per-step RMSEs;
+by the vector length about √3 times q RMSE-all, not comparable with the paper).
+
+`displacement_rms_per_step` in the rollout summary is the RMS displacement of the ground
+truth since step 1, the last exact positions, with the nodes and norm of `pos rmse`: the
+position error of a prediction in which nothing moves. Position error over displacement
+is the error as a share of the deformation.
+
+## Evaluating a run
+
+```bash
+python utils/evaluate_run.py rollouts/<rollout>     # the rollout and its training run
+python utils/evaluate_run.py checkpoints/<run>      # without a rollout: test_metrics.json
+```
+
+Evaluates one run on its own, without the paper: the training, the single-step test
+errors and the rollout with its spread over the trajectories. Writes a new folder
+`evaluations/<YYYYMMDD_HHMMSS>_<run>_evaluation/`, or into the new or empty folder given
+with `--output-dir`:
+
+| File | Content |
+|---|---|
+| `01_training.png` | losses, val rollout, generalization gap over the epochs, selected epoch |
+| `02_error_per_step.png` | error over the rollout: mean, best and worst trajectory, RMS displacement of the ground truth (rollout folder only) |
+| `03_trajectories.png` | every metric pooled, as median, best and worst trajectory |
+| `evaluation.md` | run with peak memory, findings, tables of training, single-step errors, rollout metrics and every trajectory |
+| `trajectories.csv`, `evaluation.json` | the values, in SI units |
+
+The findings are measurements, not verdicts: end of the training, scatter of the
+selection criterion, generalization gap, single-step test error against the val loss,
+pooled error against the median and trajectories far above it, error growth, error
+relative to the displacement. A checkpoint folder alone uses `test_metrics.json`
+(paper metrics per trajectory, no curves per step).
 
 ## Comparison with the paper
 
 ```bash
 python utils/compare_paper.py                      # every finished rollout in rollouts/
-python utils/compare_paper.py rollouts/<a> rollouts/<b> --exclude test_traj0038
+python utils/compare_paper.py rollouts/<a> rollouts/<b> --exclude test_traj0149
 ```
 
 Sets the paper metrics of the rollouts against MGN-T (arXiv v4, Tab. 3 on p. 7) and
@@ -124,7 +153,7 @@ a new folder `evaluations/<YYYYMMDD_HHMMSS>_paper_comparison/`:
 | `01_absolute_errors.png` | RMSE-1 and RMSE-all of position and stress next to the paper |
 | `02_relative_errors.png` | R-RMSE of position and stress |
 | `03_error_per_step.png` | error over the rollout steps |
-| `04_error_per_trajectory.png` | RMSE-all per trajectory, paper mean as reference line |
+| `04_error_per_trajectory.png` | RMSE-all over the trajectories of every rollout: all pooled, median, best and worst trajectory; paper mean as reference line |
 | `05_table_metrics.png`, `05b_table_compact.png`, `06_table_conditions.png` | tables as images: all metrics, summary with the multiple of the paper, conditions of each run |
 | `comparison.md`, `metrics.csv`, `metrics.json` | report with all tables and figures, raw values |
 

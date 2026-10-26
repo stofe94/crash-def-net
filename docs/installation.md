@@ -11,8 +11,8 @@
 
   | Config (small dataset, 8/2/2 trajectories) | Parameters | per epoch | Memory |
   |---|---|---|---|
-  | `config.example.toml` (MGN-T, minimal size) | 50 k | ~25 s, 5 epochs in ~2 min | 0.7 GB |
-  | same with `architecture = "meshgraphnets"` (latent 64, 8 steps) | 0.53 M | ~2 min 10 s, 30 epochs in ~1 h | 1.7 GB |
+  | `config.example.toml` (MGN-T, minimal size) | 50 k | ~30 s, 5 epochs in ~2.5 min | 0.6 GB |
+  | same with `architecture = "meshgraphnets"` (latent 64, 8 steps) | 0.53 M | ~2 min 30 s, 30 epochs in ~1 h 15 min | 1.6 GB |
 - Large datasets need no machine with much RAM: the export and lazy loading keep only
   one block of a run or one sample in memory ([data.md](data.md#large-datasets)).
   LS-DYNA runs need `lasso-python`, VTK files `pyvista` ([Dependencies](#dependencies)).
@@ -62,10 +62,10 @@ pip install -e ".[dev]"                  # optional: package install + pytest, r
 CrashDefNet uses DeepMind's `deforming_plate` dataset from the
 [MeshGraphNets release](https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets).
 It is not part of the repository and comes under DeepMind's terms, not CrashDefNet's
-license ([details](data.md#the-benchmark)). The example config and the results in this
-release need only [`meta.json`](https://storage.googleapis.com/dm-meshgraphnets/deforming_plate/meta.json) and [`test.tfrecord`](https://storage.googleapis.com/dm-meshgraphnets/deforming_plate/test.tfrecord)
-(~0.8 GB, 100 trajectories). The test file is used for reasons of size; the exporter
-splits its trajectories into separate train, validation and test sets:
+license ([details](data.md#the-benchmark)). The example config and the quick start
+need only [`meta.json`](https://storage.googleapis.com/dm-meshgraphnets/deforming_plate/meta.json) and [`test.tfrecord`](https://storage.googleapis.com/dm-meshgraphnets/deforming_plate/test.tfrecord)
+(~0.8 GB, 100 trajectories); the exporter splits its trajectories into separate train,
+validation and test sets:
 
 ```bash
 wget -P datasets/deforming_plate/raw_dataset \
@@ -73,9 +73,13 @@ wget -P datasets/deforming_plate/raw_dataset \
     https://storage.googleapis.com/dm-meshgraphnets/deforming_plate/test.tfrecord
 ```
 
-The full training split ([`train.tfrecord`](https://storage.googleapis.com/dm-meshgraphnets/deforming_plate/train.tfrecord), 1,000 trajectories,
-~9.9 GB) can be exported with `--source-tfrecord train.tfrecord`. The folder address
-itself is not browsable; only the file links work.
+The [comparison protocol](comparison-protocol.md) and the [results](results.md) take each
+split from DeepMind's original one and also need the training split
+([`train.tfrecord`](https://storage.googleapis.com/dm-meshgraphnets/deforming_plate/train.tfrecord), 1,200 trajectories, ~9.9 GB) and
+[`valid.tfrecord`](https://storage.googleapis.com/dm-meshgraphnets/deforming_plate/valid.tfrecord) (100 trajectories, ~0.8 GB):
+`--source-tfrecord train.tfrecord valid.tfrecord test.tfrecord`, with `--select-seed`
+drawing the trajectories at random ([options](data.md#export)). The folder address itself is not browsable; only the file
+links work.
 
 ## Check the installation
 
@@ -85,7 +89,7 @@ python train/train.py --config config.example.toml --epochs 1
 ```
 
 The first command prints the exported sample counts. The second one trains one epoch
-on the CPU (~25 s) and ends with test metrics.
+on the CPU (~30 s) and ends with test metrics.
 
 ## Troubleshooting
 
@@ -94,6 +98,12 @@ is imported after torch. The environment mixes a conda build of matplotlib with 
 builds of torch. Fix: `conda remove matplotlib matplotlib-base` and
 `pip install matplotlib`, or recreate the environment from the current
 `environment.yml`.
+
+**`ERROR: pip's dependency resolver ... lasso-python ... requires ...`** after a
+`pip install`: lasso-python pins versions of packages that only its modules
+`lasso.dimred` and `lasso.diffcrash` use; CrashDefNet uses only `lasso.dyna`, so the
+message can be ignored. Check: `python -m dataset_preprocessor.tfrecord_to_d3plot
+--count 2` writes two runs and reads them back ("read-back OK").
 
 **`dataset.db exists`** from the exporter with `--no-overwrite`. Remove the flag or
 choose another `--out-dir`.

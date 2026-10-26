@@ -2,35 +2,19 @@
 
 CrashDefNet turns simulation runs into a training dataset. It reads three raw formats:
 
-| Raw format | Typical source | Details |
+| Raw format | Status | Details |
 |---|---|---|
-| DeepMind TFRecord (default) | the `deforming_plate` benchmark | [The benchmark](#the-benchmark), [Export](#export) |
-| LS-DYNA runs (`d3plot` with keyword deck) | crash simulations | [Second raw format](#second-raw-format-ls-dyna-runs-d3plot) |
-| VTK time series (`.vtu`, `.vtp`, `.vtk`) | ParaView and other solvers or post-processors | [Third raw format](#third-raw-format-vtk-time-series-vtu--vtp--vtk) |
+| DeepMind TFRecord (default) | standard: the `deforming_plate` benchmark | [The benchmark](#the-benchmark), [Export](#export) |
+| LS-DYNA runs (`d3plot` with keyword deck) | early stage, checked on runs converted from `deforming_plate` | [Second raw format](#second-raw-format-ls-dyna-runs-d3plot) |
+| VTK time series (`.vtu`, `.vtp`, `.vtk`) | early stage, checked on runs converted from `deforming_plate` | [Third raw format](#third-raw-format-vtk-time-series-vtu--vtp--vtk) |
 
-The TFRecord is the format of the benchmark and of the comparison with the papers.
-
-**For research, also on industrial data.** Besides benchmarks, CrashDefNet is compatible
-with the data of industrial crash simulations, so it can serve research close to
-industrial applications as well. The LS-DYNA reader takes shells, solids, thick shells
-and beams in mixed meshes, rigid parts, prescribed motion, initial velocities,
-thicknesses and rigid walls from the d3plot and its keyword deck; the VTK reader takes
-general linear cells, parts and fields, e.g. of files exported by ParaView's LS-DYNA
-reader ([general meshes and run parameters](#general-meshes-and-run-parameters)).
-
-Large datasets and meshes need only modest hardware: the export reads every run in
-blocks of frames, so a run need not fit into memory, and with lazy loading the training
-reads only the frames of the current sample, so its memory does not depend on the size
-of the dataset. Vehicle-crash datasets of a few hundred GB work this way, an interrupted
-export continues where it stopped, and the contact search handles crash meshes ([Large
-datasets](#large-datasets)). The limit today is the GPU memory of one sample: with
-MeshGraphNets in paper size about 240,000 shell nodes fit on an 80 GB GPU; training on
-subgraphs, together with multi-GPU support, is planned for full-vehicle meshes
-([outlook](#outlook-training-on-subgraphs-and-multiple-gpus)).
-
-The basic idea stays the same: simple, and quickly adapted to new data and new models.
-The predictions are research results, no substitute for validated crash simulation or
-physical testing (see the [disclaimer](../README.md#disclaimer)).
+The TFRecord is the format of the benchmark and of the comparison with the papers. The
+two further readers take general meshes, parts, rigid bodies and boundary conditions
+([general meshes](#general-meshes-and-run-parameters)), but are at an early stage of
+development.
+Datasets of a few hundred GB need no extreme RAM ([large datasets](#large-datasets)). The
+predictions are research results, no substitute for validated crash simulation or
+physical testing ([disclaimer](../README.md#disclaimer)).
 
 ## The benchmark
 
@@ -73,9 +57,10 @@ python -m dataset_preprocessor.export [options]      # --help lists all options
 | `--raw-format` | `tfrecord` | `d3plot`: read the LS-DYNA runs instead, stress targets are smoothed ([below](#second-raw-format-ls-dyna-runs-d3plot)); `vtk`: read VTK time series ([below](#third-raw-format-vtk-time-series-vtu--vtp--vtk)) |
 | `--raw-dir` | `datasets/deforming_plate/raw_dataset` | folder with `meta.json` and the TFRecord (`d3plot`: `datasets/deforming_plate/raw_d3plot`, `vtk`: `datasets/deforming_plate/raw_vtk`) |
 | `--contact-radius` | from `meta.json` | world edge radius; required for LS-DYNA runs without `meta.json` |
-| `--source-tfrecord` | `test.tfrecord` | TFRecord to read (100 trajectories; `train.tfrecord`: 1,000) |
+| `--source-tfrecord` | `test.tfrecord` | TFRecord to read (100 trajectories; `train.tfrecord`: 1,200), or three, one per split: `train.tfrecord valid.tfrecord test.tfrecord` (DeepMind's original splits) |
 | `--out-dir` | `data/deforming_plate_s10_small` | output folder (= `[data].data_dir` of the config) |
-| `--n-train` / `--n-val` / `--n-test` | 8 / 2 / 2 | trajectories per split; disjoint, contiguous ranges |
+| `--n-train` / `--n-val` / `--n-test` | 8 / 2 / 2 | trajectories per split; disjoint, contiguous ranges of one source, or the first of each split's own source |
+| `--select-seed` | – | draw the trajectories of each split at random with this seed instead; `metadata.json` lists the drawn ones (`splits.<split>.indices`) |
 | `--num-steps` | 40 | frames per trajectory |
 | `--time-stride` | 10 | raw frames between two selected frames (paper: 1) |
 | `--history` | 0 | 1 = append `*_prev` columns (see below) |
@@ -93,8 +78,8 @@ does not matter.
 | Folder | Command options | Size | Used for |
 |---|---|---|---|
 | `deforming_plate_s10_small` | (defaults) 8/2/2 traj., 40 frames, stride 10 | ~11 MB | quick test (`config.example.toml`) |
-| `deforming_plate_s8_t40` | `--n-train 28 --n-val 8 --n-test 4 --num-steps 50 --time-stride 8` | ~48 MB | first results ([results.md](results.md)) |
 | `deforming_plate_s4` | `--n-train 80 --n-val 10 --n-test 10 --num-steps 100 --time-stride 4` | ~225 MB | all 100 trajectories of `test.tfrecord` |
+| `deforming_plate_s4_t150` | `--source-tfrecord train.tfrecord valid.tfrecord test.tfrecord --select-seed 42 --n-train 100 --n-val 30 --n-test 20 --num-steps 100 --time-stride 4` | ~330 MB | DeepMind's original splits, trajectories drawn at random: [comparison protocol](comparison-protocol.md), [results](results.md) |
 | as in the paper | `--num-steps 400 --time-stride 1` | ~0.85 GB (100 traj.) | paper setting |
 
 The export processes one run at a time, in blocks of frames, and folds it into the
@@ -120,92 +105,38 @@ step when a sample is requested.
   do not fit into RAM or `/dev/shm`.
 
 Trajectories on the same mesh share its mesh edges and world edge selection in memory.
-With position noise (`world_noise_std > 0`) the train loader leaves out the contact
-search: every train batch gets its world edges anew on the training device anyway, so
-the search in the loader would be wasted. The rollout builds them on its device as well.
-The results are the same as before.
+With position noise the train batches get their world edges on the training device, the
+rollout on its device as well.
 
 ## Large datasets
 
-The data layout targets crash data far beyond `deforming_plate`: full-vehicle runs with
-millions of nodes and DoE studies with many runs, in a `dataset.db` of up to a few
-hundred GB, without extreme RAM. A frame costs 16 bytes per node (`world_pos` and
-`stress`, float32 — as precise as the d3plot itself; less precise positions would
-corrupt the velocity targets, which are differences of positions):
+The data layout targets crash data far beyond `deforming_plate`, such as large crash runs
+and DoE studies with many runs, in a `dataset.db` of up to a few hundred GB without
+extreme RAM. What a dataset needs depends on one run or one sample, not on its size:
 
-| Model | Nodes | per run (100 frames) | runs in 300 GB |
-|---|---|---|---|
-| component | 50,000 | 80 MB | ~3,700 |
-| front end | 500,000 | 0.8 GB | ~370 |
-| full vehicle | 3–5 million | 5–8 GB | ~40–60 |
+- **Export:** runs are read, written and folded into the statistics in blocks of frames
+  (`--block-mb`), so a run need not fit into memory. Every run is committed with the
+  statistics, so an interrupted export continues with `--resume`. Runs on the same mesh
+  store it once, `--edge-stats-stride` thins out the most expensive part (the contact
+  search for the edge statistics), and a content fingerprint identifies the dataset
+  without hashing the whole file.
+- **Training:** with `lazy = true` only the frames of the current sample are read; the
+  static graph data are cached per process up to `static_cache_mb`. A `dataset.db` must
+  not be written while a training or rollout reads it. Older export formats still load.
 
-**Export** (format v4 of `dataset.db`):
+### Outlook: scaling to full-vehicle meshes
 
-- *Blocks.* LS-DYNA and VTK runs are read, written and folded into the statistics in
-  blocks of frames (`--block-mb`, default 1024; the LS-DYNA block size is estimated from
-  the d3plot header). A run therefore need not fit into memory; small runs are one block,
-  and the result does not depend on the block size.
-- *Resume.* Every run is committed together with the running statistics. An export that
-  stops (crash, out of time on a cluster) continues with `--resume` and the same options
-  after its last complete run, with the same result as an uninterrupted export; other
-  options are refused. `dataset.db` counts as finished only once `info.format` is
-  written, so an unfinished file is not loaded by mistake.
-- *Shared meshes.* Runs on the same mesh (same cells, e.g. the runs of a DoE) store it
-  and its mesh edges once (table `meshes`); in memory they share mesh edges and world
-  edge selection. The mesh edges are computed during the export, not at every start of
-  a training.
-- *Edge statistics.* The statistics of the mesh and world edges need a contact search
-  per frame, the most expensive part of the export for large meshes.
-  `--edge-stats-stride k` fits them on every k-th sample only (e.g. 10; on
-  `deforming_plate` a stride of 5 moved their means and standard deviations by less than
-  0.05 % of the standard deviation). It is recorded in
-  `metadata.json`; the default 1 uses every sample.
-- *Fingerprint.* `info.fingerprint` (SHA-256 over the export settings and the hashes of
-  all blobs per trajectory, computed while writing) identifies the content. Rollouts and
-  `utils/check_protocol.py` compare it instead of hashing the whole file, which would
-  take minutes at a few hundred GB; older exports keep the SHA-256 of the file.
-- *Page size.* Runs with frames of 1 MB and more (~65,000 nodes) get SQLite pages of
-  64 KB: writing large frames is ~3x faster, reading as fast.
+The limit for large meshes is the GPU memory of one sample, since training keeps the
+activations of every message passing step. Planned, step by step:
 
-**Loading:** `lazy = true` (see [above](#loading-during-training)); every read-only
-connection is opened with `immutable=1` (no locking, also on network file systems), so
-no export may write into a `dataset.db` while a training or rollout reads it. Older
-exports (format v1–v3) still load; continuing them needs a new export.
-
-**Hardware.** What a large dataset needs depends on one run or one sample, not on the
-size of the dataset:
-
-| | Memory | Bounded by |
-|---|---|---|
-| Export | one block of frames and the static data of one run (~0.5 GB for `deforming_plate`) | `--block-mb` (default 1024) |
-| Training with lazy loading | the 2–3 frames of a sample and the static graph data kept per process | `static_cache_mb` (default 1024) per process |
-| Disk | 16 bytes per node and frame (table above) | – |
-| GPU | the activations of one sample | the limit for full-vehicle meshes (below) |
-
-### Outlook: training on subgraphs and multiple GPUs
-
-The limit for full-vehicle meshes is not the database but the GPU memory of one sample.
-One-step training keeps the activations of every message passing step for the backward
-pass: measured for MeshGraphNets (latent 128, 15 steps) about 48 KiB per node and
-54 KiB per directed edge, ~320 KiB per node of a shell mesh (4 mesh + 1 world edge per
-node). An 80 GB GPU then holds ~240,000 nodes; gradient checkpointing per block and
-bfloat16 raise that to ~2 million — still less than a full vehicle.
-
-Planned for a later release: training on subgraphs with a halo, together with
-multi-GPU support. The prediction of a node depends only on its neighbourhood of L
-message passing steps (mesh and world edges), so a patch plus a halo of L hops, with the
-loss on the patch nodes only, gives exactly the gradients of the whole graph while its
-memory grows with the patch, not with the model. The world edges are found on the whole mesh first, the halo then
-follows the combined graph. Gradient checkpointing and bfloat16 come with it as
-options. MGN-T is not exact under this split (attention over all nodes, positional
-encoding normalized per graph) and needs its own treatment.
-
-The two belong together: the patches of a sample are independent units of work, so
-data-parallel training (PyTorch DDP) distributes them over several GPUs, on one or more
-machines, and combines their gradients, weighted by their share of the loss nodes, into
-the gradient of the whole graph. The subgraphs bound the memory of each GPU, the number
-of GPUs the time per epoch; the halo nodes, computed in more than one patch, are the
-overhead.
+- **Activation checkpointing** per message passing step: recompute instead of storing,
+  at the cost of one more forward pass.
+- **Leaner edge MLPs:** the node terms of their first layer are computed once per node
+  instead of once per edge; checkpoints load unchanged.
+- **Subgraphs with a halo and multi-GPU training:** a patch plus a halo of as many hops
+  as message passing steps gives the exact gradients of the whole graph at the memory of
+  the patch, and several GPUs train on patches in parallel. MGN-T, with attention over
+  all nodes, needs its own approach.
 
 ## Graph per time step t
 
@@ -235,42 +166,39 @@ can be compared on the same dataset:
 
 | `world_edges` | Pairs within r_W that get a world edge |
 |---|---|
-| `"all"` (default, paper) | all pairs that are not mesh neighbours |
+| `"all"` (default, paper) | all pairs that are not mesh neighbours (Pfaff et al. 2021, Sec. 3.1 on p. 4) |
 | `"contact"` | only pairs of different bodies (connected parts of the mesh) |
-| `"self_contact_aware"` | pairs more than `world_edge_exclude_hops` (default 4) mesh edges apart: contact between bodies plus self-contact, without the near neighbours inside a body |
+| `"self_contact_aware"` | pairs not connected through the material: contact between bodies plus self-contact, without the near neighbours inside a body. Connected: the shortest path along the mesh edges of the rest state is shorter than `world_edge_exclude_distance` × r_W (default 2) |
 
 With r_W = 0.03 and a median mesh edge length of about 0.018, the paper rule also links
-nodes of the same body that are two or three mesh edges apart. On `deforming_plate`
-(8 trajectories of the small export) the world edges split up into actuator ↔ actuator
-50–90 % (rigid and prescribed, constant over time), plate ↔ plate 9–46 % (over 99 % of
-them exist already in the rest configuration, so they are no self-contact) and
-actuator ↔ plate 2–20 % (the actual contact). Actuator and plate share no mesh edge;
-the actuator acts on the plate only through world edges.
+nodes of the same body two or three mesh edges apart; on `deforming_plate` most world
+edges are actuator ↔ actuator or plate ↔ plate pairs that exist already at rest, only a
+few percent the actual contact. The actuator acts on the plate only through world edges.
 
-- `contact` keeps only the edges between bodies. It suits bodies that touch each other
-  but do not fold onto themselves; self-contact cannot be represented.
+- `contact` suits bodies that touch but do not fold onto themselves; self-contact cannot
+  be represented.
 - `self_contact_aware` also keeps pairs of the same body that are far apart along the
-  mesh, e.g. the folds of a crushed crash structure. On `deforming_plate`, 4 hops remove
-  the near neighbours almost completely (3 hops leave up to 642 per trajectory in finely
-  meshed regions), so the result there is close to `contact`. The number of hops needed
-  grows with r_W / smallest edge length.
+  mesh, e.g. the folds of a crushed crash structure. It measures the path through the
+  material, not the number of mesh edges, so it holds where a mesh is locally refined.
+  On `deforming_plate` the result is close to `contact`. Configs and checkpoints up to
+  v0.3.0 count mesh edges instead (`world_edge_exclude_hops`, still read and applied).
+- The comparison protocol compares new architectures with MeshGraphNets on
+  `self_contact_aware`; the published results of the paper, with `all`, are the
+  original reference ([baselines](comparison-protocol.md#baselines)).
 
-Bodies and hop neighbourhoods are computed once per mesh and stored in every sample
-(`body_id`, `world_exclude_index`; with 4 hops about 100–170 k pairs per trajectory), so
-position noise and rollout rebuild the same variant. The variant is part of the training
-config in the checkpoint and is used by the rollout automatically. The normalizer
-statistics of the world edges come from the export (all pairs) and are reused for every
-variant: all world edges are relative vectors within the same radius, and their mean and
-standard deviation differ between the variants by up to about 20 %.
+Bodies and excluded pairs are computed once per mesh (the path rule per rest geometry)
+and stored in every sample, so position noise and rollout rebuild the same variant; the
+rollout takes the variant from the checkpoint. The normalizer statistics of the world
+edges come from the export (all pairs) and serve every variant.
 
 All feature groups are standardized with the statistics in `normalizer.json`. The
 one-hot columns keep mean 0 / std 1 and pass through unchanged.
 
 ## General meshes and run parameters
 
-Raw data other than `deforming_plate` (LS-DYNA runs, see [below](#second-raw-format-ls-dyna-runs-d3plot))
-may contain other cells, parameters per run, static node properties and rigid walls. The
-dataset takes all of them:
+Raw data other than `deforming_plate` (the further raw formats, see
+[below](#second-raw-format-ls-dyna-runs-d3plot)) may contain other cells, parameters per
+run, static node properties and rigid walls. The dataset takes all of them:
 
 | | |
 |---|---|
@@ -286,31 +214,10 @@ parameters, wall columns. `dataset.db` stores them per trajectory (`globals`,
 (`global_names`, `static_names`, `max_walls`); `metadata.json` lists
 `global_feature_names`, `static_feature_names`, `max_walls` and `wall_distance_cutoff`.
 
-Checked end to end on real LS-DYNA runs (16 quadrilaterals + 16 hexahedra) with a keyword
-deck containing a rigid part, clamped nodes, prescribed motion on a node and a node set,
-initial velocities (all nodes, overridden for one part) and two planar walls, plus run
-parameters: export, training of both architectures (also with history, residual target
-and scheduled sampling), rollout and `.vtu` export.
-
-### Run parameters: current approach and open points
-
-Run parameters enter the models only as constant node feature columns; the models process
-node and edge features and have no input of their own for global quantities. This is the
-approach of the MeshGraphNets paper (wind speed in FlagDynamic, App. A.1) and suffices as
-long as global quantities are inputs only. `deforming_plate` has no run parameters, so the
-current datasets do not use them.
-
-Open, to be integrated if global quantities become relevant (e.g. crash datasets with
-varied run parameters or global results):
-
-- **Global targets** — a quantity per run and time step instead of per node, e.g. the
-  acceleration at a sensor, total energy or rigid wall force. Needs a global output of the
-  model (pooling over the nodes plus a decoder) and global metrics.
-- **Global state in the processor** — a global latent vector updated in every message
-  passing step, as in the GraphNet blocks of Battaglia et al. (2018). In MGN-T the physics
-  attention tokens partly take this role.
-- **Memory** — the broadcast repeats every parameter at every node; negligible for a few
-  parameters, worth a dedicated input for many.
+Run parameters enter the models only as constant node feature columns, as in the
+MeshGraphNets paper (wind speed in FlagDynamic, App. A.1); this suffices while global
+quantities are inputs only. Global targets (e.g. a sensor acceleration or a wall force)
+or a global state in the processor would need a global output and input of the models.
 
 ## Optional history (`--history 1`, not in the paper)
 
@@ -323,15 +230,17 @@ automatically.
 
 ## Second raw format: LS-DYNA runs (d3plot)
 
-The same data also exist as LS-DYNA runs, the format of crash simulations. This shows that
-the pipeline works with LS-DYNA data as well, checked on data whose content is known
-exactly. **The TFRecord remains the standard raw format** for training, benchmarks and the
-comparison with the papers. Needs `lasso-python` (`pip install lasso-python`).
+The same data also exist as LS-DYNA runs, converted from the TFRecord, so the result is
+known exactly. Needs `lasso-python` (`pip install lasso-python`).
 
-The [reader](#the-d3plot-reader) reads general LS-DYNA output (shells, solids, thick
+> **Early stage of development.** The reader was developed and checked on runs
+> converted from `deforming_plate` (step 1 below) and on a few small example files; it
+> has not been used on real crash simulations yet. The TFRecord remains the standard
+> raw format for training, benchmarks and the comparison with the papers.
+
+The [reader](#the-d3plot-reader) covers general LS-DYNA output (shells, solids, thick
 shells, beams, user IDs, rigid parts, included keyword files), and the export takes
-[general meshes and run parameters](#general-meshes-and-run-parameters), so crash runs
-with shells and solids reach the dataset and the training as well.
+[general meshes and run parameters](#general-meshes-and-run-parameters).
 
 > **The stress differs between the two raw formats.** Positions, mesh, node types and all
 > input features are identical, but a dataset exported from d3plot has smoothed stress
@@ -362,10 +271,8 @@ datasets/deforming_plate/raw_d3plot/
 | `d3plot`, `d3plot01` | tetrahedra as 8-node solids (n1 n2 n3 n4 n4 n4 n4 n4); part 1 plate, part 2 actuator; state coordinates = `world_pos` of every frame; state time = frame index (quasi-static); stress as element tensors |
 | `model.k` | what a d3plot does not store: `*PART`, `*MAT_RIGID` for the actuator, `*SET_NODE_LIST` + `*BOUNDARY_SPC_SET` for the clamped nodes. Not a runnable simulation input (material data unknown) |
 
-Every run is read back with the reader below and compared with the TFRecord. A state
-takes ~130 kB, ~90 % of it the 7 values per solid that the format always contains.
-ParaView opens a run directly (`d3plot`, LS-DYNA reader): parts, all states, stress and
-plastic strain; the part names are only in `model.k`.
+Every run is read back with the reader below and compared with the TFRecord. ParaView
+opens a run directly (LS-DYNA reader); the part names are only in `model.k`.
 
 **2. Export** as usual, with `--raw-format d3plot` (raw directory default:
 `datasets/deforming_plate/raw_d3plot`):
@@ -391,10 +298,8 @@ element blocks, node types and nodal result fields:
 | Rigid walls | `*RIGIDWALL_PLANAR` with `_ID`, `_FINITE` (treated as infinite), `_ORTHO`, `_FORCES`; the normal points from tail to head |
 | Keyword deck | fixed, long (`*KEYWORD LONG=Y`, trailing `+`) and free (comma) format; `*INCLUDE`; node and part sets `*SET_NODE` / `*SET_PART` (`_LIST`, `_GENERATE`, `_ADD`); options `_TITLE`, `_ID`, `_BIRTH_DEATH`; `*PART` with `_CONTACT`, `_PRINT`, `_ATTACHMENT_NODES` |
 
-Checked on the converted runs and on real LS-DYNA files from the test data of
-lasso-python: a shell model with user node IDs (4,915 nodes), a mixed shell / hexahedron
-model with part IDs 1000–4000 and 5 / 8 integration points, a beam model and a d3plot
-family split over several files.
+Checked on the converted runs and on LS-DYNA files from the test data of lasso-python
+(shells with user IDs, mixed shells and hexahedra, beams, a d3plot family).
 
 Not supported yet: `*INCLUDE_TRANSFORM`, `*PART_INERTIA` / `*PART_COMPOSITE`, other set
 types, eroded elements (`*_is_alive`), moving and non-planar rigid walls, the optional
@@ -425,10 +330,15 @@ As DeepMind states no license for the data, keep the converted files local.
 
 ## Third raw format: VTK time series (.vtu / .vtp / .vtk)
 
-The same data also exist as VTK time series, one file per state — the ParaView
-convention, which many solvers and post-processors export and which the rollout writes as
-well. Unlike d3plot, VTK keeps the stress per node, so a dataset exported from these files
-is **identical** to the TFRecord export. Needs `pyvista`.
+The same data also exist as VTK time series, one file per state (the ParaView convention,
+which the rollout writes as well). Unlike d3plot, VTK keeps the stress per node, so a
+dataset exported from these files is **identical** to the TFRecord export. Needs
+`pyvista`.
+
+> **Early stage of development.** The reader was developed and checked on runs
+> converted from `deforming_plate` (step 1 below) and on a few small example files; it
+> has not been used on real crash simulations yet. The TFRecord remains the standard
+> raw format for training, benchmarks and the comparison with the papers.
 
 **1. Convert** ([`tfrecord_to_vtk.py`](../dataset_preprocessor/tfrecord_to_vtk.py)):
 every trajectory of a TFRecord with all frames (all 100 of `test.tfrecord`: 2.3 GB,
@@ -486,16 +396,9 @@ a 32-bit d3plot into one (newer VTK versions convert them one by one), so the
 copies of a node no longer match and the reader stops with an error; check `UserID` in
 ParaView, or ignore the IDs with `--node-id-field ''`.
 
-Checked: TFRecord → VTU → `dataset.db` gives the same dataset as the TFRecord export;
-synthetic runs cover `.pvd` with two shell parts, numbered files, displacement fields,
-legacy `.vtk` with hexahedra and 9-component tensors, quadratic tetrahedra and polygons,
-and a shell dataset through export and training. A crash-like LS-DYNA model (two shell
-parts sharing an edge, hexahedra on the plate, a separate impactor, triangles, user IDs)
-read with VTK's LS-DYNA reader (that of ParaView) and saved as a `.pvd` of multiblock files,
-as one file per part and state, and as a merged grid gives the nodes, cells, mesh edges,
-positions and nodal stress of the d3plot in all three cases, plus the shell thickness and
-the impactor as actuator from the parts; the multiblock export goes through export and
-training.
+Checked: TFRecord → VTU → `dataset.db` gives the same dataset as the TFRecord export, and
+a crash-like LS-DYNA model saved by ParaView (multiblock, one file per part, merged grid)
+gives the nodes, cells, positions and stress of the d3plot.
 
 Not supported yet: changing topology (eroded cells), partitioned collections (`.vtpc`),
 layered shell stress (one field), rigid walls and other boundary conditions beyond node

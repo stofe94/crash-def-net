@@ -26,7 +26,7 @@ import toml
 import torch
 
 from dataset_preprocessor.graph_features import (
-    DEFAULT_WORLD_EDGE_EXCLUDE_HOPS,
+    DEFAULT_WORLD_EDGE_EXCLUDE_DISTANCE,
     WORLD_EDGE_MODES,
 )
 from models.mgn_t import TRANSFORMER_NODES
@@ -74,7 +74,10 @@ class TrainingConfig:
     architecture: str = "meshgraphnets"
     residual_target: bool = False            # predict the change vs. *_prev (needs history)
     world_edges: str = "all"                 # all (paper) | contact | self_contact_aware
-    world_edge_exclude_hops: int = DEFAULT_WORLD_EDGE_EXCLUDE_HOPS   # self_contact_aware
+    # self_contact_aware: pairs connected through the material get no world edge, i.e.
+    # with a path along the mesh edges shorter than this many contact radii
+    world_edge_exclude_distance: float = DEFAULT_WORLD_EDGE_EXCLUDE_DISTANCE
+    world_edge_exclude_hops: Optional[int] = None   # instead: up to N mesh edges (to v0.3.0)
     latent_size: int = 128
     num_mlp_layers: int = 2
     num_message_passing_steps: int = 15
@@ -96,6 +99,9 @@ class TrainingConfig:
     # [training]
     epochs: int = 100
     batch_size: int = 2
+    # Machine setting: graphs per forward pass; batch_size / micro_batch_size passes
+    # make one optimizer step (gradient accumulation, the same step). None: batch_size
+    micro_batch_size: Optional[int] = None
     learning_rate: float = 1e-4
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0               # gradient clipping (not in the paper)
@@ -146,9 +152,17 @@ class TrainingConfig:
         _check_choice("architecture", self.architecture, ARCHITECTURES)
         _check_choice("world_edges", self.world_edges, WORLD_EDGE_MODES)
         _check_choice("transformer_nodes", self.mgn_t_transformer_nodes, TRANSFORMER_NODES)
-        if self.world_edge_exclude_hops < 1:
+        if self.world_edge_exclude_hops is not None and self.world_edge_exclude_hops < 1:
             raise ValueError(f"world_edge_exclude_hops must be >= 1, "
                              f"got {self.world_edge_exclude_hops}")
+        if self.micro_batch_size is not None and not (
+                1 <= self.micro_batch_size <= self.batch_size
+                and self.batch_size % self.micro_batch_size == 0):
+            raise ValueError(f"micro_batch_size must divide batch_size {self.batch_size}, "
+                             f"got {self.micro_batch_size}")
+        if self.world_edge_exclude_distance <= 0:
+            raise ValueError(f"world_edge_exclude_distance must be > 0, "
+                             f"got {self.world_edge_exclude_distance}")
         _check_choice("scheduler", self.scheduler, SCHEDULERS)
         _check_choice("loss_type", self.loss_type, LOSS_TYPES)
         self.early_stopping_criteria = [c for c in self.early_stopping_criteria
@@ -193,6 +207,9 @@ class TrainingConfig:
             print(f"Note: {path}: no longer a selection criterion (it favours early, "
                   f"undertrained epochs, see docs/training.md): {', '.join(sorted(dropped))}",
                   file=sys.stderr)
+        if {"world_edge_exclude_distance", "world_edge_exclude_hops"} <= values.keys():
+            raise ValueError(f"{path}: set world_edge_exclude_distance or (as up to v0.3.0) "
+                             "world_edge_exclude_hops, not both")
         if "selection_metric" in values:   # older config: one selection metric
             metric = values.pop("selection_metric")
             values.setdefault("early_stopping_criteria",
@@ -221,6 +238,11 @@ class TrainingConfig:
                 values.get("rollout_validation", False))
         return cls(**restored)
 
+    @property
+    def accumulation_steps(self) -> int:
+        """Micro-batches per optimizer step."""
+        return self.batch_size // (self.micro_batch_size or self.batch_size)
+
     def resolve_lr_decay_steps(self, steps_per_epoch: int) -> None:
         """``decay_steps = "auto"``: the LR reaches ``min_lr`` at the end of the last
         epoch. ``epochs`` counts from the start of the run, also when resuming."""
@@ -237,9 +259,15 @@ class TrainingConfig:
         if self.architecture != "mgn_t":
             unused |= {name for name in names if name.startswith("mgn_t_")}
         if self.world_edges != "self_contact_aware":
+            unused |= {"world_edge_exclude_distance", "world_edge_exclude_hops"}
+        elif self.world_edge_exclude_hops is None:
             unused.add("world_edge_exclude_hops")
+        else:
+            unused.add("world_edge_exclude_distance")
         if not self.lazy_loading:
             unused |= {"cache_frames", "static_cache_mb"}
+        if self.micro_batch_size is None:
+            unused.add("micro_batch_size")
         if self.scheduler != "exponential":
             unused.add("lr_decay_steps")
         if self.scheduler != "plateau":
@@ -273,6 +301,7 @@ TOML_KEYS = {
     "model.architecture": "architecture",
     "model.residual_target": "residual_target",
     "model.world_edges": "world_edges",
+    "model.world_edge_exclude_distance": "world_edge_exclude_distance",
     "model.world_edge_exclude_hops": "world_edge_exclude_hops",
     "model.meshgraphnets.latent_size": "latent_size",
     "model.meshgraphnets.num_mlp_layers": "num_mlp_layers",
@@ -300,6 +329,7 @@ TOML_KEYS = {
 
     "training.epochs": "epochs",
     "training.batch_size": "batch_size",
+    "training.micro_batch_size": "micro_batch_size",
     "training.learning_rate": "learning_rate",
     "training.weight_decay": "weight_decay",
     "training.max_grad_norm": "max_grad_norm",

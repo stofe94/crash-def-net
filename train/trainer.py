@@ -23,15 +23,21 @@ of the evaluations it can still select are kept in ``candidates/`` until the
 run has ended.
 
 The last history record notes how the run ended (``end``: ``early_stopping`` or
-``epochs``); an aborted run has none.
+``epochs``); an aborted run has none. Every record holds the peak memory of the run
+so far and the machine (``peak_memory``), so that the figures of a GPU and of a CPU
+machine can be told apart.
 """
 
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import logging
 import math
+import os
+import re
+import resource
 import shutil
 import sys
 import time
@@ -69,6 +75,15 @@ from utils.timezone import Formatter, now
 
 logger = logging.getLogger("train")
 
+# Optimizer steps between two progress bar updates of the loss.
+PROGRESS_EVERY = 100
+# Train samples for the loss without noise at every evaluation (generalization gap):
+# this share of the train split, evenly spread, at least TRAIN_EVAL_MIN_SAMPLES (all
+# of a smaller split). A few hundred samples give a stable mean, and the cost stays a
+# fixed share of an epoch instead of growing with the val split.
+TRAIN_EVAL_SHARE = 0.05
+TRAIN_EVAL_MIN_SAMPLES = 200
+
 LOSS_FUNCTIONS = {
     "mse": nn.MSELoss,
     "mae": nn.L1Loss,
@@ -80,6 +95,12 @@ LOSS_FUNCTIONS = {
 # ─────────────────────────────────────────────────────────────────────────────
 # Data and model
 # ─────────────────────────────────────────────────────────────────────────────
+
+def train_eval_indices(num_samples: int) -> List[int]:
+    """Train samples for the loss without noise: evenly spread over the split."""
+    count = min(num_samples, max(TRAIN_EVAL_MIN_SAMPLES, round(TRAIN_EVAL_SHARE * num_samples)))
+    return sorted({round(i * (num_samples - 1) / max(count - 1, 1)) for i in range(count)})
+
 
 def create_dataloaders(config: TrainingConfig, normalizer: Normalizer
                        ) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
@@ -96,6 +117,7 @@ def create_dataloaders(config: TrainingConfig, normalizer: Normalizer
                                 "python -m dataset_preprocessor.export")
     loading = dict(lazy=config.lazy_loading, cache_frames=config.cache_frames,
                    static_cache_mb=config.static_cache_mb, world_edges=config.world_edges,
+                   world_edge_exclude_distance=config.world_edge_exclude_distance,
                    world_edge_exclude_hops=config.world_edge_exclude_hops)
     # With position noise every train batch gets its world edges anew on the
     # device (displace_nodes): the contact search in the loader would be wasted.
@@ -107,8 +129,10 @@ def create_dataloaders(config: TrainingConfig, normalizer: Normalizer
     mode = (f"lazy, cache {config.cache_frames} frames and {config.static_cache_mb:g} MB "
             "of static data per worker" if config.lazy_loading else "in memory")
     world = config.world_edges
-    if world == "self_contact_aware":
+    if world == "self_contact_aware" and config.world_edge_exclude_hops is not None:
         world += f", > {config.world_edge_exclude_hops} hops"
+    elif world == "self_contact_aware":
+        world += f", path through the mesh >= {config.world_edge_exclude_distance:g} r_W"
     if not world_edges_in_loader:
         world += f"; train: built on {config.device}"
     logger.info(f"Data: {db_path} — train {len(train_set)}, val {len(val_set)}, "
@@ -121,11 +145,18 @@ def create_dataloaders(config: TrainingConfig, normalizer: Normalizer
         train_collate = collate_with_predecessor
 
     workers = config.num_dataloader_workers
+    if workers > 0:
+        # Workers receive the dataset's tensors through shared memory. By default
+        # every shared tensor keeps a file descriptor open in the main process, and
+        # splits of a few hundred trajectories exceed the usual limit of 1,024.
+        torch.multiprocessing.set_sharing_strategy("file_system")
     common = dict(batch_size=config.batch_size, pin_memory=config.device == "cuda")
+    # Train: micro-batches, accumulated to batch_size per optimizer step.
+    train_batch_size = config.micro_batch_size or config.batch_size
     parallel = dict(num_workers=workers, persistent_workers=workers > 0,
                     multiprocessing_context="spawn" if workers > 0 else None)
     train_loader = DataLoader(train_set, shuffle=True, collate_fn=train_collate,
-                              **common, **parallel)
+                              **{**common, "batch_size": train_batch_size}, **parallel)
     val_loader = DataLoader(val_set, shuffle=False, collate_fn=Batch.from_data_list,
                             **common, **parallel)
     test_loader = (DataLoader(test_set, shuffle=False, collate_fn=Batch.from_data_list,
@@ -248,6 +279,60 @@ def describe_config_source(config: TrainingConfig) -> str:
     return source
 
 
+def describe_machine(device: torch.device) -> str:
+    """The GPU of a run with its memory, or the CPU, and the RAM of the machine (Linux)."""
+    if device.type == "cuda":
+        properties = torch.cuda.get_device_properties(device)
+        machine = f"{properties.name}, {properties.total_memory / 2 ** 30:.1f} GiB"
+    else:
+        cpu = re.search(r"^model name\s*:\s*(.+)$", _read("/proc/cpuinfo"), re.M)
+        machine = f"{cpu.group(1).strip() if cpu else 'CPU'}, {os.cpu_count()} threads"
+    ram = re.search(r"^MemTotal:\s+(\d+) kB", _read("/proc/meminfo"), re.M)
+    return machine + (f"; RAM {int(ram.group(1)) / 2 ** 20:.1f} GiB" if ram else "")
+
+
+def peak_memory(device: torch.device) -> Dict[str, float]:
+    """Peak memory of the run so far in GiB: resident memory (RSS) of the main process
+    and of the largest child process (the DataLoader workers; pages of the dataset in
+    shared memory count in every process that reads them), on a GPU the memory
+    allocated by tensors and reserved by PyTorch's allocator (nvidia-smi shows the
+    reserved memory plus the CUDA context). No read from the GPU."""
+    gib = 2 ** 30
+    peak = {"ram_main": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 / gib}
+    workers = []
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:   # parent pid: the 2nd field after the command name in parentheses
+            if int(stat.read_text().rsplit(")", 1)[1].split()[1]) == os.getpid():
+                hwm = re.search(r"^VmHWM:\s+(\d+) kB", (stat.parent / "status").read_text(),
+                                re.M)
+                workers.append(int(hwm.group(1)) * 1024 / gib)
+        except (OSError, IndexError, ValueError, AttributeError):
+            continue   # ended meanwhile, or not readable
+    if workers:
+        peak["ram_worker"] = max(workers)
+    if device.type == "cuda":
+        peak["gpu_allocated"] = torch.cuda.max_memory_allocated(device) / gib
+        peak["gpu_reserved"] = torch.cuda.max_memory_reserved(device) / gib
+    return {key: round(value, 2) for key, value in peak.items()}
+
+
+def format_memory(peak: Dict[str, float]) -> str:
+    text = f"RAM {peak['ram_main']:.2f} GiB"
+    if "ram_worker" in peak:
+        text += f" (largest worker {peak['ram_worker']:.2f} GiB)"
+    if "gpu_reserved" in peak:
+        text += (f", GPU {peak['gpu_allocated']:.2f} GiB allocated, "
+                 f"{peak['gpu_reserved']:.2f} GiB reserved")
+    return text
+
+
+def _read(path: str) -> str:
+    try:
+        return Path(path).read_text()
+    except OSError:
+        return ""
+
+
 def format_duration(seconds: float) -> str:
     """12.3 -> '12s', 754 -> '12m 34s', 4000 -> '1h 06m 40s'."""
     seconds = int(round(seconds))
@@ -298,7 +383,7 @@ class Trainer:
         self.contact_radius = float(metadata["contact_radius"])
         self._check_history_options()
 
-        self.loss_fn = LOSS_FUNCTIONS[config.loss_type]()
+        self.loss_fn = LOSS_FUNCTIONS[config.loss_type](reduction="none")
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate,
                                           weight_decay=config.weight_decay)
         self.scheduler = self._create_scheduler()
@@ -332,6 +417,7 @@ class Trainer:
                              Path(self.config.data_dir) / "dataset.db", self.device,
                              lazy=self.config.lazy_loading,
                              world_edges=self.config.world_edges,
+                             world_edge_exclude_distance=self.config.world_edge_exclude_distance,
                              world_edge_exclude_hops=self.config.world_edge_exclude_hops,
                              static_cache_mb=self.config.static_cache_mb)
 
@@ -443,54 +529,82 @@ class Trainer:
 
     # ── epochs ──────────────────────────────────────────────────────────────
 
-    def _loss(self, batch, prediction: torch.Tensor) -> torch.Tensor:
-        mask = batch.loss_mask
-        return self.loss_fn(prediction[mask], batch.y[mask])
+    def _loss_sum(self, batch, prediction: torch.Tensor) -> torch.Tensor:
+        """Loss summed over the targets of the nodes in ``loss_mask``; the mask
+        multiplies instead of indexing, which would wait for the GPU."""
+        return (self.loss_fn(prediction, batch.y) * batch.loss_mask[:, None]).sum()
+
+    def _num_loss_terms(self, batch) -> torch.Tensor:
+        return batch.loss_mask.sum() * batch.y.shape[-1]
 
     def train_epoch(self, loader: DataLoader, epoch: int) -> float:
-        """One pass over the train split; returns the mean loss per graph."""
+        """One pass over the train split; returns the mean loss per graph.
+
+        ``accumulation_steps`` micro-batches of the loader make one optimizer
+        step. Their loss is normalized by the nodes of all of them, so the
+        gradient is that of one batch of ``batch_size`` (gradient accumulation).
+        The loss stays on the device; it is read once per epoch.
+        """
         self.model.train()
-        total_loss, num_graphs = 0.0, 0
-        progress = tqdm(loader, desc=f"Epoch {epoch + 1}", leave=False)
-        for batch in progress:
-            prev_batch = None
-            if isinstance(batch, (tuple, list)):          # (sample, predecessor) pairs
-                batch, prev_batch = batch
-                prev_batch = prev_batch.to(self.device)
-            batch = batch.to(self.device)
-
-            if prev_batch is not None and epoch > 0:
-                batch = self._apply_scheduled_sampling(batch, prev_batch, epoch)
-            if self.config.world_noise_std > 0:   # also builds the world edges
-                batch = self._apply_position_noise(batch)
-            else:
-                batch = self._with_world_edges(batch)
-            if self.config.stress_noise_std > 0 and self.stress_prev_column is not None:
-                batch = self._apply_stress_noise(batch)
-
+        total_loss = torch.zeros((), device=self.device)
+        num_graphs = 0
+        steps = self.config.accumulation_steps
+        micro_batches = iter(loader)
+        progress = tqdm(total=math.ceil(len(loader) / steps), desc=f"Epoch {epoch + 1}",
+                        leave=False)
+        while group := list(itertools.islice(micro_batches, steps)):
+            batches = [self._train_batch(item, epoch) for item in group]
+            count = sum(self._num_loss_terms(batch) for batch in batches)
             self.optimizer.zero_grad()
-            loss = self._loss(batch, self.model(batch))
-            loss.backward()
+            step_loss = torch.zeros((), device=self.device)
+            for batch in batches:
+                loss = self._loss_sum(batch, self.model(batch)) / count
+                loss.backward()
+                step_loss += loss.detach()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(),
                                            max_norm=self.config.max_grad_norm)
             self.optimizer.step()
             if self.config.scheduler == "exponential":
                 self.scheduler.step()
 
-            total_loss += loss.item() * batch.num_graphs
-            num_graphs += batch.num_graphs
-            progress.set_postfix(loss=f"{loss.item():.4f}")
-        return total_loss / max(num_graphs, 1)
+            graphs = sum(batch.num_graphs for batch in batches)
+            total_loss += step_loss * graphs
+            num_graphs += graphs
+            progress.update()
+            if progress.n % PROGRESS_EVERY == 0:   # reading the loss waits for the GPU
+                progress.set_postfix(loss=f"{step_loss.item():.4f}")
+        progress.close()
+        return (total_loss / max(num_graphs, 1)).item()
+
+    def _train_batch(self, item, epoch: int):
+        """A micro-batch of the train loader on the device, with scheduled sampling,
+        noise and world edges."""
+        prev_batch = None
+        if isinstance(item, (tuple, list)):          # (sample, predecessor) pairs
+            item, prev_batch = item
+            prev_batch = prev_batch.to(self.device)
+        batch = item.to(self.device)
+        if prev_batch is not None and epoch > 0:
+            batch = self._apply_scheduled_sampling(batch, prev_batch, epoch)
+        if self.config.world_noise_std > 0:   # also builds the world edges
+            batch = self._apply_position_noise(batch)
+        else:
+            batch = self._with_world_edges(batch)
+        if self.config.stress_noise_std > 0 and self.stress_prev_column is not None:
+            batch = self._apply_stress_noise(batch)
+        return batch
 
     @torch.no_grad()
     def validate(self, loader: DataLoader) -> float:
         """Mean single-step loss per graph (no noise, no scheduled sampling)."""
         self.model.eval()
-        total_loss, num_graphs = 0.0, 0
+        total_loss = torch.zeros((), device=self.device)
+        num_graphs = 0
         for batch in self._prepared(loader):
-            total_loss += self._loss(batch, self.model(batch)).item() * batch.num_graphs
+            mean = self._loss_sum(batch, self.model(batch)) / self._num_loss_terms(batch)
+            total_loss += mean * batch.num_graphs
             num_graphs += batch.num_graphs
-        return total_loss / max(num_graphs, 1)
+        return (total_loss / max(num_graphs, 1)).item()
 
     def _with_world_edges(self, batch):
         """``batch`` with world edges; samples built without them
@@ -535,16 +649,14 @@ class Trainer:
 
     def _train_eval_loader(self, train_loader: DataLoader, val_loader: DataLoader
                            ) -> DataLoader:
-        """Fixed train samples, evenly spread and as many as the val split, for the
-        single-step loss without noise (comparable to the val loss). Loaded in the
-        main process: workers started anew at every evaluation took 7-8 s for the
-        392 samples of the s8 dataset, the main process 0.5 s."""
+        """Fixed train samples (``train_eval_indices``) for the single-step loss
+        without noise (comparable to the val loss). Loaded in the main process:
+        starting workers anew at every evaluation takes far longer than loading a
+        few hundred samples."""
         train_set = train_loader.dataset
         if isinstance(train_set, PredecessorPairDataset):
             train_set = train_set.base
-        count = min(len(train_set), len(val_loader.dataset))
-        indices = sorted({round(i * (len(train_set) - 1) / max(count - 1, 1))
-                          for i in range(count)})
+        indices = train_eval_indices(len(train_set))
         return DataLoader(Subset(train_set, indices), batch_size=val_loader.batch_size,
                           shuffle=False, collate_fn=Batch.from_data_list,
                           pin_memory=val_loader.pin_memory)
@@ -553,7 +665,9 @@ class Trainer:
               start_epoch: int = 0) -> None:
         """Main loop: train, validate, select, checkpoint, early-stop."""
         cfg = self.config
-        logger.info(f"Run {self.run_name} on {self.device}, output: {self.checkpoint_dir}")
+        machine = describe_machine(self.device)
+        logger.info(f"Run {self.run_name} on {self.device} ({machine}), "
+                    f"output: {self.checkpoint_dir}")
         logger.info(f"Config: {describe_config_source(cfg)}")
         if cfg.architecture == "meshgraphnets":
             architecture = (f"latent {cfg.latent_size}, {cfg.num_message_passing_steps} "
@@ -629,6 +743,7 @@ class Trainer:
                 "learning_rate": learning_rate,
                 "epoch_time_seconds": round(epoch_durations[-1], 2),
                 "is_best": is_best,
+                "peak_memory": {**peak_memory(self.device), "machine": machine},
             }
             if rollout_metrics is not None:
                 record.update({f"val_{key}": value for key, value in rollout_metrics.items()})
@@ -683,6 +798,8 @@ class Trainer:
                         f"(epoch {best['epoch']})")
         logger.info(f"Training time: {format_duration(time.time() - start_time)}; "
                     f"history: {history_path}")
+        if self.history and "peak_memory" in self.history[-1]:   # not in older histories
+            logger.info(f"Peak memory: {format_memory(self.history[-1]['peak_memory'])}")
 
     def _log_training_options(self) -> None:
         cfg = self.config
@@ -690,6 +807,9 @@ class Trainer:
                                      "steps" if cfg.scheduler == "exponential" else "")
         logger.info(f"Optimizer: Adam lr={cfg.learning_rate}, weight_decay={cfg.weight_decay}, "
                     f"scheduler={scheduler}, grad clip {cfg.max_grad_norm}")
+        accumulation = (f" ({cfg.accumulation_steps} micro-batches of {cfg.micro_batch_size}"
+                        ", gradients accumulated)" if cfg.accumulation_steps > 1 else "")
+        logger.info(f"Batch: {cfg.batch_size} graphs per optimizer step{accumulation}")
         stress_noise = cfg.stress_noise_std if self.stress_prev_column is not None else 0.0
         logger.info(f"Noise: position {cfg.world_noise_std}, stress_prev {stress_noise}")
         if cfg.scheduled_sampling:
@@ -732,7 +852,7 @@ class Trainer:
                   f"elapsed {format_duration(time.time() - start_time)}, "
                   f"remaining ~{format_duration(remaining)} "
                   f"(finish ~{finish:%d.%m. %H:%M})")
-        timing += f" | {self.selection.status()}"
+        timing += f" | {self.selection.status()} | {format_memory(record['peak_memory'])}"
         logger.info(timing)
 
     # ── checkpoints ─────────────────────────────────────────────────────────

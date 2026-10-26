@@ -32,6 +32,7 @@ computed on loading), and format v1 (all frames of a trajectory in its
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from collections import OrderedDict
@@ -47,7 +48,7 @@ from torch_geometric.data import Batch, Data
 from utils.normalizer import Normalizer
 
 from .graph_features import (
-    DEFAULT_WORLD_EDGE_EXCLUDE_HOPS,
+    DEFAULT_WORLD_EDGE_EXCLUDE_DISTANCE,
     NODE_TYPE_ACTUATOR,
     NUM_NODE_TYPES,
     WALL_DISTANCE_CUTOFF,
@@ -189,6 +190,7 @@ class _Trajectory:
     walls: Optional[torch.Tensor] = None       # (W_max, 6) walls, zero rows padded
     world_pos: Optional[torch.Tensor] = None   # (T, N, 3); None when lazy
     stress: Optional[torch.Tensor] = None      # (T, N, 1); None when lazy
+    rest_key: Optional[Hashable] = None   # mesh + rest positions, if the world edges need them
 
     @property
     def num_nodes(self) -> int:
@@ -196,9 +198,11 @@ class _Trajectory:
 
 
 def _nbytes(value) -> int:
-    """Bytes of the tensors of a ``_Mesh`` / ``_Trajectory``."""
+    """Bytes of the tensors of a ``_Mesh`` / ``_Trajectory`` / world edge selection."""
     total = 0
-    for item in (getattr(value, f.name) for f in fields(value)):
+    items = [value] if isinstance(value, dict) else [getattr(value, f.name)
+                                                     for f in fields(value)]
+    for item in items:
         for tensor in (item.values() if isinstance(item, dict) else [item]):
             if isinstance(tensor, torch.Tensor):
                 total += tensor.numel() * tensor.element_size()
@@ -260,9 +264,12 @@ class DeformingPlateDataset(Dataset):
         meshes up to this size per process (LRU).
     world_edges : str
         World edge variant, one of ``WORLD_EDGE_MODES`` (``"all"``: paper).
-    world_edge_exclude_hops : int
-        ``self_contact_aware``: pairs at most this many mesh edges apart get
-        no world edge.
+    world_edge_exclude_distance : float
+        ``self_contact_aware``: pairs with a path along the mesh edges (rest
+        state) shorter than this many contact radii get no world edge.
+    world_edge_exclude_hops : int, optional
+        ``self_contact_aware`` as up to v0.3.0: pairs at most this many mesh
+        edges apart get none (instead of ``world_edge_exclude_distance``).
     build_world_edges : bool
         False: samples come without ``world_edge_index`` / ``world_edge_attr``;
         ``graph_features.add_world_edges`` adds them later (e.g. on the GPU).
@@ -271,7 +278,8 @@ class DeformingPlateDataset(Dataset):
     def __init__(self, db_path, split: str, normalizer: Optional[Normalizer] = None,
                  with_cells: bool = False, lazy: bool = False, cache_frames: int = 0,
                  world_edges: str = "all",
-                 world_edge_exclude_hops: int = DEFAULT_WORLD_EDGE_EXCLUDE_HOPS,
+                 world_edge_exclude_distance: float = DEFAULT_WORLD_EDGE_EXCLUDE_DISTANCE,
+                 world_edge_exclude_hops: Optional[int] = None,
                  static_cache_mb: float = DEFAULT_STATIC_CACHE_MB,
                  build_world_edges: bool = True):
         super().__init__()
@@ -284,7 +292,12 @@ class DeformingPlateDataset(Dataset):
         self.lazy = lazy
         self.cache_frames = max(0, int(cache_frames))
         self.world_edges = world_edges
-        self.world_edge_exclude_hops = int(world_edge_exclude_hops)
+        self.world_edge_exclude_distance = float(world_edge_exclude_distance)
+        self.world_edge_exclude_hops = (None if world_edge_exclude_hops is None
+                                        else int(world_edge_exclude_hops))
+        # The selection then depends on the rest positions, not on the mesh alone.
+        self._world_selection_by_rest = (world_edges == "self_contact_aware"
+                                         and world_edge_exclude_hops is None)
         self.static_cache_bytes = int(float(static_cache_mb) * 2 ** 20) if lazy else None
         self.build_world_edges = build_world_edges
         self.normalizer = normalizer or Normalizer.load(
@@ -296,7 +309,6 @@ class DeformingPlateDataset(Dataset):
         self._static = _StaticCache(self.static_cache_bytes)
 
         info, self.trajectories = self._load(split)
-        self.contact_radius = float(info["contact_radius"])
         # Layout fixed at export time (DBs from before --history: paper layout).
         self.history = int(info.get("history", 0))
         self.prev_stress = info.get("prev_stress", "1") == "1"
@@ -346,6 +358,7 @@ class DeformingPlateDataset(Dataset):
         info = self.trajectories[k]
         mesh = self._mesh(info)
         traj = self._trajectory(info, mesh)
+        selection = self._world_selection(mesh, traj)
         world_pos, stress = self._frames(info, traj, step, 2 + self.history)
         dynamic_inputs, targets, current_pos = trajectory_features(
             world_pos, stress, traj.actuator_mask, self.history, self.prev_stress)
@@ -354,7 +367,7 @@ class DeformingPlateDataset(Dataset):
         if world_edges:
             mesh_edge_attr, world_edge_index, world_edge_attr = edge_features(
                 mesh.edge_index, traj.mesh_space_features, world_pos, self.contact_radius,
-                **mesh.world_selection)
+                **selection)
         else:
             mesh_edge_attr = mesh_edge_features(mesh.edge_index, traj.mesh_space_features,
                                                 world_pos)
@@ -376,7 +389,7 @@ class DeformingPlateDataset(Dataset):
             loss_mask=~traj.actuator_mask,
             world_pos=world_pos,
             mesh_pos=traj.mesh_pos,       # undeformed; mgn_t's positional encoding
-            **mesh.world_selection,       # read back by rebuild_edges
+            **selection,                  # read back by rebuild_edges
         )
         if world_edges:
             data.world_edge_index = world_edge_index
@@ -459,6 +472,15 @@ class DeformingPlateDataset(Dataset):
         return self._static.get(("trajectory", info.db_id),
                                 lambda: self._read_trajectory(self._db(), info, mesh))
 
+    def _world_selection(self, mesh: _Mesh, traj: _Trajectory) -> Dict[str, torch.Tensor]:
+        """Attributes of the world edge variant: of the mesh, or with the path rule of
+        ``self_contact_aware`` of the rest geometry (shared by runs with equal geometry)."""
+        if traj.rest_key is None:
+            return mesh.world_selection
+        return self._static.get(traj.rest_key, lambda: world_edge_selection(
+            self.world_edges, mesh.edge_index, traj.num_nodes, mesh_pos=traj.mesh_pos,
+            exclude_length=self.world_edge_exclude_distance * self.contact_radius))
+
     def _read_trajectory(self, conn: sqlite3.Connection, info: _TrajectoryInfo,
                          mesh: _Mesh) -> _Trajectory:
         node_type, mesh_pos, global_values, node_static, walls = conn.execute(
@@ -476,6 +498,9 @@ class DeformingPlateDataset(Dataset):
             node_static=(None if node_static is None
                          else _tensor(node_static, np.float32, (num_nodes, -1))),
             walls=self._padded_walls(walls),
+            rest_key=(("world_selection", info.mesh_key,
+                       hashlib.sha256(mesh_pos.numpy().tobytes()).hexdigest())
+                      if self._world_selection_by_rest else None),
         )
 
     def _read_mesh(self, conn: sqlite3.Connection, info: _TrajectoryInfo) -> _Mesh:
@@ -502,8 +527,8 @@ class DeformingPlateDataset(Dataset):
             edge_index = mesh_edges_from_cells(cells, cell_types)
         return _Mesh(
             edge_index=edge_index,
-            world_selection=world_edge_selection(self.world_edges, edge_index, info.num_nodes,
-                                                 self.world_edge_exclude_hops),
+            world_selection=({} if self._world_selection_by_rest else world_edge_selection(
+                self.world_edges, edge_index, info.num_nodes, self.world_edge_exclude_hops)),
             cells=(torch.from_numpy(cells.astype(np.int64))
                    if self.with_cells and cells is not None else None),
             cell_types=(None if cell_types is None or not self.with_cells
@@ -526,6 +551,7 @@ class DeformingPlateDataset(Dataset):
                     "re-export it: python -m dataset_preprocessor.export --out-dir <dir>")
             info = dict(conn.execute("SELECT key, value FROM info").fetchall())
             self.max_walls = int(info.get("max_walls", 0))   # needed by _padded_walls
+            self.contact_radius = float(info["contact_radius"])   # and by _world_selection
             db_format = info.get("format")
             if db_format not in DB_FORMATS:
                 hint = (" — the export did not finish; continue it with --resume"
@@ -558,6 +584,7 @@ class DeformingPlateDataset(Dataset):
                         lambda: self._read_trajectory(conn, traj_info, mesh))
                     traj.world_pos, traj.stress = self._read_all_frames(conn, db_format,
                                                                         traj_info)
+                    self._world_selection(mesh, traj)
         finally:
             conn.close()
         return info, trajectories

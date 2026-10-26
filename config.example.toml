@@ -1,8 +1,8 @@
 # ============================================================
 # CrashDefNet — example training config (deforming_plate)
 # ============================================================
-# MGN-T in a minimal size that trains on a CPU in about two minutes (5 epochs
-# of ~25 s) and runs every stage of the pipeline: loading, training, rollout
+# MGN-T in a minimal size that trains on a CPU in about two and a half minutes
+# (5 epochs of ~30 s) and runs every stage of the pipeline: loading, training, rollout
 # validation, early stopping, checkpoints and test metrics. Accuracy is not
 # the goal here. For MeshGraphNets set [model] architecture = "meshgraphnets".
 #
@@ -27,11 +27,12 @@ architecture    = "mgn_t"        # "mgn_t" (MeshGraphNet-Transformer) or "meshgr
 residual_target = false          # true: predict the change w.r.t. *_prev (needs --history 1)
 world_edges     = "self_contact_aware"   # contact between bodies and self-contact (MGN-T paper v4);
                                         # "all" (MeshGraphNets paper) | "contact" (docs/data.md)
-world_edge_exclude_hops = 4      # self_contact_aware: pairs up to this many mesh edges apart get none
+world_edge_exclude_distance = 2.0   # self_contact_aware: pairs with a path through the mesh
+                                    # shorter than this x contact radius get none
 
 [model.meshgraphnets]
 # Paper (Pfaff et al. 2021): latent_size 128, 15 message passing steps. The
-# values below train on a CPU too, at ~2 min per epoch (docs/installation.md).
+# values below train on a CPU too, at ~2.5 min per epoch (docs/installation.md).
 latent_size               = 64
 num_mlp_layers            = 2
 num_message_passing_steps = 8

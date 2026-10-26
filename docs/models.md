@@ -4,7 +4,7 @@ Both architectures take the same graph (nodes, mesh edges, world edges; see
 [data.md](data.md)) and return the same output: the normalized velocity and stress per
 node for the next time step. Run parameters reach them as constant node feature columns;
 global inputs, a global state and global outputs are not implemented yet (open points:
-[data.md](data.md#run-parameters-current-approach-and-open-points)). The architecture is
+[data.md](data.md#general-meshes-and-run-parameters)). The architecture is
 selected in the config:
 
 ```toml
@@ -85,12 +85,10 @@ the transformer.
 
 Paper settings for deforming_plate (Sec. 5.1 and Tab. 2, pp. 6–7): 2 + 2 message
 passing steps, 2 transformer blocks, 4 heads, **16 tokens**, ~0.5 M parameters,
-τ₀ = 1.0 (Sec. 3.3); trained for 25 epochs with batch 32 and a cosine schedule from
-1e-4 to 1e-6. The defaults here, widths 64-32-64 and 128 tokens, come from version 3
-(Tab. 2), which lists them for its Pi-beam example; version 4 gives no widths and uses
-64 tokens for the Pi-Beam. With mesh and world edges and the choices below, these
-defaults give 0.32 M parameters; the configuration of the [results](results.md#mgn-t-configuration)
-(widths 80-48-80, 16 tokens) gives the paper's size, 0.51 M.
+τ₀ = 1.0; 25 epochs with batch 32, cosine schedule from 1e-4 to 1e-6. The defaults here
+(widths 64-32-64, 128 tokens) come from version 3 and give 0.32 M parameters; the
+[results](results.md#mgn-t-configuration) use widths 80-48-80 and 16 tokens, the paper's
+size of 0.51 M.
 
 ### Assumptions where the paper leaves gaps
 
@@ -147,11 +145,8 @@ A new architecture plugs into the same pipeline in four small steps; see
 
 ## Checkpoints
 
-The trainer saves the model's `state_dict` together with the full training config and
-the dataset metadata (feature layout). `train.trainer.load_trained_model` rebuilds the
-model from a checkpoint; the rollout uses it. The checkpoint also holds the normalizer
-statistics, so a model keeps its scale when the dataset is exported anew; older
-checkpoints read `normalizer.json` of the dataset folder, which must then be the dataset
-the model was trained on (the rollout checks the feature layout and warns if the export
-settings differ). The attribute names of the modules are
-`state_dict` keys: renaming them breaks existing checkpoints.
+A checkpoint holds the model's `state_dict`, the training config, the dataset metadata
+and the normalizer statistics; `train.trainer.load_trained_model` rebuilds the model from
+it (older checkpoints without normalizer read `normalizer.json` of the dataset folder).
+The attribute names of the modules are `state_dict` keys: renaming them breaks existing
+checkpoints.

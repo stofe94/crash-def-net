@@ -18,12 +18,12 @@ same on every machine and need neither a GPU nor a display (set
 The animation in the README and in docs/results.md:
 
     python utils/animate_rollout.py rollouts/<mgn_t rollout> rollouts/<mgn rollout> \\
-        --trajectory test_traj0037 --output docs/assets/rollout_test_traj0037.gif
+        --trajectory test_traj0136 --output docs/assets/rollout_test_traj0136.gif
 
 Usage
 -----
     python utils/animate_rollout.py rollouts/<a> [rollouts/<b> ...] \\
-        [--trajectory test_traj0037] [--labels "MGN-T tuned" "MGN"] \\
+        [--trajectory test_traj0136] [--labels "MGN-T" "MGN"] \\
         [--stress-max 200] [--output <file.gif>]
 """
 
@@ -286,7 +286,7 @@ def main(argv=None) -> int:
                         help="rollout folders with .vtu export; the first one also "
                              "provides the ground truth")
     parser.add_argument("--trajectory", default=None,
-                        help="e.g. test_traj0037 (default: the first of the split)")
+                        help="e.g. test_traj0136 (default: the first of the split)")
     parser.add_argument("--labels", nargs="+", default=None,
                         help="panel titles, one per rollout "
                              "(default: architecture and parameters)")

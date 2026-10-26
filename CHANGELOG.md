@@ -4,6 +4,97 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [semantic versioning](https://semver.org/).
 
+## [0.4.0] — 2026-10-26
+
+The comparison protocol now draws its trajectories from DeepMind's original train,
+validation and test splits, and the first results are new on it: MGN-T and MeshGraphNets
+with the same contact edges on 20 unseen test geometries. A new tool evaluates every run
+on its own, and training, rollout and contact search handle larger splits.
+
+### Added
+
+- **Evaluation of a single run** without the paper: `utils/evaluate_run.py` takes a
+  rollout or checkpoint folder and writes the training curves, the error over the
+  rollout (mean, best and worst trajectory), every metric over the trajectories (all
+  pooled, median, best, worst), the single-step errors per target and measured findings
+  to `evaluations/<time>_<run>_evaluation/`. See
+  [docs/rollout-and-evaluation.md](docs/rollout-and-evaluation.md#evaluating-a-run).
+- **Export from DeepMind's original splits:** `export.py --source-tfrecord` takes three
+  names, one per split (`train.tfrecord valid.tfrecord test.tfrecord`), and
+  `--select-seed` draws the trajectories of each split at random instead of taking the
+  first ones; `metadata.json` lists the drawn trajectories. Exports without these
+  options are unchanged. See [docs/data.md](docs/data.md).
+- **Peak memory of every training run:** every record of `history.json` holds the peak
+  RAM of the main process and of the largest DataLoader worker, on a GPU the memory
+  allocated and reserved by PyTorch, and the machine; the training log and
+  `utils/evaluate_run.py` show it. See [docs/training.md](docs/training.md#output).
+- **Micro-batches** (`[training] micro_batch_size`, a machine setting): gradient
+  accumulation over micro-batches with the loss normalized over the whole batch, so
+  the optimizer step equals that of `batch_size` while only one micro-batch is in
+  memory. Large models and large samples keep the recipe of a comparison.
+- **Displacement as the scale of the position error:** the rollout summary stores the RMS
+  displacement of the ground truth since step 1, the position error of a prediction in
+  which nothing moves, and every trajectory keeps its errors per step.
+- **DOI on Zenodo** for all versions,
+  [10.5281/zenodo.23575635](https://doi.org/10.5281/zenodo.23575635): badge and BibTeX
+  in the README, `doi` in `CITATION.cff`.
+
+### Changed
+
+- **Comparison protocol on DeepMind's original splits**
+  (`protocols/deforming_plate_s4_t150.toml`): 100 / 30 / 20 trajectories drawn from the
+  train / valid / test splits, stride 4, batch 8, 60 epochs, learning rate 2e-4 → 1e-6
+  along a cosine, rollout validation of all 30 val trajectories every 4 epochs. It
+  replaces the protocol on `test.tfrecord` (see Removed); `check_protocol.py` checks
+  against it by default. New architectures are compared with a comparable MeshGraphNets
+  baseline with `self_contact_aware` edges, since the paper's world edges (`all`, the
+  setting of the protocol config) do not scale to crash meshes; the published results of
+  the MeshGraphNets paper remain the original reference. See
+  [docs/comparison-protocol.md](docs/comparison-protocol.md#baselines).
+- **First results on the new protocol:** MGN-T and MeshGraphNets in paper size as the
+  comparable baseline, both with `self_contact_aware` contact edges, on 20 test
+  trajectories, with the GPU memory of both runs and the median trajectory next to the
+  pooled metrics ([docs/results.md](docs/results.md)).
+- **Paired comparison as counts:** `check_protocol.py` reports the difference on every
+  trajectory and how often each model has the lower error, without a verdict.
+- **Paper comparison over the trajectories:** `04_error_per_trajectory.png` shows for
+  every rollout all trajectories pooled, the median, the best and the worst trajectory
+  instead of one bar per trajectory. A run whose world edges differ from its
+  architecture's paper carries them in its name, e.g. "MGN (self_contact_aware)", and the
+  conditions table lists the contact edges.
+- **`self_contact_aware` measures the path through the material:** pairs whose
+  shortest path along the mesh edges of the rest state is shorter than
+  `world_edge_exclude_distance` × r_W (default 2) get no world edge. Counting mesh edges
+  (`world_edge_exclude_hops`) let neighbours in the material through where a mesh is
+  locally refined; in 20 of 100 trajectories of DeepMind's train split these were up to
+  112,000 world edges per trajectory. Configs and checkpoints that set
+  `world_edge_exclude_hops` (up to v0.3.0) keep counting edges.
+- **Rollouts in batches:** trajectories of equal length are rolled out together, as one
+  batch of graphs with one model call per step (up to 100,000 nodes); the errors are
+  summed on the device and read once. Metrics as before up to rounding.
+- **Training steps without reads from the GPU:** the loss stays on the device and is
+  read once per epoch, the loss mask multiplies instead of indexing, and the contact
+  search and MGN-T's slicing and position encoding take the graphs of a batch as blocks
+  of consecutive nodes instead of one mask per graph. Predictions are bitwise the same,
+  gradients the same up to rounding.
+- **Train loss without noise on fewer samples:** the generalization gap is computed on
+  5 % of the train split (evenly spread, at least 200 samples) instead of as many
+  samples as the val split, which made it half the cost of every evaluation on large
+  val splits. It takes no part in model selection.
+
+### Removed
+
+- The protocol `deforming_plate_s8_t40` on 40 trajectories of `test.tfrecord` at
+  stride 8 and its results; both remain in v0.3.0.
+
+### Fixed
+
+- The documentation gave 1,000 trajectories for DeepMind's `train.tfrecord`; it holds
+  1,200.
+- DataLoader workers stopped with "Too many open files" on splits of more than about
+  120 trajectories: every shared tensor kept a file descriptor open. They now receive
+  the tensors through files in shared memory.
+
 ## [0.3.0] — 2026-10-22
 
 CrashDefNet reads crash data: besides DeepMind's TFRecords, LS-DYNA runs and VTK time
@@ -205,6 +296,7 @@ Developed and validated on DeepMind's `deforming_plate` benchmark.
   for the results: they are predictions of learned models, no substitute for validated
   crash simulation or physical testing, and the software comes without warranty.
 
-[Unreleased]: https://github.com/stofe94/crash-def-net/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/stofe94/crash-def-net/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/stofe94/crash-def-net/releases/tag/v0.4.0
 [0.3.0]: https://github.com/stofe94/crash-def-net/releases/tag/v0.3.0
 [0.2.0]: https://github.com/stofe94/crash-def-net/releases/tag/v0.2.0

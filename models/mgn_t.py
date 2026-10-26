@@ -60,13 +60,13 @@ Input as in ``models/meshgraphnets.py``, plus ``data.mesh_pos`` (undeformed node
 positions) for the positional encoding.
 """
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dataset_preprocessor.graph_features import structure_node_mask
+from dataset_preprocessor.graph_features import graph_sizes, structure_node_mask
 from models.meshgraphnets import GraphNetBlock, count_parameters, make_mlp  # noqa: F401
 
 _ACTIVATION = nn.LeakyReLU   # paper: LeakyReLU in every MLP
@@ -99,14 +99,14 @@ class SinusoidalPositionEncoding(nn.Module):
     def dim(self) -> int:
         return 6 * self.num_frequencies
 
-    def forward(self, mesh_pos: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
-        normalized = torch.empty_like(mesh_pos)
-        for graph in range(int(batch.max().item()) + 1):
-            nodes = batch == graph
-            pos = mesh_pos[nodes]
-            low = pos.min(dim=0).values
-            span = (pos.max(dim=0).values - low).clamp(min=1e-9)
-            normalized[nodes] = (pos - low) / span
+    def forward(self, mesh_pos: torch.Tensor, sizes: List[int]) -> torch.Tensor:
+        """``sizes``: nodes per graph, the graphs as consecutive blocks (PyG batch)."""
+        normalized = []
+        for pos in mesh_pos.split(sizes):
+            low = pos.min(dim=0).values if pos.numel() else pos.new_zeros(3)
+            span = ((pos.max(dim=0).values if pos.numel() else low) - low).clamp(min=1e-9)
+            normalized.append((pos - low) / span)
+        normalized = torch.cat(normalized)
 
         angles = 2 * torch.pi * normalized.unsqueeze(-1) * self.frequencies
         return torch.cat((angles.sin(), angles.cos()), dim=-1).flatten(1)
@@ -137,17 +137,16 @@ class PhysicsAttention(nn.Module):
             logits = logits - torch.log(-torch.log(uniform))   # Gumbel noise
         return F.softmax(logits / temperature, dim=-1)
 
-    def forward(self, x: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, sizes: List[int]) -> torch.Tensor:
+        """``sizes``: nodes per graph; slices of consecutive nodes instead of masks,
+        which would wait for the GPU once per graph."""
         weights = self.slice_weights(x)
-        num_graphs = int(batch.max().item()) + 1
+        num_graphs = len(sizes)
+        graph_weights = weights.split(sizes)
 
         # Slicing per graph: z_j = sum_i w_ij x_i / sum_i w_ij
-        tokens = x.new_empty(num_graphs, self.num_tokens, x.shape[-1])
-        for graph in range(num_graphs):
-            nodes = batch == graph
-            graph_weights = weights[nodes]
-            tokens[graph] = (graph_weights.t() @ x[nodes]) \
-                / graph_weights.sum(dim=0).clamp(min=1e-9).unsqueeze(-1)
+        tokens = torch.stack([(w.t() @ nodes) / w.sum(dim=0).clamp(min=1e-9).unsqueeze(-1)
+                              for w, nodes in zip(graph_weights, x.split(sizes))])
 
         # Attention over the P tokens of one graph
         qkv = self.qkv(tokens).view(num_graphs, self.num_tokens, 3, self.num_heads,
@@ -158,11 +157,7 @@ class PhysicsAttention(nn.Module):
             attended.transpose(1, 2).reshape(num_graphs, self.num_tokens, -1))
 
         # De-slicing: x'_i = sum_j w_ij z'_j (the weights of a node sum to 1)
-        out = x.new_empty(x.shape)
-        for graph in range(num_graphs):
-            nodes = batch == graph
-            out[nodes] = weights[nodes] @ tokens[graph]
-        return out
+        return torch.cat([w @ tokens[graph] for graph, w in enumerate(graph_weights)])
 
 
 class TransformerBlock(nn.Module):
@@ -178,8 +173,8 @@ class TransformerBlock(nn.Module):
             nn.Linear(dim, ffn_ratio * dim), _ACTIVATION(),
             nn.Linear(ffn_ratio * dim, dim))
 
-    def forward(self, x: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
-        x = x + self.attention(self.attention_norm(x), batch)
+    def forward(self, x: torch.Tensor, sizes: List[int]) -> torch.Tensor:
+        x = x + self.attention(self.attention_norm(x), sizes)
         return x + self.ffn(self.ffn_norm(x))
 
 
@@ -265,10 +260,11 @@ class MgnTransformer(nn.Module):
         if self.transformer_nodes == "structure":   # without the actuator (paper Sec. 3.3)
             index = structure_node_mask(data.x).nonzero().squeeze(1)
             latents, batch, mesh_pos = nodes[index], batch[index], mesh_pos[index]
+        sizes = graph_sizes(batch)   # nodes per graph, read once
         tokens = self.to_token_dim(
-            torch.cat((latents, self.position_encoding(mesh_pos, batch)), dim=-1))
+            torch.cat((latents, self.position_encoding(mesh_pos, sizes)), dim=-1))
         for block in self.transformer:
-            tokens = block(tokens, batch)
+            tokens = block(tokens, sizes)
         update = self.from_token_dim(tokens)   # residual around the global stage
         nodes = nodes + update if self.transformer_nodes == "all" else \
             nodes.index_add(0, index, update)

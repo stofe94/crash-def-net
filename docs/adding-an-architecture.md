@@ -5,6 +5,11 @@ plugs into the existing pipeline, and data, training, rollout, metrics and the
 comparison with the paper work unchanged. MGN-T was added this way. It needs four small
 steps.
 
+This holds for architectures that take the graph of the pipeline and predict the targets
+per node. Depending on how an architecture is built, other inputs, graph structures,
+outputs or training procedures can need changes to the pipeline as well, e.g. to the
+graph building, the training loop or the rollout.
+
 ## 1. The model (`models/<name>.py`)
 
 A `torch.nn.Module` with this interface:
@@ -79,19 +84,20 @@ tables and reports, in `utils/animate_rollout.py` the panel title of the animati
 # quick check on the CPU with the small dataset (architecture = "my_model" in the config)
 python train/train.py --config configs/my_model.toml --epochs 1
 
-# full comparison with MeshGraphNets under the comparison protocol:
-# copy protocols/deforming_plate_s8_t40.toml, change only [model], train, roll out
-python train/train.py --config configs/my_model_s8_t40.toml
+# full comparison with MeshGraphNets under the comparison protocol: copy
+# protocols/deforming_plate_s4_t150.toml, change only [model] (world_edges =
+# "self_contact_aware", as the comparable MeshGraphNets baseline), train, roll out
+python train/train.py --config configs/my_model_s4_t150.toml
 python predict/rollout.py --checkpoint checkpoints/<run>/best_model.pt \
-    --data-dir data/deforming_plate_s8_t40 --split test
-python utils/check_protocol.py rollouts/<mgn rollout> rollouts/<my_model rollout> \
-    --exclude test_traj0038
-python utils/compare_paper.py rollouts/<my_model rollout> rollouts/<mgn rollout> \
-    --exclude test_traj0038
+    --data-dir data/deforming_plate_s4_t150 --split test
+python utils/check_protocol.py rollouts/<mgn baseline rollout> rollouts/<my_model rollout>
+python utils/evaluate_run.py rollouts/<my_model rollout>
+python utils/compare_paper.py rollouts/<my_model rollout> rollouts/<mgn baseline rollout>
 ```
 
 The [comparison protocol](comparison-protocol.md) fixes dataset, seed, budget and
-training recipe, lists the allowed variations (world edges) and
+training recipe, lists the allowed variations (world edges), names the two MeshGraphNets
+baselines (the paper's original and the comparable one for new architectures) and
 explains how to read the per-trajectory comparison.
 
 Everything else applies to the new model automatically: position noise, rollout

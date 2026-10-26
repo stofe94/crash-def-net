@@ -28,8 +28,9 @@ rollout: ``rollouts/<YYYYMMDD_HHMMSS>_<training run>_<checkpoint>_<split>/``
   command line, git commit, versions, results;
 - ``<split>_rollout_summary.json``: the metrics of the MGN-T paper
   (``paper_metrics``: RMSE-1, RMSE-all and R-RMSE of position and stress, see
-  ``_PaperMetrics``) plus normalized MSE, RMSE/MAE per target field and position
-  RMSE, each per step and per trajectory;
+  ``_PaperMetrics``) plus normalized MSE, RMSE/MAE per target field, position
+  RMSE and the RMS displacement of the ground truth (its scale), each per step,
+  for every trajectory and as the mean over them;
 - ``rollout.log`` and optionally one ``.vtu`` per step under
   ``<split>/<trajectory>/`` (prediction, ground truth, error; needs pyvista)
   plus ``<trajectory>.vtu.series``, which ParaView opens as one time series.
@@ -62,13 +63,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+from torch_geometric.data import Batch  # noqa: E402
 
 from dataset_preprocessor import DeformingPlateDataset  # noqa: E402
 from dataset_preprocessor.dataset import DEFAULT_STATIC_CACHE_MB, dataset_fingerprint  # noqa: E402
 from dataset_preprocessor.graph_features import (  # noqa: E402
     CELL_NUM_NODES,
     CELL_TETRA,
-    DEFAULT_WORLD_EDGE_EXCLUDE_HOPS,
+    DEFAULT_WORLD_EDGE_EXCLUDE_DISTANCE,
     TARGET_FEATURE_NAMES,
     VELOCITY_TARGET_COLUMNS,
     add_world_edges,
@@ -81,6 +83,9 @@ from utils.timezone import Formatter, from_timestamp, now  # noqa: E402
 logger = logging.getLogger("rollout")
 
 ROLLOUTS_DIR = _REPO_ROOT / "rollouts"
+# Trajectories of equal length are rolled out together, as one batch of graphs with
+# one model call per step, up to this many nodes in all.
+BATCH_NODES = 100_000
 STRESS_COLUMN = TARGET_FEATURE_NAMES.index("stress")
 # Nodes per VTK cell type, indexed by the type number.
 _NODES_OF_CELL_TYPE = np.zeros(max(CELL_NUM_NODES) + 1, dtype=np.int64)
@@ -109,7 +114,7 @@ class RolloutRunner:
         Input layout the model was trained with; checked against the dataset.
     lazy : bool
         Read the frames from the DB on access instead of loading the split.
-    world_edges, world_edge_exclude_hops
+    world_edges, world_edge_exclude_distance, world_edge_exclude_hops
         World edge variant the model was trained with (``TrainingConfig``).
     static_cache_mb : float
         Lazy: static graph data kept per split (``DeformingPlateDataset``).
@@ -121,7 +126,8 @@ class RolloutRunner:
     def __init__(self, model, normalizer, db_path, device, output_dir=None,
                  node_feature_names: Optional[List[str]] = None, lazy: bool = False,
                  world_edges: str = "all",
-                 world_edge_exclude_hops: int = DEFAULT_WORLD_EDGE_EXCLUDE_HOPS,
+                 world_edge_exclude_distance: float = DEFAULT_WORLD_EDGE_EXCLUDE_DISTANCE,
+                 world_edge_exclude_hops: Optional[int] = None,
                  static_cache_mb: float = DEFAULT_STATIC_CACHE_MB):
         self.model = model
         self.normalizer = normalizer
@@ -131,6 +137,7 @@ class RolloutRunner:
         self.expected_node_names = node_feature_names
         self.lazy = lazy
         self.world_edges = world_edges
+        self.world_edge_exclude_distance = world_edge_exclude_distance
         self.world_edge_exclude_hops = world_edge_exclude_hops
         self.static_cache_mb = static_cache_mb
         self._datasets: Dict[tuple, DeformingPlateDataset] = {}
@@ -156,6 +163,7 @@ class RolloutRunner:
                    trained.device, output_dir, trained.metadata["node_feature_names"],
                    lazy=config.lazy_loading if lazy is None else lazy,
                    world_edges=config.world_edges,
+                   world_edge_exclude_distance=config.world_edge_exclude_distance,
                    world_edge_exclude_hops=config.world_edge_exclude_hops,
                    static_cache_mb=config.static_cache_mb)
 
@@ -190,14 +198,15 @@ class RolloutRunner:
         all_metrics = _StepMetrics()
         paper_metrics: List[_PaperMetrics] = []
         sequence_results = {}
-        for sequence_id, sample_indices in sequences:
-            metrics, paper = self._rollout_sequence(dataset, split, sequence_id,
-                                                    sample_indices[:max_steps], prev_to_target,
-                                                    export_vtu, one_step)
-            all_metrics.merge(metrics)
-            paper_metrics.append(paper)
-            sequence_results[sequence_id] = {**metrics.sequence_summary(),
-                                             "paper_metrics": paper.result()}
+        num_nodes = {traj.sequence_id: traj.num_nodes for traj in dataset.trajectories}
+        for group in _sequence_batches(sequences, num_nodes, max_steps):
+            results = self._rollout_batch(dataset, split, group, prev_to_target, export_vtu,
+                                          one_step)
+            for (sequence_id, _), (metrics, paper) in zip(group, results):
+                all_metrics.merge(metrics)
+                paper_metrics.append(paper)
+                sequence_results[sequence_id] = {**metrics.sequence_summary(),
+                                                 "paper_metrics": paper.result()}
 
         summary = {"split": split, "num_sequences": len(sequence_results),
                    "target_feature_names": list(TARGET_FEATURE_NAMES),
@@ -214,38 +223,43 @@ class RolloutRunner:
         return summary
 
     @torch.no_grad()
-    def _rollout_sequence(self, dataset, split, sequence_id, sample_indices,
-                          prev_to_target, export_vtu, one_step=False
-                          ) -> Tuple["_StepMetrics", "_PaperMetrics"]:
-        """Roll out one trajectory; returns its per-step errors and paper metrics."""
+    def _rollout_batch(self, dataset, split, group, prev_to_target, export_vtu,
+                       one_step=False) -> List[Tuple["_StepMetrics", "_PaperMetrics"]]:
+        """Roll out the trajectories of ``group`` ((sequence id, sample indices), all
+        of the same length) together, as one batch of graphs; returns the per-step
+        errors and paper metrics of each. The errors are summed per graph on the
+        device and read once at the end, so the steps do not wait for the GPU."""
         node_mean, node_std = self.normalizer.mean_std("node_features", self.device)
         _, target_std = self.normalizer.mean_std("target", self.device)
         is_velocity = torch.zeros(len(TARGET_FEATURE_NAMES), dtype=torch.bool,
                                   device=self.device)
         is_velocity[VELOCITY_TARGET_COLUMNS] = True
-        metrics = _StepMetrics()
-        paper = _PaperMetrics()
+        num_graphs, num_steps = len(group), len(group[0][1])
+        step_errors: List[torch.Tensor] = []   # (len(_StepMetrics.ROWS), graphs) per step
+        paper = _PaperSums(num_graphs, self.device)
         prev_prediction = prev_pos = None      # raw prediction / positions of step t-1
-        exported_steps: List[int] = []
 
-        for step, idx in enumerate(sample_indices):
+        for step in range(num_steps):
+            samples = [dataset.sample(indices[step], world_edges=False) for _, indices in group]
+            sizes = [sample.num_nodes for sample in samples]
             # World edges on the device: from the ground truth only where the model
             # sees it (one_step), else rebuilt from the prediction below.
-            data = dataset.sample(idx, world_edges=False).to(self.device)
+            data = Batch.from_data_list(samples).to(self.device)
             target = self.normalizer.denormalize(data.y, "target")
             true_pos = data.world_pos
             free = free_node_mask(data.x)
             # Prescribed values are not predicted: the actuator keeps all its
             # ground-truth targets, clamped nodes their (zero) velocity.
             prescribed = (~data.loss_mask)[:, None] | ((~free)[:, None] & is_velocity)
-            paper.observe(true_pos, target[:, STRESS_COLUMN])
+            paper.observe(true_pos, target[:, STRESS_COLUMN], data.batch)
 
             if one_step:   # from the ground-truth state: x_{t+1} error = velocity error
                 add_world_edges(data, self.normalizer, dataset.contact_radius)
                 single = torch.where(prescribed, target, self.normalizer.denormalize(
                     self.model(data), "target"))
-                paper.add("q_1", (single - target)[:, VELOCITY_TARGET_COLUMNS])
-                paper.add("stress_1", (single - target)[:, STRESS_COLUMN])
+                paper.add("q_1", (single - target)[:, VELOCITY_TARGET_COLUMNS], data.batch,
+                          sizes)
+                paper.add("stress_1", (single - target)[:, STRESS_COLUMN], data.batch, sizes)
 
             if step == 0:
                 pos = true_pos
@@ -267,19 +281,34 @@ class RolloutRunner:
             prediction = torch.where(prescribed, target, prediction)
 
             if step > 0:   # step 0 is the ground-truth seed
-                loss_mask = data.loss_mask
-                metrics.add(step, prediction[loss_mask] - target[loss_mask], target_std,
-                            (pos - true_pos)[loss_mask])
-                paper.add("q_all", pos - true_pos)
-                paper.add("stress_all", (prediction - target)[:, STRESS_COLUMN])
+                if step == 1:   # positions still exact: the start of the displacement
+                    start_pos = true_pos
+                step_errors.append(_step_errors(prediction - target, pos - true_pos,
+                                                true_pos - start_pos, data.loss_mask,
+                                                data.batch, num_graphs, target_std))
+                paper.add("q_all", pos - true_pos, data.batch, sizes)
+                paper.add("stress_all", (prediction - target)[:, STRESS_COLUMN], data.batch,
+                          sizes)
                 if export_vtu:
-                    exported_steps.append(step)
-                    self._export_vtu(split, sequence_id, step, data, true_pos,
-                                     prediction, target)
+                    bounds = np.cumsum([0] + sizes)
+                    for (sequence_id, _), sample, a, b in zip(group, samples, bounds[:-1],
+                                                              bounds[1:]):
+                        self._export_vtu(split, sequence_id, step, sample, pos[a:b],
+                                         true_pos[a:b], prediction[a:b], target[a:b])
             prev_prediction, prev_pos = prediction, pos
-        if exported_steps:
-            self._write_vtu_series(split, sequence_id, exported_steps)
-        return metrics, paper
+        if export_vtu and num_steps > 1:
+            for sequence_id, _ in group:
+                self._write_vtu_series(split, sequence_id, list(range(1, num_steps)))
+
+        errors = (torch.stack(step_errors).cpu().numpy() if step_errors
+                  else np.zeros((0, len(_StepMetrics.ROWS), num_graphs)))
+        metrics = []
+        for graph in range(num_graphs):
+            graph_metrics = _StepMetrics()
+            for step, values in enumerate(errors[:, :, graph], start=1):
+                graph_metrics.add(step, values)
+            metrics.append(graph_metrics)
+        return list(zip(metrics, paper.trajectories()))
 
     # ── helpers ─────────────────────────────────────────────────────────────
 
@@ -294,6 +323,7 @@ class RolloutRunner:
             self._datasets[key] = DeformingPlateDataset(
                 self.db_path, split, self.normalizer, with_cells=with_cells, lazy=self.lazy,
                 world_edges=self.world_edges,
+                world_edge_exclude_distance=self.world_edge_exclude_distance,
                 world_edge_exclude_hops=self.world_edge_exclude_hops,
                 static_cache_mb=self.static_cache_mb, build_world_edges=False)
         return self._datasets[key]
@@ -307,13 +337,14 @@ class RolloutRunner:
             return False
         return True
 
-    def _export_vtu(self, split, sequence_id, step, data, true_pos, prediction, target):
-        """Write the predicted mesh of one step with prediction, ground truth and error."""
+    def _export_vtu(self, split, sequence_id, step, sample, pos, true_pos, prediction, target):
+        """Write the predicted mesh ``pos`` of one step with prediction, ground truth and
+        error; ``sample`` (of the dataset) holds the cells."""
         import pyvista as pv
 
-        points = data.world_pos.cpu().numpy().astype("float64")
-        cells = data.cells.cpu().numpy().astype("int64")       # (C, 4) or (C, W) padded
-        cell_types = getattr(data, "cell_types", None)
+        points = pos.cpu().numpy().astype("float64")
+        cells = sample.cells.cpu().numpy().astype("int64")     # (C, 4) or (C, W) padded
+        cell_types = getattr(sample, "cell_types", None)
         if cell_types is None:                                  # tetrahedra
             cell_types = np.full(cells.shape[0], CELL_TETRA, dtype=np.uint8)
         else:
@@ -350,27 +381,76 @@ class RolloutRunner:
             json.dump(series, f, indent=1)
 
 
+def _sequence_batches(sequences, num_nodes: Dict[str, int], max_steps: Optional[int]):
+    """Consecutive sequences of equal length, up to ``BATCH_NODES`` nodes per batch."""
+    group, size = [], 0
+    for sequence_id, indices in sequences:
+        indices = indices[:max_steps]
+        if group and (size + num_nodes[sequence_id] > BATCH_NODES
+                      or len(indices) != len(group[0][1])):
+            yield group
+            group, size = [], 0
+        group.append((sequence_id, indices))
+        size += num_nodes[sequence_id]
+    if group:
+        yield group
+
+
+def _per_graph(values: torch.Tensor, batch: torch.Tensor, num_graphs: int) -> torch.Tensor:
+    """Sum of ``values`` (N, ...) over the nodes of each graph -> (num_graphs, ...), float64."""
+    sums = torch.zeros((num_graphs,) + values.shape[1:], dtype=torch.float64,
+                       device=values.device)
+    return sums.index_add_(0, batch, values.double())
+
+
+def _step_errors(error: torch.Tensor, position_error: torch.Tensor, displacement: torch.Tensor,
+                 loss_mask: torch.Tensor, batch: torch.Tensor, num_graphs: int,
+                 target_std: torch.Tensor) -> torch.Tensor:
+    """Errors of one step per graph over the nodes in ``loss_mask`` -> (rows, graphs),
+    rows as in ``_StepMetrics.ROWS``. ``error`` (N, F): raw target error;
+    ``displacement`` (N, 3): ground-truth position minus that of step 1."""
+    mask = loss_mask.double()[:, None]
+    error = error.double()
+    per_node = torch.cat(((error / target_std).pow(2).mean(1, keepdim=True),
+                          position_error.double().pow(2).sum(1, keepdim=True),
+                          displacement.double().pow(2).sum(1, keepdim=True),
+                          error.pow(2), error.abs()), dim=1)
+    mean = (_per_graph(per_node * mask, batch, num_graphs)
+            / _per_graph(mask, batch, num_graphs)).t()
+    fields = len(TARGET_FEATURE_NAMES)
+    return torch.cat((mean[:1], mean[1:3].sqrt(), mean[3:3 + fields].sqrt(), mean[3 + fields:]))
+
+
 class _StepMetrics:
     """Errors per rollout step, collected over one or more sequences."""
+
+    # One step of one sequence (``_step_errors``): normalized MSE, position RMSE, RMS
+    # displacement of the ground truth since step 1, then RMSE and MAE per target field.
+    ROWS = (["mse_normalized", "position_rmse", "displacement_rms"]
+            + [f"rmse_{name}" for name in TARGET_FEATURE_NAMES]
+            + [f"mae_{name}" for name in TARGET_FEATURE_NAMES])
 
     def __init__(self):
         self.mse_normalized = defaultdict(list)                # step -> [value per sequence]
         self.position_rmse = defaultdict(list)
+        self.displacement_rms = defaultdict(list)
         self.rmse = defaultdict(lambda: defaultdict(list))     # field -> step -> [...]
         self.mae = defaultdict(lambda: defaultdict(list))
 
-    def add(self, step: int, error: torch.Tensor, target_std: torch.Tensor,
-            position_error: torch.Tensor) -> None:
-        """``error`` (M, 4) raw target error and ``position_error`` (M, 3) of the loss nodes."""
-        self.mse_normalized[step].append((error / target_std).pow(2).mean().item())
-        self.position_rmse[step].append(position_error.pow(2).sum(1).mean().sqrt().item())
+    def add(self, step: int, values) -> None:
+        """The errors of one sequence at ``step``, in the order of ``ROWS``."""
+        fields = len(TARGET_FEATURE_NAMES)
+        self.mse_normalized[step].append(float(values[0]))
+        self.position_rmse[step].append(float(values[1]))
+        self.displacement_rms[step].append(float(values[2]))
         for i, name in enumerate(TARGET_FEATURE_NAMES):
-            self.rmse[name][step].append(error[:, i].pow(2).mean().sqrt().item())
-            self.mae[name][step].append(error[:, i].abs().mean().item())
+            self.rmse[name][step].append(float(values[3 + i]))
+            self.mae[name][step].append(float(values[3 + fields + i]))
 
     def merge(self, other: "_StepMetrics") -> None:
         for mine, theirs in ((self.mse_normalized, other.mse_normalized),
-                             (self.position_rmse, other.position_rmse)):
+                             (self.position_rmse, other.position_rmse),
+                             (self.displacement_rms, other.displacement_rms)):
             for step, values in theirs.items():
                 mine[step].extend(values)
         for mine, theirs in ((self.rmse, other.rmse), (self.mae, other.mae)):
@@ -395,17 +475,20 @@ class _StepMetrics:
             "mse_normalized_per_step": self._per_step(self.mse_normalized),
             # step 1 starts from exact positions, so its position error is 0
             "position_rmse_per_step": self._per_step(self.position_rmse),
+            # since step 1, the last exact positions; same nodes and norm: the position
+            # error of a prediction in which nothing moves, the scale of position_rmse
+            "displacement_rms_per_step": self._per_step(self.displacement_rms),
             "rmse_per_field": {n: self._overall(s) for n, s in self.rmse.items()},
             "mae_per_field": {n: self._overall(s) for n, s in self.mae.items()},
             "rmse_per_field_per_step": {n: self._per_step(s) for n, s in self.rmse.items()},
         }
 
     def sequence_summary(self) -> Dict:
-        """Summary of a single sequence."""
+        """Summary of a single sequence: as ``summary``, plus the last step."""
         last = max(self.position_rmse, default=None)
         return {
             "num_predicted_steps": len(self.mse_normalized),
-            "mean_mse_normalized": self._overall(self.mse_normalized),
+            **self.summary(),
             "final_position_rmse": self.position_rmse[last][0] if last else float("nan"),
             "final_rmse_per_field": ({n: s[last][0] for n, s in self.rmse.items()}
                                      if last else {}),
@@ -436,15 +519,6 @@ class _PaperMetrics:
         self.squared = defaultdict(float)     # "q_1", "q_all", "stress_1", "stress_all"
         self.count = defaultdict(int)
         self.max_abs = {name: 0.0 for name in self.VARIABLES}
-
-    def observe(self, position: torch.Tensor, stress: torch.Tensor) -> None:
-        """Ground truth of one frame, for the infinity norm of the trajectory."""
-        self.max_abs["q"] = max(self.max_abs["q"], position.abs().max().item())
-        self.max_abs["stress"] = max(self.max_abs["stress"], stress.abs().max().item())
-
-    def add(self, key: str, error: torch.Tensor) -> None:
-        self.squared[key] += error.double().pow(2).sum().item()
-        self.count[key] += error.numel()
 
     def result(self) -> Dict[str, float]:
         """``<variable>_rmse_<1|all>`` and ``<variable>_r_rmse_<1|all>`` of this trajectory."""
@@ -482,6 +556,45 @@ class _PaperMetrics:
                     float(np.std(values, ddof=1) / math.sqrt(len(values)))
                     if len(values) > 1 else None)
         return out
+
+
+class _PaperSums:
+    """The sums of ``_PaperMetrics`` for the trajectories of a batch, on the device."""
+
+    def __init__(self, num_graphs: int, device):
+        self.num_graphs = num_graphs
+        self.squared: Dict[str, torch.Tensor] = {}       # key -> (graphs,) float64
+        self.count: Dict[str, np.ndarray] = {}
+        self.max_abs = {name: torch.zeros(num_graphs, dtype=torch.float64, device=device)
+                        for name in _PaperMetrics.VARIABLES}
+
+    def observe(self, position: torch.Tensor, stress: torch.Tensor, batch: torch.Tensor) -> None:
+        """Ground truth of one frame, for the infinity norm of each trajectory."""
+        for name, values in (("q", position.abs().amax(1)), ("stress", stress.abs())):
+            self.max_abs[name] = self.max_abs[name].scatter_reduce(
+                0, batch, values.double(), "amax")
+
+    def add(self, key: str, error: torch.Tensor, batch: torch.Tensor, sizes: List[int]) -> None:
+        """``error`` (N,) or (N, C) of every node of the batch; ``sizes``: nodes per graph."""
+        squared = error.double().pow(2)
+        squared = _per_graph(squared.sum(1) if squared.dim() > 1 else squared, batch,
+                             self.num_graphs)
+        components = error.shape[1] if error.dim() > 1 else 1
+        self.squared[key] = self.squared[key] + squared if key in self.squared else squared
+        self.count[key] = self.count.get(key, 0) + np.asarray(sizes) * components
+
+    def trajectories(self) -> List[_PaperMetrics]:
+        squared = {key: value.cpu().numpy() for key, value in self.squared.items()}
+        max_abs = {name: value.cpu().numpy() for name, value in self.max_abs.items()}
+        result = []
+        for graph in range(self.num_graphs):
+            metrics = _PaperMetrics()
+            for key, values in squared.items():
+                metrics.squared[key] = float(values[graph])
+                metrics.count[key] = int(self.count[key][graph])
+            metrics.max_abs = {name: float(values[graph]) for name, values in max_abs.items()}
+            result.append(metrics)
+        return result
 
 
 def format_paper_metrics(paper: Dict) -> List[str]:

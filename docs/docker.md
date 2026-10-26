@@ -31,7 +31,7 @@ with the exporter (see [data.md](data.md)) and set in `.env` next to
 ```bash
 cp .env.example .env
 # in .env, e.g.:
-#   DATASET_DIR=./data/deforming_plate_s8_t40
+#   DATASET_DIR=./data/deforming_plate_s4_t150
 #   CONFIG=configs/my_run.toml
 docker compose up
 ```
@@ -69,8 +69,9 @@ With the raw data under `datasets/deforming_plate/raw_dataset/` (see
 ```bash
 docker run --rm -v $PWD/datasets:/app/datasets -v $PWD/data:/app/data \
   --entrypoint python crashdefnet-deforming-plate:latest -m dataset_preprocessor.export \
-  --out-dir data/deforming_plate_s8_t40 \
-  --n-train 28 --n-val 8 --n-test 4 --num-steps 50 --time-stride 8
+  --out-dir data/deforming_plate_s4_t150 \
+  --source-tfrecord train.tfrecord valid.tfrecord test.tfrecord --select-seed 42 \
+  --n-train 100 --n-val 30 --n-test 20 --num-steps 100 --time-stride 4
 ```
 
 ## Rollout inside the container
@@ -98,10 +99,11 @@ Copy the dataset folder separately. Alternatively copy the repository and run
 
 ## Memory hints
 
-- **VRAM:** the model of `config.example.toml` (MGN-T in a minimal size, ~50 k parameters) fits into 4 GB at batch 2.
-  MeshGraphNets at paper size needs ~5–6 GB at batch 2 and ~15 GB at batch 4. MGN-T needs
-  considerably less. Per graph there are ~1,300 nodes, ~13 k mesh edges and, with
-  `world_edges = "all"`, ~21 k world edges (up to ~40 k); memory grows with the batch size. `PYTORCH_CUDA_ALLOC_CONF` in
+- **VRAM:** the model of `config.example.toml` fits into 4 GB at batch 2. The runs of the
+  [results](results.md) needed ~2 GB (MGN-T) and ~8 GB (MeshGraphNets in paper size) at
+  batch 8 with `self_contact_aware`; with `world_edges = "all"` MeshGraphNets needs
+  micro-batches on a 16 GB GPU ([protocol](comparison-protocol.md#training)). The trainer
+  records the peak memory in `history.json`. `PYTORCH_CUDA_ALLOC_CONF` in
   `docker-compose.yml` counters fragmentation caused by the varying number of contact
   edges.
 - **RAM:** the dataset is held once in shared memory (`shm_size` 2 GB); each DataLoader

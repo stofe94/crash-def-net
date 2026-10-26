@@ -5,6 +5,7 @@ checkpoints/
 rollouts/
 evaluations/
 test/
+archive/
 
 # Papers are kept locally next to the docs, but not redistributed
 docs/*.pdf

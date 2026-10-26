@@ -96,12 +96,18 @@ CELL_EDGES = {
 # ── world edge variants (config ``[model] world_edges``) ────────────────────
 # all                 every pair within r_W that is not a mesh edge (paper, Sec. 3.1)
 # contact             only pairs of different bodies (connected parts of the mesh)
-# self_contact_aware  every pair within r_W that is more than ``exclude_hops``
-#                     mesh edges apart: contact between bodies plus self-contact,
+# self_contact_aware  every pair within r_W that is not connected through the
+#                     material: contact between bodies plus self-contact,
 #                     without the static near neighbours a radius larger than the
-#                     edge length adds inside a body
+#                     edge length adds inside a body. Connected: the shortest
+#                     path along the mesh edges in the rest state is shorter
+#                     than ``exclude_distance`` x r_W. Counting mesh edges
+#                     instead (``exclude_hops``, configs up to v0.3.0) fails
+#                     where the mesh is locally refined: there, neighbours in the
+#                     material lie many edges apart.
 WORLD_EDGE_MODES = ("all", "contact", "self_contact_aware")
-DEFAULT_WORLD_EDGE_EXCLUDE_HOPS = 4
+# x r_W; on a mesh with edges of r_W / 2 the same pairs as 4 mesh edges
+DEFAULT_WORLD_EDGE_EXCLUDE_DISTANCE = 2.0
 # Static per-sample attributes that select the variant (see world_edge_selection).
 WORLD_SELECTION_KEYS = ("body_id", "world_exclude_index")
 
@@ -276,26 +282,81 @@ def hop_neighbour_pairs(edge_index: torch.Tensor, num_nodes: int, hops: int) -> 
     return pairs[:, pairs[0] != pairs[1]]
 
 
+def mesh_path_pairs(edge_index: torch.Tensor, mesh_pos: torch.Tensor,
+                    max_length: float) -> torch.Tensor:
+    """All ordered pairs (i, j), i != j, whose shortest path along the mesh edges
+    (edge lengths from ``mesh_pos``) is shorter than ``max_length`` -> (2, P),
+    sorted by (i, j).
+
+    Shortest paths from every node at once, bounded by ``max_length`` (label
+    correcting, float64): the pairs whose distance fell in the last round are
+    extended by every edge of their end node, until no distance falls any more.
+    """
+    num_nodes = mesh_pos.shape[0]
+    device = edge_index.device
+    order = torch.argsort(edge_index[0])
+    senders, receivers = edge_index[0, order], edge_index[1, order]
+    pos = mesh_pos.to(device, torch.float64)
+    lengths = torch.linalg.norm(pos[senders] - pos[receivers], dim=-1)
+    degree = torch.bincount(senders, minlength=num_nodes)
+    first_edge = torch.cumsum(degree, 0) - degree      # start of each node's edges
+    nodes = torch.arange(num_nodes, device=device)
+    keys = nodes * num_nodes + nodes                   # (i, i) at distance 0, sorted
+    distance = torch.zeros(num_nodes, dtype=torch.float64, device=device)
+    frontier, frontier_distance = keys, distance
+    while frontier.numel():
+        start, end = frontier // num_nodes, frontier % num_nodes
+        count = degree[end]
+        offset = (torch.arange(int(count.sum()), device=device)
+                  - (torch.cumsum(count, 0) - count).repeat_interleave(count))
+        edge = first_edge[end].repeat_interleave(count) + offset
+        reached = start.repeat_interleave(count) * num_nodes + receivers[edge]
+        length = frontier_distance.repeat_interleave(count) + lengths[edge]
+        short = length < max_length
+        reached, inverse = torch.unique(reached[short], return_inverse=True)
+        length = torch.full(reached.shape, torch.inf, dtype=torch.float64,
+                            device=device).scatter_reduce(0, inverse, length[short], "amin")
+        at = torch.searchsorted(keys, reached).clamp(max=keys.numel() - 1)
+        known = keys[at] == reached
+        shorter = known & (length < distance[at])
+        distance[at[shorter]] = length[shorter]
+        frontier, frontier_distance = reached[shorter | ~known], length[shorter | ~known]
+        keys, order = torch.sort(torch.cat((keys, reached[~known])))
+        distance = torch.cat((distance, length[~known]))[order]
+    pairs = torch.stack((keys // num_nodes, keys % num_nodes))
+    return pairs[:, pairs[0] != pairs[1]]
+
+
 def world_edge_selection(mode: str, mesh_edge_index: torch.Tensor, num_nodes: int,
-                         exclude_hops: int = DEFAULT_WORLD_EDGE_EXCLUDE_HOPS
-                         ) -> Dict[str, torch.Tensor]:
+                         exclude_hops: Optional[int] = None,
+                         mesh_pos: Optional[torch.Tensor] = None,
+                         exclude_length: Optional[float] = None) -> Dict[str, torch.Tensor]:
     """Static sample attributes that select the world edge variant ``mode``.
 
     ``all``: none, the mesh edges are excluded. ``contact``: ``body_id`` (N,),
     the connected part of the mesh of every node. ``self_contact_aware``:
-    ``world_exclude_index`` (2, P), the pairs at most ``exclude_hops`` mesh
-    edges apart. The dataset stores them in every sample and ``rebuild_edges``
-    reads them back, so noise and rollout rebuild the same variant.
+    ``world_exclude_index`` (2, P), the pairs connected through the material,
+    i.e. with a path along the mesh edges of the rest state ``mesh_pos`` shorter
+    than ``exclude_length``; with ``exclude_hops`` (configs up to v0.3.0) the
+    pairs at most that many mesh edges apart. The dataset stores them in every
+    sample and ``rebuild_edges`` reads them back, so noise and rollout rebuild
+    the same variant.
     """
     if mode == "all":
         return {}
     if mode == "contact":
         return {"body_id": mesh_components(mesh_edge_index, num_nodes)}
     if mode == "self_contact_aware":
-        if exclude_hops < 1:
-            raise ValueError(f"exclude_hops must be >= 1, got {exclude_hops}")
-        return {"world_exclude_index":
-                hop_neighbour_pairs(mesh_edge_index, num_nodes, exclude_hops)}
+        if exclude_hops is not None:
+            if exclude_hops < 1:
+                raise ValueError(f"exclude_hops must be >= 1, got {exclude_hops}")
+            return {"world_exclude_index":
+                    hop_neighbour_pairs(mesh_edge_index, num_nodes, exclude_hops)}
+        if mesh_pos is None or exclude_length is None or exclude_length <= 0:
+            raise ValueError("self_contact_aware needs the rest positions and a positive "
+                             "exclude_length (or exclude_hops)")
+        return {"world_exclude_index": mesh_path_pairs(mesh_edge_index, mesh_pos,
+                                                       exclude_length)}
     raise ValueError(f"world_edges must be one of {WORLD_EDGE_MODES}, got {mode!r}")
 
 
@@ -310,27 +371,31 @@ def radius_pairs(pos: torch.Tensor, radius: float,
     Graphs up to ``DENSE_RADIUS_SEARCH_LIMIT`` nodes use the dense distance
     matrix, larger ones a cell list (``_cell_list_pairs``); both compute the
     distances directly, so the result does not depend on the path. With
-    ``batch`` (node -> graph index) only pairs inside a graph are formed.
-    Returns (2, P), sorted by (i, j).
+    ``batch`` (node -> graph index, the nodes of a graph in one block as in a
+    PyG batch) only pairs inside a graph are formed. Returns (2, P), sorted by (i, j).
     """
-    device = pos.device
-    if batch is None:
-        graphs = [torch.arange(pos.shape[0], device=device)]
-    else:
-        graphs = [torch.nonzero(batch == b, as_tuple=True)[0] for b in torch.unique(batch)]
+    sizes = [pos.shape[0]] if batch is None else graph_sizes(batch)
     pairs = []
-    for nodes in graphs:
-        graph_pos = pos[nodes]
-        if len(nodes) <= DENSE_RADIUS_SEARCH_LIMIT:
+    start = 0
+    for size in sizes:
+        graph_pos = pos[start:start + size]
+        if size <= DENSE_RADIUS_SEARCH_LIMIT:
             close = torch.cdist(graph_pos, graph_pos,
                                 compute_mode="donot_use_mm_for_euclid_dist") < radius
             close.fill_diagonal_(False)
             senders, receivers = torch.nonzero(close, as_tuple=True)
         else:
             senders, receivers = _cell_list_pairs(graph_pos, radius)
-        pairs.append(torch.stack((nodes[senders], nodes[receivers])))
+        pairs.append(torch.stack((senders, receivers)) + start)
+        start += size
     return (torch.cat(pairs, dim=1) if pairs
-            else torch.empty(2, 0, dtype=torch.long, device=device))
+            else torch.empty(2, 0, dtype=torch.long, device=pos.device))
+
+
+def graph_sizes(batch: torch.Tensor) -> List[int]:
+    """Nodes per graph of a batch whose graphs are blocks of consecutive nodes (PyG);
+    one read from the device instead of one per graph."""
+    return torch.bincount(batch).tolist() if batch.numel() else []
 
 
 def _cell_list_pairs(pos: torch.Tensor, radius: float) -> Tuple[torch.Tensor, torch.Tensor]:

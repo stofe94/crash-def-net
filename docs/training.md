@@ -13,9 +13,9 @@ unnoticed.
 ## Configs
 
 [`config.example.toml`](../config.example.toml) is a complete, commented example: MGN-T
-in a minimal size (~50 k parameters) that trains on a CPU in about two minutes (~25 s per
-epoch on the small dataset) and runs every stage of the pipeline. It contains the
-settings of both architectures; switching to MeshGraphNets is one line (~2 min 10 s per
+in a minimal size (~50 k parameters) that trains on a CPU in about two and a half minutes
+(~30 s per epoch on the small dataset) and runs every stage of the pipeline. It contains the
+settings of both architectures; switching to MeshGraphNets is one line (~2 min 30 s per
 epoch on the CPU listed in [installation.md](installation.md#requirements)):
 
 ```toml
@@ -53,6 +53,10 @@ the way to the paper setting, typically:
   `decay_steps = "auto"` = epochs × steps per epoch, so the LR reaches `min_lr` exactly
   at the end of the run. Alternatives: `plateau`, `cosine`, `none`.
 - **Gradient clipping** (`max_grad_norm`, not in the paper).
+- **Micro-batches** (`micro_batch_size`, a machine setting): `batch_size /
+  micro_batch_size` forward passes make one optimizer step, with the loss normalized
+  over the whole batch, so the step equals that of one batch of `batch_size` while only
+  one micro-batch is in memory.
 - **Scheduled sampling** (optional, needs the history layout): the prediction for the
   previous sample replaces `*_prev` on a fraction of the nodes, and the current positions
   move consistently.
@@ -67,33 +71,24 @@ the way to the paper setting, typically:
   | `rollout_pos_rmse` | position error of that rollout, mean over the steps |
   | `rollout_pos_rmse_final` | position error at the last rollout step |
 
-  The rollout criteria need rollout validation; the position errors also capture drift
-  that accumulates over the rollout. Each evaluation also records the train loss
-  without noise (single-step loss on fixed train samples) and the generalization gap
-  `max(1, val / train)`; both are logged and plotted and take no part in selection or
-  stopping.
+  The rollout criteria need rollout validation. Each evaluation also records the train
+  loss without noise (on 5 % of the train split, at least 200 samples) and the
+  generalization gap `max(1, val / train)`; neither takes part in selection or stopping.
 - **Model selection** (`[training.early_stopping] criteria`): every evaluation is scored
-  by its *worst* criterion, the relative excess over the lowest value of that criterion
-  so far; the selected model is the evaluation with the lowest score, close to the best
-  value in all criteria at once. With one criterion it is the minimum of that metric. An
-  earlier evaluation can be selected again when a criterion reaches a new low; its
-  weights are kept in `candidates/` until the run ends. At the end the log lists every
-  criterion of the selected evaluation next to its lowest value, and the selected model
-  is restored and evaluated on the test split. The `plateau` scheduler follows the first
+  by its *worst* criterion, the relative excess over that criterion's lowest value; the
+  evaluation with the lowest score is selected, close to the best in all criteria at
+  once (with one criterion: its minimum). Weights of evaluations that can still be
+  selected are kept in `candidates/` until the run ends; then the selected model is
+  restored and evaluated on the test split. The `plateau` scheduler follows the first
   criterion.
 - **Early stopping** (`enabled`, `patience`, `min_epochs`): after at least `min_epochs`
   epochs, a run stops when no criterion has reached a new low in the last `patience`
   evaluations; the log shows "n/patience evaluations without a new low". With
   `enabled = false` all epochs run and the selection still applies.
-- **Limits:** only evaluated epochs are candidates; the val split is small, so the
-  criteria scatter by several % between evaluations, and the model selected on it need
-  not be the best on the test split. A resumed run (`--resume`) starts the selection
-  anew.
-
-> **Adapt the rules to your data.** Criteria, `patience` and `min_epochs` are tuned to
-> `deforming_plate` with a small val split (8 trajectories), rollout validation every
-> 5 epochs and a learning rate that decays over the whole run. For other data, check how
-> much the criteria scatter between evaluations and adapt them.
+- **Limits:** only evaluated epochs are candidates; on a small val split the criteria
+  scatter by several % between evaluations, so the selected model need not be the best
+  on the test split. Adapt criteria, `patience` and `min_epochs` to how much they
+  scatter on your data. A resumed run (`--resume`) starts the selection anew.
 
 ## Output
 
@@ -104,8 +99,8 @@ Everything goes into `[checkpointing].checkpoint_dir`:
 | `best_model.pt` | selected model; like every checkpoint with the training config, the dataset metadata and the normalizer statistics the weights belong to |
 | `checkpoint_epoch_N.pt` | every `save_every` epochs |
 | `candidates/` | with more than one criterion: weights of the evaluations that can still be selected, removed at the regular end of the run |
-| `history.json` | per epoch: losses, rollout metrics, LR, duration, `is_best` (selected at that time), `selected` (the selected epoch); at evaluations also `selection_score`, `train_loss_clean` and `gap_ratio`; the last record notes `end` (`early_stopping` or `epochs`), with early stopping also `stop_reason` — an aborted run has none |
-| `train_<time>.log`, `train_<time>_config.json` | log and the resolved config: source TOML file (`config_file`, relative to the repo, and `config_file_sha256`), command-line overrides (`config_overrides`) and only the settings in effect (no `[model.mgn_t]` values in a MeshGraphNets run, no plateau values with the exponential scheduler, no sub-settings of disabled options) |
+| `history.json` | per epoch: losses, rollout metrics, LR, duration, `selected`; at evaluations also `selection_score`, `train_loss_clean`, `gap_ratio`; `peak_memory` of the run so far in GiB (RAM of the main process and the largest worker, on a GPU allocated and reserved memory) and the `machine`; the last record notes `end` (`early_stopping` or `epochs`), an aborted run has none |
+| `train_<time>.log`, `train_<time>_config.json` | log and the resolved config with its source TOML file, SHA-256 and command-line overrides, only the settings in effect |
 | `test_metrics.json` | single-step test metrics (normalized MSE/MAE, RMSE/MAE per target in physical units) and a full test rollout with the paper metrics |
 
 Loss curves: `python utils/plot_losses.py --run-dir checkpoints/<run>` writes
@@ -120,10 +115,10 @@ e.g. after a new export).
 | Section | Important keys |
 |---|---|
 | `[data]` | `data_dir`, `num_dataloader_workers`, `lazy`, `cache_frames`, `static_cache_mb` (lazy: static graph data per process, MB; default 1024) |
-| `[model]` | `architecture` (`meshgraphnets` \| `mgn_t`), `residual_target`, `world_edges` (`all` \| `contact` \| `self_contact_aware`, see [data.md](data.md#world-edge-variants-model-world_edges)), `world_edge_exclude_hops` (4) |
+| `[model]` | `architecture` (`meshgraphnets` \| `mgn_t`), `residual_target`, `world_edges` (`all` \| `contact` \| `self_contact_aware`, see [data.md](data.md#world-edge-variants-model-world_edges)), `world_edge_exclude_distance` (2.0, `self_contact_aware`), `world_edge_exclude_hops` (configs up to v0.3.0) |
 | `[model.meshgraphnets]` | `latent_size` (paper 128), `num_mlp_layers` (2), `num_message_passing_steps` (paper 15), `aggregation` (`sum` \| `mean`) |
 | `[model.mgn_t]` | `latent_size`, `token_dim`, `num_tokens`, `num_heads`, `num_transformer_blocks`, `num_pre_mp_steps`, `num_post_mp_steps`, `pe_frequencies`, `ffn_ratio`, `tau_init`, `transformer_nodes` (`structure` \| `all`), `num_mlp_layers` and `aggregation` (one setting shared with `[model.meshgraphnets]`) (see [models.md](models.md)) |
-| `[training]` | `epochs`, `batch_size` (MeshGraphNets paper 2, MGN-T paper 32), `learning_rate` (1e-4), `weight_decay`, `max_grad_norm`, `seed`, `device` |
+| `[training]` | `epochs`, `batch_size` (MeshGraphNets paper 2, MGN-T paper 32), `micro_batch_size` (default `batch_size`; divides it), `learning_rate` (1e-4), `weight_decay`, `max_grad_norm`, `seed`, `device` |
 | `[training.scheduler]` | `type` (`exponential` \| `plateau` \| `cosine` \| `none`), `min_lr`, `decay_steps` (number or `"auto"`), `patience` / `factor` (plateau) |
 | `[training.rollout_validation]` | `enabled`, `every_n_epochs`, `max_sequences` |
 | `[training.early_stopping]` | `enabled`, `patience` (evaluations), `min_epochs`, `criteria` (default all: `val_loss`, `rollout_mse`, `rollout_pos_rmse`, `rollout_pos_rmse_final`) |
@@ -132,13 +127,9 @@ e.g. after a new export).
 | `[scheduled_sampling]` | `enabled`, `start_ratio`, `end_ratio`, `warmup_epochs` (history only) |
 | `[checkpointing]` | `checkpoint_dir`, `save_every`, `log_every`, `resume` |
 
-Older key names (`[training.scheduler] lr`, `[rollout] scheduled_sampling*`, the former
-architecture name `meshgraphnet` and its section `[model.meshgraphnet]`) are still read,
-and older checkpoints can be loaded. `[training.rollout_validation]
-selection_metric` of older configs becomes the matching single criterion (`mse` →
-`["rollout_mse"]`, `pos_rmse` → `["rollout_pos_rmse"]`, …); the former early-stopping
-keys `min_delta`, `smoothing_window`, `efficiency_window`, `efficiency_threshold`,
-`gap_weight` / `lambda` and `overfitting_gap` are read without effect (a note lists them).
+Configs and checkpoints of earlier releases still load: older key names are translated,
+keys without effect are listed in a note, and `world_edge_exclude_hops` keeps counting
+mesh edges (a config sets it or `world_edge_exclude_distance`, not both).
 
 ## Deviations from the paper
 

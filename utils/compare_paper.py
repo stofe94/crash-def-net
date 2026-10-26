@@ -11,7 +11,8 @@ a new folder ``evaluations/<YYYYMMDD_HHMMSS>_paper_comparison/`` with
 - ``01_absolute_errors.png``       RMSE-1 and RMSE-all of position q and stress
 - ``02_relative_errors.png``       R-RMSE (%) of position q and stress
 - ``03_error_per_step.png``        error over the rollout steps
-- ``04_error_per_trajectory.png``  RMSE-all per trajectory, paper value as reference
+- ``04_error_per_trajectory.png``  RMSE-all over the trajectories: all pooled, median,
+  best and worst trajectory, paper value as reference
 - ``05_table_metrics.png``, ``05b_table_compact.png`` (only RMSE-all, with the
   multiple of the paper), ``06_table_conditions.png``
 - ``comparison.md`` (tables, figures, notes), ``metrics.csv``, ``metrics.json``
@@ -24,7 +25,7 @@ from the per-trajectory values of the summary.
 Usage
 -----
     python utils/compare_paper.py                      # every rollout in rollouts/
-    python utils/compare_paper.py rollouts/<a> rollouts/<b> --exclude test_traj0038
+    python utils/compare_paper.py rollouts/<a> rollouts/<b> --exclude test_traj0149
 """
 
 from __future__ import annotations
@@ -70,6 +71,10 @@ SERIES_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
 PAPER_COLOR = TEXT_MUTED
 # "meshgraphnet": misspelling of rollouts from v0.2.0 checkpoints (see train/config.py)
 ARCHITECTURE_NAMES = {"mgn_t": "MGN-T", "meshgraphnets": "MGN", "meshgraphnet": "MGN"}
+# World edges of each architecture in its paper; a run with other world edges carries
+# the variant in its name, e.g. MeshGraphNets with the contact edges of MGN-T.
+PAPER_WORLD_EDGES = {"mgn_t": "self_contact_aware", "meshgraphnets": "all",
+                     "meshgraphnet": "all"}
 # Single selection metric of configs written before the criteria list.
 SELECTION_NAMES = {"mse": "rollout MSE (normalized)", "pos_rmse": "position error",
                    "pos_rmse_final": "position error at the last step"}
@@ -104,6 +109,8 @@ PAPER_CONDITIONS = {
     "Rollout": "400 steps, stride 1",
     "Nodes per mesh": "1,271 on average (Pfaff et al., Tab. 1)",
     "Parameters": "MGN-T 0.5 M, MGN 2.0 M (Tab. 2)",
+    "Contact edges": "MGN-T: contact and self-contact (self_contact_aware, v4); "
+                     "MGN: all pairs within r_W (all, Pfaff et al.)",
     "Training": "MGN-T: 25 epochs, batch 32, cosine LR 1e-4 → 1e-6 (Sec. 5.1)",
     "Spread (±)": "standard error over the test trajectories",
 }
@@ -162,9 +169,16 @@ class Rollout:
         return self.info["model"]
 
     @property
+    def world_edges(self) -> str:
+        return self.model["training_config"].get("world_edges", "all")   # up to v0.2.0: all
+
+    @property
     def name(self) -> str:
-        return f"{ARCHITECTURE_NAMES.get(self.model['architecture'], self.model['architecture'])}" \
-               f" Ep. {self.model['epoch']}"
+        architecture = self.model["architecture"]
+        variant = ("" if self.world_edges == PAPER_WORLD_EDGES.get(architecture)
+                   else f" ({self.world_edges})")
+        return f"{ARCHITECTURE_NAMES.get(architecture, architecture)}{variant} " \
+               f"Ep. {self.model['epoch']}"
 
     @property
     def split(self) -> str:
@@ -357,47 +371,59 @@ def plot_steps(own: List[Entry], path: Path) -> None:
     plt.close(fig)
 
 
+SPREAD_ROWS = ("all", "median", "best", "worst")
+
+
+def trajectory_spread(entry: Entry, key: str) -> List[Tuple[float, Optional[str]]]:
+    """(value, trajectory) of ``SPREAD_ROWS``: all trajectories pooled (the row's paper
+    metric), the median, the best and the worst trajectory."""
+    sequences = entry.rollout.summary["sequences"]
+    ranked = sorted((s["paper_metrics"][key], sid) for sid, s in sequences.items()
+                    if s["paper_metrics"].get(key) is not None)
+    return [(entry.values[key][0], None), (float(np.median([v for v, _ in ranked])), None),
+            ranked[0], ranked[-1]]
+
+
 def plot_trajectories(own: List[Entry], exclude: Sequence[str], path: Path) -> None:
-    """RMSE-all per trajectory, grouped by trajectory; paper mean as reference line."""
-    trajectories = sorted({sid for e in own for sid in e.rollout.summary["sequences"]})
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5.4), facecolor=SURFACE)
-    width = 0.8 / max(len(own), 1)
-    x = np.arange(len(trajectories))
+    """RMSE-all over the trajectories of every rollout: all pooled, median, best and
+    worst trajectory, instead of one bar per trajectory; paper mean as reference line."""
+    rows = len(own) * len(SPREAD_ROWS)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 2.2 + 0.42 * rows), sharey=True,
+                             facecolor=SURFACE)
+    positions = np.arange(rows)[::-1]
+    labels = [f"{e.label.split(' · ')[0]} · {row}" if row == SPREAD_ROWS[0] else row
+              for e in own for row in SPREAD_ROWS]
     for ax, key in zip(axes, ["q_rmse_all", "stress_rmse_all"]):
         factor, unit = display(key)
-        for index, entry in enumerate(own):
-            sequences = entry.rollout.summary["sequences"]
-            values = [sequences[sid]["paper_metrics"][key] * factor if sid in sequences
-                      else np.nan for sid in trajectories]
-            offset = (index - (len(own) - 1) / 2) * width
-            ax.bar(x + offset, values, width=width, color=entry.color, edgecolor=SURFACE,
-                   linewidth=2, label=entry.label)
-            for xi, value in zip(x + offset, values):
-                if not np.isnan(value):
-                    ax.text(xi, value, f"{value:.1f}", ha="center", va="bottom", fontsize=8,
-                            color=TEXT_PRIMARY)
+        bars = [(value * factor, sid, color) for e in own
+                for (value, sid), color in zip(trajectory_spread(e, key),
+                                               [e.color] + [tint(e.color, 0.45)] * 3)]
         reference = PAPER_MGN_T[key][0] * factor
-        ax.axhline(reference, color=TEXT_SECONDARY, linewidth=1, linestyle=(0, (4, 3)),
-                   label=f"MGN-T · paper, mean over its test set: "
-                         f"{_significant(reference, 3)} {unit}")
-        ax.set_xticks(x, [sid + (" *" if sid in exclude else "") for sid in trajectories],
-                      fontsize=9, color=TEXT_PRIMARY)
-        # Headroom for the legend above the tallest bar.
-        tallest = max(e.rollout.summary["sequences"][sid]["paper_metrics"][key] * factor
-                      for e in own for sid in e.rollout.summary["sequences"])
-        ax.set_ylim(0, max(tallest, reference) * (1.12 + 0.07 * (len(own) + 1)))
+        limit = max([value for value, _, _ in bars] + [reference]) * 1.45
+        for y, (value, sid, color) in zip(positions, bars):
+            ax.barh(y, value, height=0.62, color=color, edgecolor=SURFACE, linewidth=2)
+            label = _significant(value, 3) + (f"  {sid}" if sid else "") \
+                + (" *" if sid in exclude else "")
+            ax.text(value + limit * 0.015, y, label, va="center", fontsize=9,
+                    color=TEXT_PRIMARY)
+        ax.axvline(reference, color=TEXT_SECONDARY, linewidth=1, linestyle=(0, (4, 3)))
+        ax.text(reference + limit * 0.01, rows - 0.35, f"MGN-T · paper {_significant(reference, 3)}",
+                va="center", fontsize=9, color=TEXT_SECONDARY)
+        ax.set_xlim(0, limit)
+        ax.set_ylim(-0.6, rows - 0.05)
         variable = "q" if key.startswith("q_") else "stress"
-        ax.set_title(f"{VARIABLE_NAMES[variable]} — RMSE-all per trajectory [{unit}]",
+        ax.set_title(f"{VARIABLE_NAMES[variable]} — RMSE-all [{unit}]",
                      loc="left", fontsize=11.5, color=TEXT_PRIMARY, pad=8)
-        _style(ax, "y")
-    for ax in axes:
-        legend = ax.legend(fontsize=9, frameon=False, loc="upper left")
-        for text in legend.get_texts():
-            text.set_color(TEXT_PRIMARY)
+        _style(ax)
+    axes[0].set_yticks(positions, labels, fontsize=9.5, color=TEXT_PRIMARY)
+    axes[1].tick_params(axis="y", length=0)
     note = " * = left out of the additional rows with --exclude." if exclude else ""
-    top = _figure_header(fig, "Error per trajectory",
-                         "Whole rollout per test trajectory; dashed: the paper's mean for "
-                         "MGN-T over its test set." + note)
+    top = _figure_header(fig, "Error over the trajectories",
+                         "Whole rollout. all: one RMSE over all test trajectories together "
+                         "(squared errors of all nodes, steps and trajectories averaged, then "
+                         "the root, as in the papers); median, best, worst: the RMSE of single "
+                         "trajectories. Dashed: the paper's value for MGN-T over its test set. "
+                         "Every trajectory: utils/evaluate_run.py or the rollout summary." + note)
     fig.tight_layout(rect=(0, 0, 1, top))
     fig.savefig(path, dpi=180, facecolor=SURFACE)
     plt.close(fig)
@@ -501,10 +527,14 @@ def training_summary(rollout: Rollout) -> Dict[str, str]:
     metadata_path = Path(info["data"]["data_dir"]) / "metadata.json"
     if not metadata_path.is_absolute():
         metadata_path = _REPO_ROOT / metadata_path
-    splits = {}
+    splits, source = {}, rollout.info["data"]["metadata"].get("source_tfrecord", "?")
     if metadata_path.exists():
         with open(metadata_path) as f:
-            splits = {k: v["count"] for k, v in json.load(f).get("splits", {}).items()}
+            metadata = json.load(f)
+        splits = {k: v["count"] for k, v in metadata.get("splits", {}).items()}
+        source = metadata.get("source_tfrecord", source)
+    if not isinstance(source, str):   # one source per split
+        source = ", ".join(source)
     history_path = Path(model["checkpoint"]["absolute_path"]).parent / "history.json"
     trained = "unknown"
     if history_path.exists():
@@ -518,13 +548,14 @@ def training_summary(rollout: Rollout) -> Dict[str, str]:
     steps = len(rollout.summary["position_rmse_per_step"])
     nodes = [n for sid, n in node_counts(rollout).items() if sid in rollout.summary["sequences"]]
     return {
-        "Dataset": (f"{Path(info['data']['data_dir']).name} ({meta.get('source_tfrecord')})"
+        "Dataset": (f"{Path(info['data']['data_dir']).name} ({source})"
                     + ("; trajectories train/val/test "
                        + "/".join(str(splits.get(s, '?')) for s in ("train", "val", "test"))
                        if splits else "")),
         "Rollout": f"{steps} steps, stride {meta.get('time_stride')}, "
                    f"{len(rollout.summary['sequences'])} {rollout.split} trajectories",
         "Parameters": f"{model['parameters'] / 1e6:.2f} M",
+        "Contact edges": rollout.world_edges,
         "Evaluated epoch": f"{model['epoch']} ({Path(model['checkpoint']['path']).name})",
         "Training": f"{trained}, batch {config['batch_size']}",
         "Model selection": _selection_description(config),
@@ -548,8 +579,8 @@ def _selection_description(config: Dict) -> str:
 def condition_rows(own: List[Entry]) -> Tuple[List[str], List[List[str]]]:
     columns = ["", "MGN-T · paper"] + [e.label.split(" · ")[0] + " · own" for e in own]
     summaries = [training_summary(e.rollout) for e in own]
-    keys = ["Dataset", "Rollout", "Parameters", "Evaluated epoch", "Training",
-            "Model selection", "Nodes per mesh", "Spread (±)"]
+    keys = ["Dataset", "Rollout", "Parameters", "Contact edges", "Evaluated epoch",
+            "Training", "Model selection", "Nodes per mesh", "Spread (±)"]
     rows = []
     for key in keys:
         paper = PAPER_CONDITIONS.get(key, "–")
@@ -587,7 +618,7 @@ def main(argv=None) -> int:
                         help="only rollouts of this split (default: test)")
     parser.add_argument("--exclude", nargs="*", default=[],
                         help="trajectories for additional rows without them, "
-                             "e.g. test_traj0038")
+                             "e.g. test_traj0149")
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="default: evaluations/<time>_paper_comparison")
     args = parser.parse_args(argv)
@@ -614,7 +645,8 @@ def main(argv=None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     entries = build_entries(finished, args.exclude)
     own = [e for e in entries if e.source == "own" and e.subset is None]
-    split_note = f"own values: {args.split} split; ± = standard error over the trajectories"
+    split_note = (f"own values: {args.split} split, one RMSE over all trajectories together "
+                  "as in the papers; ± = standard error over the trajectories")
 
     plot_bar_panels(entries, ABSOLUTE, "Absolute errors compared with the MGN-T paper",
                     f"{PAPER_SOURCE}; {split_note}. Paper: 400 steps, stride 1 — "
@@ -673,8 +705,8 @@ def main(argv=None) -> int:
         markdown_table(["Model"] + [label.split(" [")[0] for _, label in METRIC_COLUMNS],
                        ratio_rows(entries)),
         "",
-        "RMSE-1 is not comparable at a different stride: at stride 8 the nodes move about "
-        "8 times as far per step as in the paper. RMSE-all instead covers the same physical "
+        "RMSE-1 is not comparable at a different stride: at stride k the nodes move about "
+        "k times as far per step as in the paper. RMSE-all instead covers the same physical "
         "time span, but with fewer rollout steps (less opportunity for error accumulation).",
         "",
         "### Baselines in the MGN-T paper (q, ×10⁻³ m)",
@@ -690,7 +722,7 @@ def main(argv=None) -> int:
         markdown_table(condition_columns, conditions),
         "",
         "The numbers are only partly comparable: different stride and rollout length, far "
-        "less training data and training time, a very small test set.",
+        "less training data and training time, a small test set.",
         "",
         "## Figures",
         "",

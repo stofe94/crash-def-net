@@ -3,8 +3,9 @@
 check_protocol.py — Check rollouts against a comparison protocol and compare them
 with a reference trajectory by trajectory (docs/comparison-protocol.md).
 
-The first rollout folder is the reference (the MeshGraphNets baseline), every
-further one a candidate. For each rollout the training config stored with the
+The first rollout folder is the reference (a MeshGraphNets baseline; for a new
+architecture the comparable one with the same world edges), every further one a
+candidate. For each rollout the training config stored with the
 checkpoint is compared with the protocol config:
 
 - fixed settings must be equal: budget, optimizer, schedule, noise, loss,
@@ -27,7 +28,7 @@ Prints a Markdown report; the exit code is 1 if a rollout violates the protocol.
 Usage
 -----
     python utils/check_protocol.py rollouts/<baseline> rollouts/<new> [...] \\
-        [--exclude test_traj0038] [--protocol protocols/deforming_plate_s8_t40.toml]
+        [--exclude test_traj0149] [--protocol protocols/deforming_plate_s4_t150.toml]
 """
 
 from __future__ import annotations
@@ -48,7 +49,7 @@ if str(_REPO_ROOT) not in sys.path:
 from dataset_preprocessor.dataset import dataset_fingerprint  # noqa: E402
 from train.config import TOML_KEYS, TrainingConfig  # noqa: E402
 
-DEFAULT_PROTOCOL = _REPO_ROOT / "protocols" / "deforming_plate_s8_t40.toml"
+DEFAULT_PROTOCOL = _REPO_ROOT / "protocols" / "deforming_plate_s4_t150.toml"
 PROTOCOL_SPLIT = "test"
 # Display names and paired metrics as in compare_paper.py (not imported from there:
 # it loads matplotlib, which this check does not need).
@@ -65,13 +66,14 @@ EQUAL_TOLERANCE = 1e-3
 
 # Settings of the machine and the bookkeeping, without influence on the result.
 MACHINE_FIELDS = {"data_dir", "num_dataloader_workers", "lazy_loading", "cache_frames",
-                  "static_cache_mb", "device", "checkpoint_dir", "save_every", "log_every",
+                  "static_cache_mb", "micro_batch_size", "device", "checkpoint_dir", "save_every", "log_every",
                   "resume", "config_file", "config_file_sha256", "config_overrides"}
 # Parameters of an architecture: the fields of the sections [model.<architecture>].
 ARCHITECTURE_FIELDS = {field for key, field in TOML_KEYS.items()
                        if key.startswith("model.") and key.count(".") >= 2}
 # Allowed variations; they are listed with the result.
-DECLARED_FIELDS = {"architecture", "world_edges", "world_edge_exclude_hops"} | ARCHITECTURE_FIELDS
+DECLARED_FIELDS = ({"architecture", "world_edges", "world_edge_exclude_distance",
+                    "world_edge_exclude_hops"} | ARCHITECTURE_FIELDS)
 
 
 @dataclasses.dataclass
@@ -320,19 +322,11 @@ def lower_error(reference: float, candidate: float) -> str:
 
 
 def tally(winners: Dict[str, str], sequences: Sequence[str]) -> str:
-    """Count of lower errors over ``sequences``; established only if all agree."""
+    """How often each model has the lower error over ``sequences``."""
     lower = sum(winners[sid] == "candidate" for sid in sequences)
     higher = sum(winners[sid] == "reference" for sid in sequences)
     n = len(sequences)
-    if n > 1 and lower == n:
-        verdict = "candidate lower on every trajectory"
-    elif n > 1 and higher == n:
-        verdict = "reference lower on every trajectory"
-    elif lower == higher == 0:
-        verdict = "no difference"
-    else:
-        verdict = "not established (needs every trajectory)"
-    return f"candidate lower on {lower} of {n}, reference on {higher} of {n} — {verdict}"
+    return f"candidate lower on {lower} of {n}, reference on {higher} of {n}"
 
 
 def paired_section(candidate: Rollout, reference: Rollout,
@@ -372,7 +366,7 @@ def main(argv=None) -> int:
     parser.add_argument("--protocol", type=Path, default=DEFAULT_PROTOCOL,
                         help="protocol training config (default: %(default)s)")
     parser.add_argument("--exclude", nargs="*", default=[],
-                        help="trajectories counted separately, e.g. test_traj0038")
+                        help="trajectories counted separately, e.g. test_traj0149")
     args = parser.parse_args(argv)
 
     try:
@@ -399,13 +393,9 @@ def main(argv=None) -> int:
     for rollout, check in zip(candidates, checks[1:]):
         lines += check_section("Candidate", rollout, check)
     if candidates:
-        n = len(reference.summary["sequences"])
-        chance = (f"With equal models one of them is lower on all {n} by chance in "
-                  f"{100 * 2 * 0.5 ** n:.1f} % of cases"
-                  + (f", on {n - 1} of {n} in {100 * 2 * n * 0.5 ** n:.1f} %." if n >= 3 else "."))
         lines += ["## Paired comparison with the reference", "",
-                  "A difference is established only if one model has the lower error on "
-                  f"every trajectory. {chance}", ""]
+                  "Both models on the same trajectories: the difference on each, and how "
+                  "often each model has the lower error.", ""]
         for candidate in candidates:
             lines += paired_section(candidate, reference, args.exclude)
     print("\n".join(lines).rstrip())

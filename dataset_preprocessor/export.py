@@ -16,9 +16,13 @@ representation) or VTK time series (``vtk``, read by ``vtk_reader.py``).
 ``metadata.json``
     feature layout, dimensions, splits and contact radius.
 
-Train/val/test are disjoint, contiguous trajectory ranges of the raw data
-(e.g. ``test.tfrecord`` with 100 trajectories). Frames are subsampled with
-``time_stride``: frames 0, stride, 2·stride, ... (paper: stride 1).
+Train/val/test are disjoint. With one source (e.g. ``test.tfrecord`` with 100
+trajectories) they are contiguous ranges of its runs, train first; with three
+(e.g. DeepMind's ``train`` / ``valid`` / ``test.tfrecord``) each split comes
+from its own. ``select_seed`` draws the runs of each split at random instead
+(without replacement; read in ascending order); the chosen runs are stored in
+``metadata.json``. Frames are subsampled with ``time_stride``: frames 0,
+stride, 2·stride, ... (paper: stride 1).
 
 Large data
 ----------
@@ -50,12 +54,13 @@ import inspect
 import json
 import os
 import sqlite3
+import struct
 import sys
 import time
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -98,6 +103,7 @@ EXPORT_DEFAULTS = dict(
     source_tfrecord="test.tfrecord",               # d3plot: runs converted from it
     out_dir="data/deforming_plate_s10_small",   # == [data].data_dir in the config
     n_train=8, n_val=2, n_test=2,                  # whole trajectories (= geometries)
+    select_seed=None,                              # None: the first runs; int: random
     num_steps=40, time_stride=10,                  # frames 0, 10, ..., 390
     history=0, prev_stress=True,                   # 0 = paper; 1 adds *_prev inputs
     overwrite=True,                                # replace an existing dataset.db
@@ -111,7 +117,11 @@ EXPORT_DEFAULTS = dict(
 # All 100 trajectories at stride 4 (~225 MB, ~1 min):
 #   python -m dataset_preprocessor.export --out-dir data/deforming_plate_s4 \
 #       --n-train 80 --n-val 10 --n-test 10 --num-steps 100 --time-stride 4
-# Every frame, as in the paper: --num-steps 400 --time-stride 1 (~0.85 GB, ~3.5 min)
+# Every frame, as in the paper: --num-steps 400 --time-stride 1 (~0.85 GB, ~4 min)
+# DeepMind's original splits, trajectories drawn at random, stride 4:
+#   python -m dataset_preprocessor.export --out-dir data/deforming_plate_s4_t150 \
+#       --source-tfrecord train.tfrecord valid.tfrecord test.tfrecord --select-seed 42 \
+#       --n-train 100 --n-val 30 --n-test 20 --num-steps 100 --time-stride 4
 
 RAW_FORMATS = ("tfrecord", "d3plot", "vtk")
 # Guards against zero std (constant columns) when fitting the statistics.
@@ -163,8 +173,10 @@ def read_raw_meta(raw_dir) -> dict:
 
 
 def read_raw_trajectories(raw_dir, tfrecord_name: str, frames: Sequence[int],
-                          count: Optional[int]) -> Iterator[RawTrajectory]:
-    """Yield the first ``count`` trajectories of ``tfrecord_name`` (None: all).
+                          count: Optional[int],
+                          indices: Optional[Sequence[int]] = None) -> Iterator[RawTrajectory]:
+    """Yield the first ``count`` trajectories of ``tfrecord_name`` (None: all), or
+    those at the ascending positions ``indices``.
 
     Dynamic fields are restricted to ``frames``; static fields (mesh, node
     type, cells) are stored once per trajectory in the file.
@@ -175,6 +187,8 @@ def read_raw_trajectories(raw_dir, tfrecord_name: str, frames: Sequence[int],
     records = TFRecordDataset(os.path.join(raw_dir, tfrecord_name), None,
                               {name: "byte" for name in meta["field_names"]})
     frames = np.asarray(frames)
+    if indices is not None:
+        count, wanted = max(indices, default=-1) + 1, set(indices)
 
     def field(record, name):
         spec = meta["features"][name]
@@ -185,6 +199,8 @@ def read_raw_trajectories(raw_dir, tfrecord_name: str, frames: Sequence[int],
     for index, record in enumerate(records):
         if count is not None and index >= count:
             break
+        if indices is not None and index not in wanted:
+            continue
         yield RawTrajectory(
             node_type=field(record, "node_type")[:, 0],
             mesh_pos=field(record, "mesh_pos"),
@@ -194,38 +210,94 @@ def read_raw_trajectories(raw_dir, tfrecord_name: str, frames: Sequence[int],
         )
 
 
-def raw_runs(raw_format: str, raw_dir, source_tfrecord: str, frames: Sequence[int],
-             count: Optional[int], vtk_options: Optional[Dict] = None,
-             block_bytes: Optional[int] = None
+def num_records(path) -> int:
+    """Number of records in a TFRecord file, from the record headers alone."""
+    count, size = 0, os.path.getsize(path)
+    with open(path, "rb") as f:
+        while f.tell() < size:   # length (uint64), its CRC, data, data CRC (uint32 each)
+            (length,) = struct.unpack("<Q", f.read(8))
+            f.seek(length + 8, os.SEEK_CUR)
+            count += 1
+    return count
+
+
+def _run_dirs(raw_format: str):
+    if raw_format == "d3plot":
+        from dataset_preprocessor.d3plot_reader import run_dirs
+    elif raw_format == "vtk":
+        from dataset_preprocessor.vtk_reader import run_dirs
+    else:
+        raise ValueError(f"raw_format must be one of {RAW_FORMATS}, got {raw_format!r}")
+    return run_dirs
+
+
+def select_runs(raw_format: str, raw_dir, sources: Sequence[str], counts: Dict[str, int],
+                seed: Optional[int] = None) -> Dict[str, Tuple[str, List[int]]]:
+    """``split -> (source, positions)``: the runs of every split in ``counts``.
+
+    One source: disjoint ranges of its runs, in the order of ``counts``; one source
+    per split: the first runs of each. ``seed`` draws them at random instead,
+    without replacement; the positions of a split are ascending. A position
+    counts the records of a TFRecord or the run folders of ``source``.
+    """
+    names = dict(zip(counts, sources if len(sources) > 1 else list(sources) * len(counts)))
+    rng = None if seed is None else np.random.default_rng(seed)
+    selection: Dict[str, Tuple[str, List[int]]] = {}
+    for name in dict.fromkeys(names.values()):   # every source once, in split order
+        splits = [split for split in counts if names[split] == name]
+        needed = sum(counts[split] for split in splits)
+        available = (num_records(Path(raw_dir) / name) if raw_format == "tfrecord"
+                     else len(_run_dirs(raw_format)(raw_dir, name)))
+        if needed > available:
+            raise ValueError(f"{name} ({raw_format}) holds only {available} trajectories, "
+                             f"{needed} requested ({', '.join(splits)})")
+        positions = np.arange(needed) if rng is None else rng.choice(available, needed,
+                                                                     replace=False)
+        start = 0
+        for split in splits:
+            selection[split] = (name, sorted(positions[start:start + counts[split]].tolist()))
+            start += counts[split]
+    return {split: selection[split] for split in counts}
+
+
+def raw_runs(raw_format: str, raw_dir, runs: Sequence[Tuple[str, int]], frames: Sequence[int],
+             vtk_options: Optional[Dict] = None, block_bytes: Optional[int] = None
              ) -> Iterator[Tuple[str, Callable[[], RawTrajectory]]]:
-    """``(source, read)`` of the first ``count`` runs (None: all), in order.
+    """``(source, read)`` of the ``runs`` (source, position), in their order.
 
     ``read()`` returns the run as a ``RawTrajectory`` (LS-DYNA and VTK runs with
     their frames in blocks of about ``block_bytes``); a run that is skipped is
     not read. ``source`` names the run: the TFRecord record, or the run folder
-    relative to ``raw_dir``.
+    relative to ``raw_dir``. A TFRecord is read in one pass per ascending stretch.
     """
+    stretches: List[Tuple[str, List[int]]] = []
+    for name, position in runs:
+        if stretches and stretches[-1][0] == name and position > stretches[-1][1][-1]:
+            stretches[-1][1].append(position)
+        else:
+            stretches.append((name, [position]))
     if raw_format == "tfrecord":
-        for index, traj in enumerate(read_raw_trajectories(raw_dir, source_tfrecord, frames,
-                                                           count)):
-            yield f"{source_tfrecord}[{index}]", (lambda traj=traj: traj)
+        for name, positions in stretches:
+            for index, traj in zip(positions, read_raw_trajectories(raw_dir, name, frames,
+                                                                    None, positions)):
+                yield f"{name}[{index}]", (lambda traj=traj: traj)
         return
     if raw_format == "d3plot":
-        from dataset_preprocessor.d3plot_reader import read_raw_run, run_dirs
+        from dataset_preprocessor.d3plot_reader import read_raw_run
         options: Dict = {}
-    elif raw_format == "vtk":
-        from dataset_preprocessor.vtk_reader import read_raw_run, run_dirs
-        options = dict(vtk_options or {})
     else:
-        raise ValueError(f"raw_format must be one of {RAW_FORMATS}, got {raw_format!r}")
+        from dataset_preprocessor.vtk_reader import read_raw_run
+        options = dict(vtk_options or {})
     root = Path(raw_dir).resolve()
-    for run_dir in run_dirs(raw_dir, source_tfrecord)[:count]:
-        try:
-            source = str(Path(run_dir).resolve().relative_to(root))
-        except ValueError:
-            source = str(run_dir)
-        yield source, partial(read_raw_run, run_dir, frames, max_block_bytes=block_bytes,
-                              **options)
+    for name, positions in stretches:
+        run_dirs = _run_dirs(raw_format)(raw_dir, name)
+        for run_dir in (run_dirs[p] for p in positions):
+            try:
+                source = str(Path(run_dir).resolve().relative_to(root))
+            except ValueError:
+                source = str(run_dir)
+            yield source, partial(read_raw_run, run_dir, frames, max_block_bytes=block_bytes,
+                                  **options)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -567,10 +639,11 @@ def _resume(db_path: Path, settings: Dict[str, str]) -> sqlite3.Connection:
 def write_dataset(
     raw_dir: str,
     out_dir: str,
-    source_tfrecord: str = "test.tfrecord",
+    source_tfrecord: Union[str, Sequence[str]] = "test.tfrecord",
     n_train: int = 70,
     n_val: int = 15,
     n_test: int = 15,
+    select_seed: Optional[int] = None,
     num_steps: int = 400,
     time_stride: int = 1,
     history: int = 0,
@@ -590,6 +663,8 @@ def write_dataset(
     ``"d3plot"`` / ``"vtk"`` read LS-DYNA runs / VTK time series (below
     ``raw_dir/<source_tfrecord name>`` or ``raw_dir``) instead of the TFRecord;
     ``vtk_options`` are passed to ``vtk_reader.read_raw_run`` (field names, parts).
+    ``source_tfrecord`` names one source or one per split (train, val, test);
+    ``select_seed`` draws the runs at random (see ``select_runs``).
     ``contact_radius`` overrides the ``collision_radius`` of ``meta.json``,
     which such raw data may lack. An existing ``dataset.db`` is replaced, or with
     ``resume`` continued (see the module docstring); ``progress`` receives one
@@ -609,10 +684,18 @@ def write_dataset(
     contact_radius = float(contact_radius)
     frames = [k * time_stride for k in range(num_steps)]
     samples_per_trajectory = num_steps - 1 - history
-    splits = {"train": {"start": 0, "count": n_train},
-              "val": {"start": n_train, "count": n_val},
-              "test": {"start": n_train + n_val, "count": n_test}}
-    num_trajectories = n_train + n_val + n_test
+    sources = [source_tfrecord] if isinstance(source_tfrecord, str) else list(source_tfrecord)
+    if len(sources) not in (1, 3):
+        raise ValueError(f"one source or one per split (train, val, test), got {sources}")
+    counts = {"train": n_train, "val": n_val, "test": n_test}
+    selection = select_runs(raw_format, raw_dir, sources, counts, select_seed)
+    splits, start = {}, 0
+    for name, count in counts.items():
+        splits[name] = {"start": start, "count": count}
+        start += count
+        if len(sources) > 1 or select_seed is not None:   # else: the ranges of one source
+            splits[name].update(source=selection[name][0], indices=selection[name][1])
+    num_trajectories = start
     # Everything that changes the content; --resume requires the same values.
     settings = {
         "contact_radius": repr(contact_radius),
@@ -621,11 +704,13 @@ def write_dataset(
         "prev_stress": "1" if prev_stress else "0",
         "num_steps": str(num_steps),
         "frames": json.dumps(frames),
-        "source_tfrecord": source_tfrecord,
+        "source_tfrecord": sources[0] if len(sources) == 1 else json.dumps(sources),
         "raw_format": raw_format,
         "splits": json.dumps(splits),
         "edge_stats_stride": str(edge_stats_stride),
     }
+    if select_seed is not None:
+        settings["select_seed"] = str(select_seed)
     if raw_format == "vtk":   # the options in effect, so that defaults compare equal
         from dataset_preprocessor.vtk_reader import read_raw_run
         vtk_options = {**{name: p.default for name, p in
@@ -659,12 +744,16 @@ def write_dataset(
         conn = None   # created with the first run, whose size sets the page size
 
     block_bytes = int(block_mb * 2 ** 20) if block_mb else None
-    num_read = 0
+    runs = [(name, position) for name, positions in selection.values() for position in positions]
+    num_read, seen = 0, set()
     try:
-        for index, (source, read) in enumerate(raw_runs(
-                raw_format, raw_dir, source_tfrecord, frames, num_trajectories,
-                vtk_options, block_bytes)):
+        for index, (source, read) in enumerate(raw_runs(raw_format, raw_dir, runs, frames,
+                                                        vtk_options, block_bytes)):
             num_read += 1
+            if source in seen:   # d3plot / vtk: sources without a folder share raw_dir
+                raise ValueError(f"{source} would be in two splits — the sources "
+                                 f"{sources} overlap")
+            seen.add(source)
             if index in done:
                 if done[index] != source:
                     raise ValueError(f"trajectory {index} in {db_path} comes from {done[index]}, "
@@ -700,8 +789,8 @@ def write_dataset(
                          f"{traj.mesh_pos.shape[0]:,} nodes, {len(frames)} frames, "
                          f"{time.time() - start:.1f} s")
         if num_read < num_trajectories:
-            raise ValueError(f"{source_tfrecord} ({raw_format}) holds only {num_read} "
-                             f"trajectories, {num_trajectories} requested")
+            raise ValueError(f"{', '.join(sources)} ({raw_format}) held only {num_read} of "
+                             f"the {num_trajectories} trajectories requested")
 
         max_walls = (conn.execute("SELECT max(length(walls)) FROM trajectories").fetchone()[0]
                      or 0) // (6 * 4)
@@ -737,7 +826,7 @@ def write_dataset(
         "num_steps": num_steps,
         "time_stride": time_stride,
         "raw_dir": str(Path(raw_dir).resolve()),
-        "source_tfrecord": source_tfrecord,
+        "source_tfrecord": sources[0] if len(sources) == 1 else sources,
         "sample_counts": {name: r["count"] * samples_per_trajectory
                           for name, r in splits.items()},
         "splits": splits,
@@ -755,6 +844,8 @@ def write_dataset(
         metadata["wall_distance_cutoff"] = WALL_DISTANCE_CUTOFF * contact_radius
     if edge_stats_stride != 1:
         metadata["edge_stats_stride"] = edge_stats_stride
+    if select_seed is not None:
+        metadata["select_seed"] = select_seed
     metadata_path = out / "metadata.json"
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
@@ -789,10 +880,12 @@ def main(argv=None) -> None:
                         help="directory with meta.json and the .tfrecord or the run folders "
                              f"(default: {d['raw_dir']}; d3plot: {d['raw_dir_d3plot']}; "
                              f"vtk: {d['raw_dir_vtk']})")
-    parser.add_argument("--source-tfrecord", default=d["source_tfrecord"],
-                        help="TFRecord inside --raw-dir (test.tfrecord: 100 trajectories); "
-                             "d3plot / vtk: the runs converted from it (folder <name without "
-                             ".tfrecord>), else all runs below --raw-dir")
+    parser.add_argument("--source-tfrecord", nargs="+", default=[d["source_tfrecord"]],
+                        metavar="NAME",
+                        help="TFRecord inside --raw-dir (test.tfrecord: 100 trajectories), "
+                             "or three, one per split: train valid test; d3plot / vtk: the "
+                             "runs converted from it (folder <name without .tfrecord>), else "
+                             "all runs below --raw-dir")
     parser.add_argument("--contact-radius", type=float, default=None,
                         help="world edge radius; default: collision_radius of meta.json "
                              "(required for d3plot / vtk raw data without meta.json)")
@@ -822,6 +915,9 @@ def main(argv=None) -> None:
     parser.add_argument("--n-train", type=int, default=d["n_train"], help="train trajectories")
     parser.add_argument("--n-val", type=int, default=d["n_val"], help="validation trajectories")
     parser.add_argument("--n-test", type=int, default=d["n_test"], help="test trajectories")
+    parser.add_argument("--select-seed", type=int, default=d["select_seed"],
+                        help="draw the trajectories of each split at random with this seed "
+                             "(stored in metadata.json); default: the first ones")
     parser.add_argument("--num-steps", type=int, default=d["num_steps"],
                         help="frames per trajectory (samples per trajectory = "
                              "num_steps - 1 - history)")
@@ -850,16 +946,26 @@ def main(argv=None) -> None:
         args.raw_dir = d[{"d3plot": "raw_dir_d3plot", "vtk": "raw_dir_vtk"}.get(
             args.raw_format, "raw_dir")]
     raw_dir, out_dir = _repo_path(args.raw_dir), _repo_path(args.out_dir)
-    num_trajectories = args.n_train + args.n_val + args.n_test
+    if len(args.source_tfrecord) not in (1, 3):
+        parser.error("--source-tfrecord takes one name, or three: train, val and test")
     if (raw_dir / "meta.json").exists():
         trajectory_length = read_raw_meta(raw_dir)["trajectory_length"]
-    elif args.raw_format != "tfrecord":   # runs without meta.json: shortest run
+    elif args.raw_format != "tfrecord":   # runs without meta.json: shortest selected run
         if args.raw_format == "d3plot":
             from dataset_preprocessor.d3plot_reader import num_states, run_dirs
         else:
             from dataset_preprocessor.vtk_reader import num_states, run_dirs
-        runs = run_dirs(raw_dir, args.source_tfrecord)[:num_trajectories]
-        trajectory_length = min(num_states(run) for run in runs)
+        try:
+            selection = select_runs(args.raw_format, raw_dir, args.source_tfrecord,
+                                    {"train": args.n_train, "val": args.n_val,
+                                     "test": args.n_test}, args.select_seed)
+        except ValueError as error:
+            parser.error(str(error))
+        lengths = []
+        for name, positions in selection.values():
+            runs = run_dirs(raw_dir, name)
+            lengths += [num_states(runs[p]) for p in positions]
+        trajectory_length = min(lengths)
     else:
         parser.error(f"{raw_dir / 'meta.json'} not found")
     if args.contact_radius is None and args.raw_format != "tfrecord" and \
@@ -882,15 +988,17 @@ def main(argv=None) -> None:
                      "continue it")
 
     samples_per_trajectory = args.num_steps - 1 - args.history
+    drawn = "" if args.select_seed is None else f", drawn with seed {args.select_seed}"
     print(f"Exporting {args.n_train}/{args.n_val}/{args.n_test} trajectories x "
           f"{samples_per_trajectory} samples (frames 0..{last_frame}, stride "
-          f"{args.time_stride}, history {args.history}, raw {args.raw_format}) -> {out_dir}")
+          f"{args.time_stride}, history {args.history}, raw {args.raw_format}{drawn}) "
+          f"-> {out_dir}")
     start = time.time()
     try:
         paths = write_dataset(
             raw_dir=str(raw_dir), out_dir=str(out_dir), source_tfrecord=args.source_tfrecord,
             n_train=args.n_train, n_val=args.n_val, n_test=args.n_test,
-            num_steps=args.num_steps, time_stride=args.time_stride,
+            select_seed=args.select_seed, num_steps=args.num_steps, time_stride=args.time_stride,
             history=args.history, prev_stress=args.prev_stress, raw_format=args.raw_format,
             contact_radius=args.contact_radius,
             vtk_options=dict(stress_field=args.stress_field, node_type_field=args.node_type_field,
