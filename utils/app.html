@@ -1,0 +1,818 @@
+<!doctype html>
+<!-- app.html — the page of utils/app.py: the workflow in five steps. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CrashDefNet app</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f3f0; --surface: #fcfcfb; --surface-2: #f0efec; --border: #dcdad4;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #75736d;
+  --accent: #1c5cab; --accent-hover: #184f95; --accent-soft: #e3eefc; --on-accent: #ffffff;
+  --good: #0a7d0a; --critical: #c03030; --note-bg: #fff6dc; --note-border: #f0d68a;
+  --series-1: #2a78d6; --series-2: #eb6834; --grid: #e6e4df;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #111110; --surface: #1a1a19; --surface-2: #242422; --border: #3a3a37;
+    --text: #f0efec; --text-2: #c3c2b7; --muted: #9a998f;
+    --accent: #3987e5; --accent-hover: #5598e7; --accent-soft: #1d2a3b; --on-accent: #0b0b0b;
+    --good: #45c445; --critical: #e66767; --note-bg: #2e2816; --note-border: #5c4c1c;
+    --series-1: #3987e5; --series-2: #d95926; --grid: #2e2e2b;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111110; --surface: #1a1a19; --surface-2: #242422; --border: #3a3a37;
+  --text: #f0efec; --text-2: #c3c2b7; --muted: #9a998f;
+  --accent: #3987e5; --accent-hover: #5598e7; --accent-soft: #1d2a3b; --on-accent: #0b0b0b;
+  --good: #45c445; --critical: #e66767; --note-bg: #2e2816; --note-border: #5c4c1c;
+  --series-1: #3987e5; --series-2: #d95926; --grid: #2e2e2b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+header, .layout, footer { max-width: 1080px; margin: 0 auto; padding: 0 16px; }
+header { padding-top: 28px; padding-bottom: 8px; }
+h1 { font-size: 24px; margin: 0 0 4px; letter-spacing: -0.01em; }
+h1 span { color: var(--muted); font-weight: 500; }
+h2 { font-size: 20px; margin: 0 0 6px; }
+h3 { font-size: 15px; margin: 22px 0 8px; }
+p { margin: 0 0 10px; }
+.lead { color: var(--text-2); max-width: 70ch; }
+.layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 24px; padding-top: 16px; }
+nav ol { list-style: none; margin: 0; padding: 0; position: sticky; top: 16px; }
+nav button {
+  display: flex; gap: 10px; align-items: flex-start; width: 100%; text-align: left;
+  border: 0; background: none; color: var(--text); padding: 10px; border-radius: 10px;
+  cursor: pointer; font: inherit;
+}
+nav button:hover { background: var(--surface-2); }
+nav button[aria-current="step"] { background: var(--surface); box-shadow: inset 0 0 0 1px var(--border); }
+nav .num {
+  flex: none; width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center;
+  font-size: 13px; font-weight: 600; background: var(--surface-2); color: var(--text-2);
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+nav .done .num { background: var(--good); color: var(--surface); box-shadow: none; }
+nav small { display: block; color: var(--muted); font-size: 12.5px; line-height: 1.35; overflow-wrap: anywhere; }
+nav button > span:last-child { min-width: 0; }
+main section {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  padding: 24px; min-width: 0;
+}
+.muted { color: var(--muted); }
+.text-2 { color: var(--text-2); }
+code { font: 13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--surface-2);
+       padding: 1px 5px; border-radius: 5px; overflow-wrap: anywhere; }
+a { color: var(--accent); }
+button.primary, button.secondary {
+  font: inherit; font-weight: 600; border-radius: 9px; padding: 9px 16px; cursor: pointer;
+  border: 1px solid var(--accent);
+}
+button.primary { background: var(--accent); color: var(--on-accent); }
+button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+button.secondary { background: none; color: var(--accent); }
+button.secondary:hover:not(:disabled) { background: var(--accent-soft); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+.actions { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 18px; }
+.nextbar { display: flex; justify-content: space-between; gap: 10px; margin-top: 26px;
+           padding-top: 16px; border-top: 1px solid var(--border); }
+.choices { display: grid; gap: 8px; }
+.choice {
+  display: flex; gap: 12px; align-items: flex-start; padding: 12px 14px; border-radius: 10px;
+  border: 1px solid var(--border); cursor: pointer; background: var(--surface);
+}
+.choice:hover { border-color: var(--accent); }
+.choice:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); }
+.choice.disabled { opacity: .55; cursor: not-allowed; }
+.choice input { margin-top: 4px; accent-color: var(--accent); }
+.choice b { display: block; overflow-wrap: anywhere; }
+.choice small { color: var(--text-2); display: block; }
+.form { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+label.field { display: grid; gap: 4px; font-size: 13.5px; color: var(--text-2); }
+input[type=number], select {
+  font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 9px; width: 100%;
+}
+.files { display: grid; gap: 6px; margin: 12px 0; }
+.file { display: flex; gap: 10px; align-items: center; }
+.ok { color: var(--good); font-weight: 600; }
+.missing { color: var(--critical); font-weight: 600; }
+.note { background: var(--note-bg); border: 1px solid var(--note-border); border-radius: 10px;
+        padding: 10px 14px; margin: 14px 0; }
+.error { color: var(--critical); margin-top: 10px; }
+.job { margin-top: 18px; border: 1px solid var(--border); border-radius: 12px; padding: 14px;
+       background: var(--surface-2); }
+.job-head { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.badge { font-size: 12.5px; font-weight: 600; padding: 2px 9px; border-radius: 99px;
+         background: var(--surface); box-shadow: inset 0 0 0 1px var(--border); }
+.badge.finished { color: var(--good); }
+.badge.failed, .badge.cancelled { color: var(--critical); }
+.bar { height: 8px; border-radius: 99px; background: var(--surface); overflow: hidden; margin: 10px 0 6px;
+       box-shadow: inset 0 0 0 1px var(--border); }
+.bar > div { height: 100%; background: var(--accent); border-radius: 99px; transition: width .4s; }
+.bar.indeterminate > div { width: 30% !important; animation: slide 1.4s ease-in-out infinite; }
+@keyframes slide { from { margin-left: -30%; } to { margin-left: 100%; } }
+details summary { cursor: pointer; color: var(--text-2); font-size: 13.5px; margin-top: 8px; }
+pre.log { max-height: 260px; overflow: auto; font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace;
+          background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+          padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; margin: 14px 0; }
+.tile { border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
+.tile .label { color: var(--text-2); font-size: 13px; }
+.tile .value { font-size: 26px; font-weight: 650; letter-spacing: -0.01em; }
+.tile .unit { font-size: 15px; font-weight: 500; color: var(--text-2); }
+.tile .sub { color: var(--muted); font-size: 12.5px; }
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--text-2); font-weight: 600; font-size: 13px; }
+tbody tr { cursor: pointer; }
+tbody tr:hover, tbody tr.current { background: var(--accent-soft); }
+.chart { position: relative; margin-top: 6px; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.chart text { fill: var(--muted); font-size: 11.5px; }
+.legend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; color: var(--text-2); }
+.legend i { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+.tooltip { position: absolute; pointer-events: none; background: var(--surface); color: var(--text);
+           border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px; font-size: 12.5px;
+           box-shadow: 0 4px 14px rgba(0,0,0,.12); white-space: nowrap; display: none; }
+.tooltip i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+.examples { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 14px 0 6px; }
+.examples img { display: block; width: 100%; height: auto; border-radius: 10px; border: 1px solid var(--border); }
+.gif { margin-top: 12px; }
+.gif img { max-width: 100%; height: auto; border-radius: 10px; border: 1px solid var(--border); }
+footer { color: var(--muted); font-size: 13px; padding-top: 18px; padding-bottom: 32px; }
+[hidden] { display: none !important; }
+@media (max-width: 860px) {
+  .layout { grid-template-columns: minmax(0, 1fr); }
+  nav ol { position: static; display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; }
+  nav li { flex: 0 0 auto; }
+  nav small { display: none; }
+  main section { padding: 18px; }
+  .examples { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>CrashDefNet <span>app</span></h1>
+  <p class="lead">A graph neural network learns from finite element simulations how a structure
+  deforms, then predicts this on its own, time step by time step, for simulations it has never
+  seen. Follow the five steps for a first run in minutes, or go straight to any step to work with
+  your own datasets, configurations, models and predictions.</p>
+  <div id="device-note" class="note" hidden></div>
+</header>
+
+<div class="layout">
+<nav aria-label="Steps"><ol id="nav"></ol></nav>
+<main>
+
+<section data-step="0">
+  <h2>1 · Raw data</h2>
+  <p class="text-2">A first run needs no data of your own: the model learns from DeepMind's
+  <code>deforming_plate</code> dataset, finite element simulations in which an actuator presses
+  into a plate and deforms it. Every plate has its own
+  outline, holes and mesh, and the actuators differ in shape and in where they press. A simulation
+  runs 400 time steps: the actuator presses in until step 360, then pulls back, and the plate
+  springs back.</p>
+  <div id="examples" hidden>
+    <div class="examples"></div>
+    <p class="muted">Six of the plates at their deepest indentation, time step 360. Colour: von Mises
+    stress, from light blue (0) to dark blue (300 kPa and above); grey: the actuator.</p>
+  </div>
+  <p class="text-2">This needs the test file of the dataset, 100 simulated plates (0.8 GB),
+  downloaded once into <code id="raw-folder"></code>. With datasets of your own you can skip this
+  step.</p>
+  <div class="files" id="raw-files"></div>
+  <p class="muted">The data comes under DeepMind's terms, not CrashDefNet's license
+  (<a href="https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets" target="_blank" rel="noopener">MeshGraphNets release</a>).</p>
+  <div class="actions"><button class="primary" id="download">Download (0.8 GB)</button></div>
+  <div class="job-slot"></div>
+  <div class="nextbar"><span></span><button class="secondary" data-go="1">Next: dataset →</button></div>
+</section>
+
+<section data-step="1" hidden>
+  <h2>2 · Dataset</h2>
+  <p class="text-2">Each simulation becomes a sequence of graphs: the nodes of the finite element
+  mesh, connected along the mesh and where parts touch. <b>Training simulations</b> teach the model,
+  <b>check simulations</b> pick its best training epoch, and the <b>unseen simulations</b> are what
+  it predicts at the end.</p>
+  <h3>Use a dataset</h3>
+  <div class="choices" id="datasets"></div>
+  <p class="muted" style="margin-top:8px">Every export in <code>data/</code> appears here, also of your
+  own simulations: LS-DYNA runs and VTK time series are exported on the command line
+  (<a href="https://stofe94.github.io/crash-def-net/guides/export/" target="_blank" rel="noopener">guide</a>).</p>
+  <h3>Or create a new one from <code>deforming_plate</code></h3>
+  <div class="form">
+    <label class="field">Training simulations <input type="number" id="n_train" min="1" max="98"></label>
+    <label class="field">Check simulations <input type="number" id="n_val" min="1" max="98"></label>
+    <label class="field">Unseen simulations <input type="number" id="n_test" min="1" max="98"></label>
+    <label class="field">Time steps <select id="time_stride"></select></label>
+  </div>
+  <p class="muted" id="export-estimate" style="margin-top:10px"></p>
+  <div class="actions"><button class="primary" id="export">Create dataset</button>
+    <span class="muted" id="export-hint"></span></div>
+  <div class="job-slot"></div>
+  <div class="nextbar"><button class="secondary" data-go="0">← Back</button>
+    <button class="secondary" data-go="2" id="to-training">Next: training →</button></div>
+</section>
+
+<section data-step="2" hidden>
+  <h2>3 · Training</h2>
+  <p class="text-2">From one time step the model learns to predict the next: how each node moves and
+  which stress it carries. After every epoch it predicts the check simulations on its own, and the
+  epoch that does this best is kept.</p>
+  <p>Dataset: <b id="train-dataset">none chosen</b> · <a href="#" data-go="1">change</a></p>
+  <h3>Configuration</h3>
+  <label class="field" style="max-width:420px">Training config <select id="config"></select></label>
+  <p class="muted" id="config-note" style="margin-top:8px"></p>
+  <h3>Model</h3>
+  <div class="choices" id="architectures"></div>
+  <div class="form" style="margin-top:14px">
+    <label class="field">Epochs <input type="number" id="epochs" min="1" max="500"></label>
+  </div>
+  <p class="muted" style="margin-top:8px">Training can stop earlier, once the check simulations stop
+  improving (early stopping of the config). <span id="train-estimate"></span></p>
+  <div class="actions"><button class="primary" id="train">Start training</button>
+    <span class="muted" id="device-line"></span></div>
+  <div class="job-slot"></div>
+  <div id="train-chart" hidden>
+    <h3>Error per epoch</h3>
+    <p class="muted">Loss of the one-step prediction (normalized, log scale): training and check
+    simulations. The marked epoch is the one kept.</p>
+    <div class="chart" id="loss-chart"></div>
+  </div>
+  <div id="train-result"></div>
+  <div class="nextbar"><button class="secondary" data-go="1">← Back</button>
+    <button class="secondary" data-go="3">Next: prediction →</button></div>
+</section>
+
+<section data-step="3" hidden>
+  <h2>4 · Prediction</h2>
+  <p class="text-2">The trained model predicts the unseen simulations from the first time step to the
+  last, each step from its own previous prediction, and compares them with the ground truth. Then
+  the app renders the first simulation as an animation, so that step 5 can show it right away.</p>
+  <h3>Trained model</h3>
+  <div class="choices" id="models"></div>
+  <div class="actions"><button class="primary" id="rollout">Predict the unseen simulations</button></div>
+  <div class="job-slot"></div>
+  <div class="nextbar"><button class="secondary" data-go="2">← Back</button>
+    <button class="secondary" data-go="4">Next: result →</button></div>
+</section>
+
+<section data-step="4" hidden>
+  <h2>5 · Result</h2>
+  <label class="field" style="max-width:640px">Prediction <select id="rollouts"></select></label>
+  <div id="result-empty" class="muted" style="margin-top:14px">No prediction yet: run step 4 first.</div>
+  <div id="result" hidden>
+    <div class="tiles" id="tiles"></div>
+    <h3>Animation</h3>
+    <p class="muted">Left the simulation (finite element method), right the prediction of the model.
+    Colour: von Mises stress.</p>
+    <div class="actions" style="margin-top:8px">
+      <label class="field" style="min-width:200px">Simulation <select id="simulation"></select></label>
+      <button class="primary" id="animate" style="align-self:end">Create animation</button>
+    </div>
+    <div class="job-slot"></div>
+    <div class="gif" id="gif"></div>
+    <div class="note" id="quick-start-note" hidden><b>Not a usable result:</b> the quick start is the
+      absolute minimum to show that the workflow runs and has nothing to do with a real training,
+      which is what leads to usable results (see the
+      <a href="https://stofe94.github.io/crash-def-net/results/deforming-plate/" target="_blank" rel="noopener">documentation</a>).</div>
+    <h3>Per simulation</h3>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Simulation</th><th>Position, first step</th><th>Position, all steps</th><th>Stress, all steps</th></tr></thead>
+      <tbody id="simulations"></tbody>
+    </table></div>
+    <p class="muted" id="result-files"></p>
+  </div>
+  <div class="nextbar"><button class="secondary" data-go="3">← Back</button><span></span></div>
+</section>
+
+</main>
+</div>
+<footer>Everything runs on this computer: data and results stay here. This app is at an early stage,
+made mainly for the quick start, and will be developed further.</footer>
+
+<script>
+"use strict";
+const STEPS = [["Raw data", "deforming_plate"], ["Dataset", "simulations as graphs"],
+               ["Training", "learn one step"], ["Prediction", "unseen simulations"],
+               ["Result", "errors, animation"]];
+const JOB_STEP = {download: 0, export: 1, train: 2, rollout: 3, animate: 4};
+const ARCHITECTURES = {
+  mgn_t: ["MGN-T (MeshGraphNet-Transformer)",
+          "Message passing along the mesh plus attention across the whole structure.",
+          "Small size, about 50,000 parameters: ~22 s per epoch on a desktop CPU with the quick-start dataset."],
+  meshgraphnets: ["MeshGraphNets",
+          "Message passing along the mesh and the contact edges.",
+          "About 530,000 parameters: ~2 min per epoch on a desktop CPU with the quick-start dataset."],
+};
+// Seconds per training sample and epoch on a 6-core desktop CPU (installation guide:
+// 22 s and 2 min per epoch for the 312 samples of the quick-start dataset).
+const CPU_SECONDS_PER_SAMPLE = {mgn_t: 22 / 312, meshgraphnets: 120 / 312};
+const MB_PER_FRAME = 11 / (12 * 40);   // quick-start dataset: ~11 MB, 12 plates of 40 frames
+
+const S = {step: 0, lists: null, state: null, dataset: null, config: null, architecture: "mgn_t",
+           model: null, rollout: null, simulation: null, detail: null, trained: null};
+const $ = (selector, root = document) => root.querySelector(selector);
+const esc = value => String(value ?? "").replace(/[&<>"']/g, c =>
+  ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const busy = () => S.state?.job?.status === "running";
+const fileUrl = path => "/files/" + path.split("/").map(encodeURIComponent).join("/");
+
+async function api(path, body) {
+  const options = body === undefined ? {} : {method: "POST", body: JSON.stringify(body),
+                                             headers: {"Content-Type": "application/json"}};
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || response.statusText);
+  return data;
+}
+
+function number(value, digits = 3) {
+  if (value == null || !isFinite(value)) return "–";
+  const magnitude = Math.abs(value);
+  return value.toFixed(magnitude >= 100 ? 0 : magnitude >= 10 ? 1 : magnitude >= 1 ? 2 : digits);
+}
+const mm = metres => number(metres * 1e3);
+// The stress as in the reports (utils/units.py): kPa for data in Pa or kPa, else the unit of the data.
+const stressUnit = unit => unit === "MPa" || unit === "GPa" ? unit : "kPa";
+const stressValue = (pascal, unit) => number(pascal / {kPa: 1e3, MPa: 1e6, GPa: 1e9}[stressUnit(unit)]);
+const stress = (pascal, unit) => stressValue(pascal, unit) + " " + stressUnit(unit);
+const percent = fraction => number(fraction * 100, 2) + " %";
+const simulations = n => `${n} simulation${n === 1 ? "" : "s"}`;
+function every(stride) {
+  if (stride == null) return "";
+  if (stride === 1) return "every time step";
+  const suffix = [11, 12, 13].includes(stride % 100) ? "th" : ({1: "st", 2: "nd", 3: "rd"}[stride % 10] ?? "th");
+  return `every ${stride}${suffix} time step`;
+}
+function duration(seconds) {
+  if (seconds < 90) return `${Math.max(1, Math.round(seconds))} s`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)} min`;
+  return `${(seconds / 3600).toFixed(1)} h`;
+}
+
+// ── Navigation ────────────────────────────────────────────────
+
+function stepDone(i) {
+  const lists = S.lists;
+  if (!lists) return false;
+  return [lists.raw.complete, !!S.dataset, lists.models.some(m => m.finished),
+          lists.rollouts.length > 0, lists.rollouts.some(r => Object.keys(r.gifs).length > 0)][i];
+}
+
+function stepNote(i) {
+  const lists = S.lists;
+  if (!lists) return STEPS[i][1];
+  const job = S.state?.job;
+  if (job && job.status === "running" && JOB_STEP[job.kind] === i) return "running …";
+  return [lists.raw.complete ? "found" : "to download",
+          S.dataset || "choose or create",
+          S.trained || (lists.models.length ? `${lists.models.length} trained` : "start a run"),
+          lists.rollouts.length ? `${lists.rollouts.length} done` : "run the model",
+          STEPS[4][1]][i];
+}
+
+function renderNav() {
+  $("#nav").innerHTML = STEPS.map(([title], i) => `
+    <li class="${stepDone(i) ? "done" : ""}"><button data-go="${i}"
+      ${S.step === i ? 'aria-current="step"' : ""}><span class="num">${stepDone(i) ? "✓" : i + 1}</span>
+      <span><b>${title}</b><small>${esc(stepNote(i))}</small></span></button></li>`).join("");
+}
+
+function go(i) {
+  S.step = i;
+  document.querySelectorAll("main section").forEach(s => s.hidden = Number(s.dataset.step) !== i);
+  renderNav();
+  renderJob();
+  if (i === 4) loadDetail();
+  window.scrollTo({top: 0});
+}
+
+document.addEventListener("click", event => {
+  const target = event.target.closest("[data-go]");
+  if (target) { event.preventDefault(); go(Number(target.dataset.go)); }
+});
+
+// ── Steps ─────────────────────────────────────────────────────
+
+function renderRaw() {
+  const raw = S.lists.raw;
+  $("#raw-folder").textContent = raw.folder + "/";
+  $("#raw-files").innerHTML = Object.entries(raw.files).map(([name, size]) => `
+    <div class="file">${size != null ? '<span class="ok">✓ found</span>' : '<span class="missing">✗ missing</span>'}
+      <code>${esc(name)}</code><span class="muted">${size != null ? number(size / 1e6) + " MB" : ""}</span></div>`).join("");
+  $("#download").hidden = raw.complete;
+  $("#download").disabled = busy();
+}
+
+function renderExamples() {   // once: the images do not change while the app runs
+  const examples = S.lists.raw.examples;
+  $("#examples").hidden = !examples.length;
+  $("#examples .examples").innerHTML = examples.map(path => {
+    const plate = path.match(/(\d+)\.png$/)?.[1];
+    const alt = plate ? `Plate ${Number(plate)} of test.tfrecord at its deepest indentation` : "Example plate";
+    return `<a href="${fileUrl(path)}" target="_blank" rel="noopener"><img src="${fileUrl(path)}" alt="${esc(alt)}"></a>`;
+  }).join("");
+}
+
+function frames(stride) {
+  const length = S.lists.raw.trajectory_length || 400;
+  return Math.floor((length - 1) / stride) + 1;
+}
+
+function renderDatasets() {
+  const lists = S.lists;
+  if (S.dataset && !lists.datasets.some(d => d.name === S.dataset)) S.dataset = null;
+  if (!S.dataset && lists.datasets.length) S.dataset = lists.datasets[0].name;
+  $("#datasets").innerHTML = lists.datasets.length ? lists.datasets.map(d => `
+    <label class="choice"><input type="radio" name="dataset" value="${esc(d.name)}" ${d.name === S.dataset ? "checked" : ""}>
+      <span><b>${esc(d.name)}</b><small>${d.simulations.train} training · ${d.simulations.val} check ·
+      ${d.simulations.test} unseen simulations · ${d.frames ?? "?"} frames each (${every(d.time_stride)}) ·
+      ${number(d.size_mb)} MB</small></span></label>`).join("")
+    : '<p class="muted">No dataset in <code>data/</code> yet: create one below.</p>';
+  document.querySelectorAll("input[name=dataset]").forEach(input =>
+    input.addEventListener("change", () => { S.dataset = input.value; renderAll(); }));
+  $("#export").disabled = busy() || !lists.raw.complete;
+  $("#export-hint").textContent = lists.raw.complete ? "" : "needs the raw data of step 1";
+  $("#to-training").disabled = !S.dataset;
+}
+
+function initExportForm() {
+  const d = S.lists.defaults;
+  for (const key of ["n_train", "n_val", "n_test"]) $("#" + key).value = d[key];
+  $("#time_stride").innerHTML = d.time_strides.map(s =>
+    `<option value="${s}" ${s === d.time_stride ? "selected" : ""}>${every(s).replace(/(\d\w\w) time step$/, "$1")}</option>`).join("");
+  $("#epochs").value = d.epochs;
+  S.config = d.config;
+  document.querySelectorAll(".form input, .form select").forEach(el =>
+    el.addEventListener("input", () => { renderExportEstimate(); renderTrainEstimate(); }));
+}
+
+function exportParams() {
+  return Object.fromEntries(["n_train", "n_val", "n_test", "time_stride"].map(k => [k, Number($("#" + k).value)]));
+}
+
+function renderExportEstimate() {
+  const p = exportParams();
+  const f = frames(p.time_stride);
+  const total = p.n_train + p.n_val + p.n_test;
+  $("#export-estimate").textContent = `${f} frames per simulation · ${p.n_train * (f - 1)} training samples · ` +
+    `about ${number(MB_PER_FRAME * total * f)} MB · ` +
+    (total > S.lists.raw.trajectories ? `at most ${S.lists.raw.trajectories} in all` : "takes seconds to minutes");
+}
+
+function renderTraining() {
+  const dataset = S.lists.datasets.find(d => d.name === S.dataset);
+  $("#train-dataset").textContent = dataset
+    ? `${dataset.name} (${simulations(dataset.simulations.train)} for training, ${dataset.train_samples ?? "?"} samples)` : "none chosen";
+  const example = S.config === S.lists.defaults.config;
+  $("#config").innerHTML = S.lists.configs.map(c =>
+    `<option value="${esc(c.path)}" ${c.path === S.config ? "selected" : ""}>${esc(c.path)}</option>`).join("");
+  $("#config-note").innerHTML = example
+    ? "The small example: minutes on a CPU, for a first run. For a real training choose another config; your own in <code>configs/</code> appear here."
+    : "Sizes, learning rate, noise and all other settings come from this config; architecture and epochs below override it.";
+  $("#architectures").innerHTML = Object.entries(ARCHITECTURES).map(([key, [title, text, sizes]]) => `
+    <label class="choice"><input type="radio" name="architecture" value="${key}" ${key === S.architecture ? "checked" : ""}>
+      <span><b>${title}</b><small>${text}${example ? " " + sizes : ""}</small></span></label>`).join("");
+  document.querySelectorAll("input[name=architecture]").forEach(input =>
+    input.addEventListener("change", () => { S.architecture = input.value; renderTrainEstimate(); }));
+  $("#train").disabled = busy() || !dataset;
+  renderTrainEstimate();
+  renderTrainResult();
+}
+
+function renderTrainEstimate() {
+  const dataset = S.lists?.datasets.find(d => d.name === S.dataset);
+  const epochs = Number($("#epochs").value) || 0;
+  // Known for the sizes of the example config only.
+  if (!dataset?.train_samples || !epochs || S.config !== S.lists.defaults.config) {
+    $("#train-estimate").textContent = "";
+    return;
+  }
+  const seconds = CPU_SECONDS_PER_SAMPLE[S.architecture] * dataset.train_samples * epochs;
+  const gpu = (S.state?.device || "").startsWith("GPU");
+  $("#train-estimate").textContent = `Rough duration on a desktop CPU: up to ${duration(seconds)}` +
+    (gpu ? ", with the GPU considerably less." : ".");
+}
+
+function renderTrainResult() {
+  const model = S.lists.models.find(m => m.name === S.trained);
+  const box = $("#train-result");
+  if (!model || !model.finished) { box.innerHTML = ""; return; }
+  const t = model.test || {};
+  box.innerHTML = `<div class="note" style="background:var(--surface-2);border-color:var(--border)">
+    <b class="ok">Training finished</b> after ${model.epochs} epochs, epoch ${model.selected_epoch ?? "?"} kept.
+    On the ${t.num_trajectories ? simulations(t.num_trajectories) : "simulations"} it has not seen, its error over the whole prediction is
+    <b>${mm(t.q_rmse_all)} mm</b> in the position and <b>${stress(t.stress_rmse_all, model.stress_unit)}</b> in the stress.
+    Next: predict them and look at the result.</div>`;
+}
+
+function renderModels() {
+  const models = S.lists.models;
+  if (S.model && !models.some(m => m.name === S.model)) S.model = null;
+  const usable = m => m.has_model && m.dataset_present && !m.training;
+  if (!S.model) S.model = models.find(usable)?.name ?? null;
+  $("#models").innerHTML = models.length ? models.map(m => {
+    const why = m.training ? "training now" : !m.has_model ? "no model saved yet"
+              : !m.dataset_present ? `its dataset ${esc(m.data_dir)} is not here: name its folder once with predict/rollout.py --data-dir` : "";
+    const test = m.test ? ` · unseen simulations: position ${mm(m.test.q_rmse_all)} mm` : "";
+    const predicted = S.lists.rollouts.find(r => r.model === m.name);   // the newest
+    const result = predicted ? ` · <a href="#" data-go="4" data-rollout="${esc(predicted.name)}">predicted
+      ${esc(predicted.started.slice(0, 16).replace("T", " "))}: see the result</a>` : "";
+    return `<label class="choice ${why ? "disabled" : ""}"><input type="radio" name="model" value="${esc(m.name)}"
+      ${m.name === S.model ? "checked" : ""} ${why ? "disabled" : ""}>
+      <span><b>${esc(m.name)}</b><small>${esc(ARCHITECTURES[m.architecture]?.[0] ?? m.architecture)} ·
+      ${m.dataset_present ? `dataset ${esc(m.dataset)} · ` : ""}${m.epochs} epochs${m.selected_epoch ? `, epoch ${m.selected_epoch} kept` : ""}${test}${result}
+      ${why ? ` · <b class="missing">${why}</b>` : ""}</small></span></label>`;
+  }).join("") : '<p class="muted">No trained model yet: train one in step 3.</p>';
+  document.querySelectorAll("input[name=model]").forEach(input =>
+    input.addEventListener("change", () => { S.model = input.value; }));
+  document.querySelectorAll("#models [data-rollout]").forEach(link =>   // before the data-go of the document
+    link.addEventListener("click", () => { S.rollout = link.dataset.rollout; S.detail = null; renderRollouts(); }));
+  $("#rollout").disabled = busy() || !S.model;
+}
+
+function renderRollouts() {
+  const rollouts = S.lists.rollouts;
+  if (S.rollout && !rollouts.some(r => r.name === S.rollout)) S.rollout = null;
+  if (!S.rollout && rollouts.length) S.rollout = rollouts[0].name;
+  $("#rollouts").innerHTML = rollouts.map(r => `<option value="${esc(r.name)}" ${r.name === S.rollout ? "selected" : ""}>
+    ${esc((r.started || "").slice(0, 16).replace("T", " "))} · ${esc(r.model)} (${esc(ARCHITECTURES[r.architecture]?.[0] ?? r.architecture)}) · ${esc(r.dataset)}</option>`).join("");
+  $("#result-empty").hidden = rollouts.length > 0;
+  $("#result").hidden = !rollouts.length;
+}
+$("#rollouts").addEventListener("change", event => { S.rollout = event.target.value; S.detail = null; loadDetail(); });
+
+async function loadDetail() {
+  if (!S.rollout) return;
+  if (S.detail?.name !== S.rollout) S.simulation = null;
+  S.detail = await api("/api/rollout?name=" + encodeURIComponent(S.rollout));
+  const runs = Object.keys(S.detail.simulations);
+  if (!runs.includes(S.simulation)) S.simulation = runs.find(id => S.detail.simulations[id].gif) ?? runs[0] ?? null;
+  renderResult();
+}
+
+function renderResult() {
+  const d = S.detail;
+  if (!d || d.name !== S.rollout) return;
+  const p = d.rollout_metrics || {};
+  const tile = (label, value, unit, sub) => `<div class="tile"><div class="label">${label}</div>
+    <div class="value">${value} <span class="unit">${unit}</span></div><div class="sub">${sub}</div></div>`;
+  $("#quick-start-note").hidden = !d.quick_start;
+  $("#tiles").innerHTML =
+    tile("Position error, first step", mm(p.q_rmse_1), "mm", `relative ${percent(p.q_r_rmse_1)}`) +
+    tile("Position error, all steps", mm(p.q_rmse_all), "mm", `relative ${percent(p.q_r_rmse_all)}`) +
+    tile("Stress error, all steps", stressValue(p.stress_rmse_all, d.stress_unit), stressUnit(d.stress_unit),
+         `relative ${percent(p.stress_r_rmse_all)}`);
+  $("#simulations").innerHTML = Object.entries(d.simulations).map(([id, run]) => {
+    const m = run.rollout_metrics || {};
+    return `<tr data-simulation="${esc(id)}" class="${id === S.simulation ? "current" : ""}"><td>${esc(id)}</td>
+      <td>${mm(m.q_rmse_1)} mm</td><td>${mm(m.q_rmse_all)} mm</td><td>${stress(m.stress_rmse_all, d.stress_unit)}</td></tr>`;
+  }).join("");
+  document.querySelectorAll("#simulations tr").forEach(row =>
+    row.addEventListener("click", () => { S.simulation = row.dataset.simulation; renderResult(); }));
+  $("#simulation").innerHTML = Object.keys(d.simulations).map(id =>
+    `<option ${id === S.simulation ? "selected" : ""}>${esc(id)}</option>`).join("");
+  const gif = d.simulations[S.simulation]?.gif;
+  $("#gif").innerHTML = gif ? `<img src="${fileUrl(gif)}" alt="Animation of ${esc(S.simulation)}: simulation and prediction">` : "";
+  $("#animate").disabled = busy();
+  $("#animate").textContent = gif ? "Create again" : "Create animation";
+  $("#result-files").innerHTML = `Files: <code>${esc(d.folder)}/</code> (the <code>.vtu.series</code> files open in ParaView)` +
+    (gif ? `, animation <code>${esc(gif)}</code>` : "");
+  renderNav();
+}
+$("#simulation").addEventListener("change", event => { S.simulation = event.target.value; renderResult(); });
+
+// ── Line chart (SVG, hover tooltip) ──────────────────────────
+
+function ticks(low, high, count = 5) {
+  const step0 = (high - low) / count || 1;
+  const power = 10 ** Math.floor(Math.log10(step0));
+  const step = [1, 2, 5, 10].map(f => f * power).find(s => s >= step0);
+  const out = [];
+  for (let t = Math.ceil(low / step) * step; t <= high + step * 1e-9; t += step) out.push(+t.toPrecision(12));
+  return out;
+}
+
+function logTicks(a, b) {   // a, b: log10 of the range; 1-2-5 steps, only powers of ten if many
+  const out = [];
+  for (let d = Math.floor(a); d <= Math.ceil(b); d++) {
+    for (const f of [1, 2, 5]) if (Math.log10(f * 10 ** d) >= a && Math.log10(f * 10 ** d) <= b) out.push(f * 10 ** d);
+  }
+  return out.length > 6 ? out.filter(v => Number.isInteger(+Math.log10(v).toFixed(9))) : out;
+}
+
+function lineChart(el, {series, xLabel, yLabel, log = false, format, mark}) {
+  const all = series.flatMap(s => s.points).filter(([, y]) => y > 0 || !log);
+  if (!all.length) { el.innerHTML = '<p class="muted">No values yet.</p>'; return; }
+  const W = Math.max(320, el.clientWidth || 640), H = 250, m = {l: 54, r: 14, t: 10, b: 38};
+  const f = log ? Math.log10 : v => v;
+  const xs = all.map(p => p[0]), ys = all.map(p => f(p[1]));
+  let [x0, x1] = [Math.min(...xs), Math.max(...xs)];
+  if (x0 === x1) x1 = x0 + 1;
+  let [y0, y1] = [Math.min(...ys), Math.max(...ys)];
+  if (!log) y0 = Math.min(0, y0);
+  if (y0 === y1) { y0 -= 0.5; y1 += 0.5; }
+  const pad = (y1 - y0) * 0.06; y1 += pad; if (log) y0 -= pad;
+  const X = x => m.l + (x - x0) / (x1 - x0) * (W - m.l - m.r);
+  const Y = y => H - m.b - (f(y) - y0) / (y1 - y0) * (H - m.t - m.b);
+  const yt = log ? logTicks(y0, y1) : ticks(y0, y1, 4);
+  const xt = ticks(x0, x1, 6).filter(t => t >= x0 && t <= x1 && Number.isInteger(t));
+  const lab = v => log ? (v >= 1e-2 && v < 1e3 ? +v.toPrecision(2) : v.toExponential(0)) : +v.toPrecision(4);
+  const svg = [`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(yLabel)} over ${esc(xLabel)}">`];
+  for (const t of yt) svg.push(`<line x1="${m.l}" x2="${W - m.r}" y1="${Y(t)}" y2="${Y(t)}" stroke="var(--grid)"/>`,
+    `<text x="${m.l - 8}" y="${Y(t) + 4}" text-anchor="end">${lab(t)}</text>`);
+  for (const t of xt) svg.push(`<text x="${X(t)}" y="${H - m.b + 16}" text-anchor="middle">${+t.toPrecision(6)}</text>`);
+  svg.push(`<line x1="${m.l}" x2="${W - m.r}" y1="${H - m.b}" y2="${H - m.b}" stroke="var(--border)"/>`,
+    `<text x="${(m.l + W - m.r) / 2}" y="${H - 4}" text-anchor="middle">${esc(xLabel)}</text>`,
+    `<text x="12" y="${m.t + 4}" transform="rotate(-90 12 ${m.t + 4})" text-anchor="end">${esc(yLabel)}</text>`);
+  for (const s of series) {
+    const pts = s.points.filter(([, y]) => y > 0 || !log);
+    svg.push(`<path d="${pts.map(([x, y], i) => `${i ? "L" : "M"}${X(x).toFixed(1)},${Y(y).toFixed(1)}`).join("")}"
+      fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`);
+    if (pts.length === 1) svg.push(`<circle cx="${X(pts[0][0])}" cy="${Y(pts[0][1])}" r="4" fill="${s.color}"/>`);
+  }
+  if (mark != null) {
+    const point = series[series.length - 1].points.find(p => p[0] === mark);
+    if (point) svg.push(`<circle cx="${X(point[0])}" cy="${Y(point[1])}" r="5" fill="var(--surface)" stroke="${series[series.length - 1].color}" stroke-width="2"/>`,
+      `<text x="${X(point[0])}" y="${Y(point[1]) - 10}" text-anchor="middle">kept</text>`);
+  }
+  svg.push(`<line class="cross" y1="${m.t}" y2="${H - m.b}" stroke="var(--muted)" stroke-dasharray="3 3" visibility="hidden"/>`,
+           `<rect x="${m.l}" y="${m.t}" width="${W - m.l - m.r}" height="${H - m.t - m.b}" fill="transparent"/></svg>`);
+  const legend = series.length > 1 ? `<div class="legend">${series.map(s =>
+    `<span><i style="background:${s.color}"></i>${esc(s.name)}</span>`).join("")}</div>` : "";
+  el.innerHTML = legend + svg.join("") + '<div class="tooltip"></div>';
+  const svgEl = $("svg", el), cross = $(".cross", el), tip = $(".tooltip", el);
+  const xsSorted = [...new Set(xs)].sort((a, b) => a - b);
+  $("rect", el).addEventListener("mousemove", event => {
+    const box = svgEl.getBoundingClientRect();
+    const xv = x0 + ((event.clientX - box.left) * W / box.width - m.l) / (W - m.l - m.r) * (x1 - x0);
+    const x = xsSorted.reduce((best, v) => Math.abs(v - xv) < Math.abs(best - xv) ? v : best, xsSorted[0]);
+    cross.setAttribute("x1", X(x)); cross.setAttribute("x2", X(x)); cross.setAttribute("visibility", "visible");
+    const rows = series.map(s => [s, s.points.find(p => p[0] === x)]).filter(([, p]) => p);
+    tip.innerHTML = `<b>${esc(xLabel)} ${x}</b>` + rows.map(([s, p]) =>
+      `<div><i style="background:${s.color}"></i>${esc(s.name)}: ${format(p[1])}</div>`).join("");
+    tip.style.display = "block";
+    const left = X(x) * box.width / W;
+    tip.style.left = Math.min(left + 12, box.width - tip.offsetWidth) + "px";
+    tip.style.top = (el.querySelector(".legend")?.offsetHeight || 0) + 8 + "px";
+  });
+  $("rect", el).addEventListener("mouseleave", () => { cross.setAttribute("visibility", "hidden"); tip.style.display = "none"; });
+}
+
+async function loadHistory(name) {
+  if (!name) return;
+  const history = await api("/api/history?model=" + encodeURIComponent(name)).catch(() => []);
+  $("#train-chart").hidden = !history.length;
+  if (!history.length) return;
+  const series = [
+    {name: "training simulations", color: "var(--series-1)", points: history.map(r => [r.epoch, r.train_loss])},
+    {name: "check simulations", color: "var(--series-2)", points: history.filter(r => r.val_loss != null).map(r => [r.epoch, r.val_loss])},
+  ];
+  lineChart($("#loss-chart"), {series, xLabel: "epoch", yLabel: "loss", log: true,
+    format: v => v.toPrecision(3), mark: history.find(r => r.selected)?.epoch});
+}
+
+// ── Running steps ─────────────────────────────────────────────
+
+async function start(kind, params = {}) {
+  const section = $(`main section[data-step="${JOB_STEP[kind]}"]`);
+  let message = $(".step-error", section);
+  if (!message) {
+    message = Object.assign(document.createElement("p"), {className: "error step-error"});
+    $(".job-slot", section).before(message);
+  }
+  message.textContent = "";
+  try {
+    await api("/api/start/" + kind, params);
+    await poll();
+  } catch (error) {
+    message.textContent = error.message;
+  }
+}
+
+$("#download").addEventListener("click", () => start("download"));
+$("#export").addEventListener("click", () => start("export", exportParams()));
+$("#train").addEventListener("click", () => {
+  S.trained = null;
+  start("train", {dataset: S.dataset, config: S.config, architecture: S.architecture,
+                  epochs: Number($("#epochs").value)});
+});
+$("#config").addEventListener("change", event => {
+  S.config = event.target.value;
+  const config = S.lists.configs.find(c => c.path === S.config);
+  if (ARCHITECTURES[config?.architecture]) S.architecture = config.architecture;
+  if (config?.epochs) $("#epochs").value = config.epochs;
+  renderTraining();
+});
+$("#rollout").addEventListener("click", () => start("rollout", {model: S.model}));
+$("#animate").addEventListener("click", () => start("animate", {rollout: S.rollout, trajectory: S.simulation}));
+
+function renderJob() {
+  const job = S.state?.job;
+  document.querySelectorAll(".job-slot").forEach((slot, i) => {
+    if (!job || JOB_STEP[job.kind] !== i) { slot.innerHTML = ""; slot.dataset.shown = ""; return; }
+    const shown = JSON.stringify(job);
+    if (slot.dataset.shown === shown) return;   // unchanged (an ended job): keep text selections
+    slot.dataset.shown = shown;
+    const running = job.status === "running";
+    const statusText = {running: "running", finished: "✓ done", failed: "✗ failed", cancelled: "✗ cancelled"}[job.status];
+    const open = slot.querySelector("details")?.open ?? job.status === "failed";
+    const log = slot.querySelector("pre.log");
+    const atBottom = !log || log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
+    slot.innerHTML = `<div class="job"><div class="job-head"><b>${esc(job.title)}</b>
+        <span><span class="badge ${job.status}">${statusText}</span> <span class="muted">${duration(job.elapsed)}</span></span></div>
+      ${running || job.progress != null ? `<div class="bar ${running && job.progress == null ? "indeterminate" : ""}">
+        <div style="width:${Math.round((job.progress ?? (running ? 0.3 : 1)) * 100)}%"></div></div>` : ""}
+      <div class="muted">${esc(job.detail)}</div>
+      ${job.error ? `<p class="error">${esc(job.error)}</p>` : ""}
+      ${running ? '<div class="actions" style="margin-top:10px"><button class="secondary" id="cancel">Cancel</button></div>' : ""}
+      <details ${open ? "open" : ""}><summary>Log</summary><pre class="log">${esc(job.log.join("\n"))}</pre></details></div>`;
+    const pre = slot.querySelector("pre.log");
+    if (atBottom) pre.scrollTop = pre.scrollHeight;
+    slot.querySelector("#cancel")?.addEventListener("click", () => api("/api/cancel", {}).then(poll));
+  });
+}
+
+function renderDevice() {
+  const device = S.state?.device;
+  $("#device-line").textContent = device ? `Runs on: ${device}` : "Looking for a GPU …";
+  renderTrainEstimate();
+  const missing = device?.startsWith("missing");
+  $("#device-note").hidden = !missing;
+  if (missing) $("#device-note").innerHTML = `<b>PyTorch is missing.</b> Install CrashDefNet first and start
+    the app from its environment (<a href="https://stofe94.github.io/crash-def-net/getting-started/installation/" target="_blank" rel="noopener">installation</a>).`;
+}
+
+function renderAll() {
+  renderNav(); renderRaw(); renderDatasets(); renderExportEstimate(); renderTraining();
+  renderModels(); renderRollouts();
+}
+
+async function loadLists() {
+  S.lists = await api("/api/lists");
+  renderAll();
+}
+
+let handled = null;   // start time of the last job whose end the page has handled
+async function poll() {
+  try {
+    S.state = await api("/api/state");
+  } catch {
+    $("#device-line").textContent = "The app is not running any more: start it again.";
+    return;
+  }
+  const job = S.state.job;
+  if (job?.status === "running" && job.kind === "train") loadHistory(job.info.model);
+  if (job && job.status !== "running" && handled !== job.started) {
+    handled = job.started;
+    await jobEnded(job);
+  }
+  renderDevice(); renderJob(); renderNav();
+  if (busy()) for (const id of ["#download", "#export", "#train", "#rollout", "#animate"]) $(id).disabled = true;
+}
+
+async function jobEnded(job) {
+  const result = job.result || {};
+  if (job.status === "finished") {
+    if (job.kind === "export") S.dataset = result.dataset;
+    if (job.kind === "train") S.model = result.model;
+    if (job.kind === "rollout") { S.rollout = result.rollout; S.detail = null; }
+  }
+  if (job.kind === "train") { S.trained = job.info.model; loadHistory(S.trained); }
+  await loadLists();
+  if (job.status === "finished" && job.kind === "rollout") go(4);
+  else if (S.step === 4) loadDetail();
+}
+
+async function init() {
+  await loadLists();
+  initExportForm();
+  renderExamples();
+  renderAll();
+  const first = await api("/api/state").catch(() => ({}));
+  const job = first.job;
+  if (job && job.status !== "running") handled = job.started;   // ended before the page opened
+  if (job?.kind === "train") { S.trained = job.info.model; loadHistory(S.trained); renderTraining(); }
+  await poll();
+  if (job?.status === "running") go(JOB_STEP[job.kind]);
+  else go(!S.lists.raw.complete && !S.lists.datasets.length ? 0 : !S.lists.datasets.length ? 1
+          : !S.lists.models.some(m => m.finished) ? 2 : !S.lists.rollouts.length ? 3 : 4);
+  setInterval(poll, 1000);
+}
+window.addEventListener("resize", () => { if (S.step === 4) renderResult(); if (S.step === 2 && S.trained) loadHistory(S.trained); });
+init();
+</script>
+</body>
+</html>

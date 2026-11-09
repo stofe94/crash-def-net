@@ -48,14 +48,28 @@ What a run provides (``read_run``)
   (normal, actuator, clamped), then the nodes of the cells of ``actuator_parts``
   and ``clamped_parts``; without either every node is normal. A node takes the
   highest type of its copies and parts (clamped > actuator > normal).
-* ``stress``: point field ``stress_field`` — a scalar, or a stress tensor
-  (6 Voigt components xx yy zz xy yz zx, or 9) from which the von Mises stress
-  is computed. Cell data: von Mises per cell, then averaged at the nodes (as
-  in ``d3plot_reader``). Nodes of parts without the field get 0.
+* result fields (the targets besides the velocity), per state: ``stress`` from
+  the point field ``stress_field`` — a scalar, or a stress tensor (6 Voigt
+  components xx yy zz xy yz zx, or 9) from which the von Mises stress is
+  computed; cell data: von Mises per cell, then averaged at the nodes (as in
+  ``d3plot_reader``); ``stress_field=""``: none. Then the point or cell fields
+  ``fields`` (e.g. a plastic strain), each under its own name; vectors give one
+  field per component as in ``node_static``. Nodes of parts without a field have no
+  value (NaN).
 * ``node_static``: the point or cell fields ``static_fields`` of the first
-  state, 0 at nodes of parts without them; vectors give one feature per
+  state, NaN (no value) at nodes of parts without them; vectors give one feature per
   component (``<name>_x`` / ``_y`` / ``_z``, or ``<name>_0`` ...).
 * ``globals``: ``globals.json`` in the run folder.
+* ``component``: the part of every node (``component_names``: the part names,
+  by block, file or ``part_field`` as above). A node of several parts belongs to
+  the one that appears first.
+* ``rigid_bodies``: the parts named in ``free_rigid_parts``, rigid parts whose motion
+  results from the crash: their nodes are normal (also where ``node_type_field``
+  marks them as actuator), so the model predicts their motion, and the rollout moves
+  each as a rigid body.
+* ``components``: the parts of the run and their roles (``export_config.py``). Parts that
+  no pattern matches are left out, with the points only they hold; ``node_type_field``
+  still marks single nodes.
 
 Needs ``pyvista``.
 """
@@ -81,6 +95,12 @@ from dataset_preprocessor.d3plot_reader import (
     von_mises,
 )
 from dataset_preprocessor.export import RawTrajectory
+from dataset_preprocessor.export_config import (
+    ROLE_ACTUATOR,
+    ROLE_FIXED,
+    ROLE_FREE_RIGID,
+    component_roles,
+)
 from dataset_preprocessor.graph_features import (
     CELL_EDGES,
     CELL_HEXAHEDRON,
@@ -131,7 +151,7 @@ def run_states(run_dir) -> List[Tuple[float, List[Tuple[str, Path]]]]:
     if series:
         parts = []
         for path in series:   # one series file per part, named like it (part_a.vtu.series)
-            with open(path) as f:
+            with open(path, encoding="utf-8") as f:
                 files = json.load(f)["files"]
             name = Path(path.stem).stem
             parts.append([(float(item.get("time", i)), (name, run_dir / item["name"]))
@@ -326,18 +346,22 @@ def _points(mesh, displacement_field: Optional[str], where: str) -> np.ndarray:
     return points
 
 
-def _field(parts: List[_Part], name: str, num_nodes: int, transform=None
+def _field(parts: List[_Part], name: str, num_nodes: int, transform=None,
+           part_field: Optional[str] = None, left_out: Sequence[str] = ()
            ) -> Tuple[Optional[np.ndarray], List[str]]:
     """(k, N) point or cell field ``name`` at the nodes, and the parts without it.
 
     Point values are averaged over the copies of a node, cell values over the
     cells around it; ``transform`` maps (M, k) values to (M,) — e.g. a tensor
     to its von Mises stress — before, as post-processors do. Nodes of parts
-    without the field get 0; None if no part has it.
+    without the field have no value (NaN); None if no part has it. The parts ``left_out``
+    do not count (the cells named so by ``part_field``, else the meshes of that name).
     """
     average, missing = None, []
     for part in parts:
         mesh = part.mesh
+        if part_field is None and part.name in left_out:
+            continue
         if name in mesh.point_data:
             values = np.asarray(mesh.point_data[name], dtype=np.float64).reshape(mesh.n_points, -1)
             corners = part.nodes[:, None]
@@ -346,6 +370,9 @@ def _field(parts: List[_Part], name: str, num_nodes: int, transform=None
             cells, _, order = part.cells()
             values = values[order]
             corners = np.where(cells >= 0, cells, cells[:, :1])   # padding: counted once
+            if part_field is not None and len(left_out):
+                in_run = ~np.isin(_cell_parts(part, part_field, name), list(left_out))
+                values, corners = values[in_run], corners[in_run]
         else:
             missing.append(part.name)
             continue
@@ -375,7 +402,7 @@ def _scalar_stress(values: np.ndarray) -> np.ndarray:
 
 def _node_types(parts: List[_Part], num_nodes: int, node_type_field: str,
                 part_field: Optional[str], actuator_parts: Sequence, clamped_parts: Sequence,
-                where: str) -> np.ndarray:
+                where: str, with_roles: bool = False) -> np.ndarray:
     """Node types from ``node_type_field`` and the parts; the highest type of a node wins."""
     node_type = np.full(num_nodes, NODE_TYPE_NORMAL, dtype=np.int32)
     with_field = [p for p in parts if node_type_field in p.mesh.point_data]
@@ -386,21 +413,15 @@ def _node_types(parts: List[_Part], num_nodes: int, node_type_field: str,
             raise ValueError(f"{where}: node types {sorted(unknown)}; expected "
                              f"{list(_KNOWN_NODE_TYPES)}")
         np.maximum.at(node_type, part.nodes, values)
-    if not with_field and not (actuator_parts or clamped_parts):
+    if not with_field and not (actuator_parts or clamped_parts or with_roles):
         warnings.warn(f"{where}: no point field {node_type_field!r} — all nodes normal")
 
     found = set()
     for kind, wanted in ((NODE_TYPE_ACTUATOR, actuator_parts), (NODE_TYPE_CLAMPED, clamped_parts)):
         wanted = [str(name) for name in wanted]
         for part in parts if wanted else ():
-            cells, _, order = part.cells()
-            if part_field is None:
-                names = np.full(len(cells), part.name)
-            elif part_field in part.mesh.cell_data:
-                values = np.asarray(part.mesh.cell_data[part_field]).reshape(-1)[order]
-                names = values.astype(np.int64).astype(str)
-            else:
-                raise ValueError(f"{where}: part {part.name} has no cell field {part_field!r}")
+            cells = part.cells()[0]
+            names = _cell_parts(part, part_field, where)
             found.update(np.unique(names).tolist())
             nodes = cells[np.isin(names, wanted)]
             nodes = nodes[nodes >= 0]
@@ -412,6 +433,44 @@ def _node_types(parts: List[_Part], num_nodes: int, node_type_field: str,
     return node_type
 
 
+def _cell_parts(part: _Part, part_field: Optional[str], where: str) -> np.ndarray:
+    """The part name of every cell of ``part`` (its own name, or ``part_field``)."""
+    cells, _, order = part.cells()
+    if part_field is None:
+        return np.full(len(cells), part.name)
+    if part_field not in part.mesh.cell_data:
+        raise ValueError(f"{where}: part {part.name} has no cell field {part_field!r}")
+    values = np.asarray(part.mesh.cell_data[part_field]).reshape(-1)[order]
+    return values.astype(np.int64).astype(str)
+
+
+def _node_components(parts: List[_Part], num_nodes: int, part_field: Optional[str],
+                     where: str, only: Optional[Sequence[str]] = None,
+                     leading: Sequence[str] = ()) -> Tuple[np.ndarray, List[str]]:
+    """The part of every node (N,) as index into the part names, in the order the
+    parts appear; a node of several parts belongs to the first. ``only``: the parts that
+    count, without points outside their cells; ``leading``: parts that go first."""
+    names: Dict[str, int] = {name: k for k, name in enumerate(leading)}
+    unset = np.iinfo(np.int64).max
+    component = np.full(num_nodes, unset, dtype=np.int64)
+    for part in parts:
+        cells = part.cells()[0]
+        cell_names = _cell_parts(part, part_field, where)
+        if only is not None:
+            in_run = np.isin(cell_names, list(only))
+            cells, cell_names = cells[in_run], cell_names[in_run]
+        unique, first, inverse = np.unique(cell_names, return_index=True, return_inverse=True)
+        for k in np.argsort(first):
+            names.setdefault(str(unique[k]), len(names))
+        index = np.array([names[str(name)] for name in unique], np.int64)[inverse.reshape(-1)]
+        valid = cells >= 0
+        np.minimum.at(component, cells[valid], np.broadcast_to(index[:, None], cells.shape)[valid])
+        loose = part.nodes[component[part.nodes] == unset]   # points without cells
+        if len(loose) and only is None:
+            component[loose] = names.setdefault(part.name, len(names))
+    return component, list(names)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Runs
 # ─────────────────────────────────────────────────────────────────────────────
@@ -421,22 +480,38 @@ def _node_types(parts: List[_Part], num_nodes: int, node_type_field: str,
 _BYTES_PER_NODE_STATE = 128
 
 
+def _component_names(name: str, count: int) -> List[str]:
+    """``name`` for a scalar, else ``name_x/_y/_z`` (3 components) or ``name_0`` ..."""
+    if count == 1:
+        return [name]
+    return [f"{name}_{s}" for s in (("x", "y", "z") if count == 3 else range(count))]
+
+
 class _StateReader:
-    """Positions and stress of the states of one run; the first state fixes the nodes."""
+    """Positions and result fields of the states of one run; the first state fixes
+    the nodes and the names of the fields (``field_names``)."""
 
     def __init__(self, run_dir: Path, node_id_field: Optional[str],
-                 displacement_field: Optional[str], stress_field: str):
+                 displacement_field: Optional[str], stress_field: str,
+                 fields: Sequence[str] = (), components: Optional[Dict[str, str]] = None,
+                 part_field: Optional[str] = None):
         self.run_dir = run_dir
         self.node_id_field = node_id_field
         self.displacement_field = displacement_field
         self.stress_field = stress_field
+        self.fields = list(fields)
+        self.components = components
+        self.part_field = part_field
+        self.roles: Optional[Dict[str, str]] = None      # with components, from the first state
+        self.left_out: List[str] = []
+        self.field_names: List[str] = []
         self.node_index: Optional[_NodeIndex] = None
         self.num_nodes = 0
         self.tolerance = 0.0
 
     def read(self, files: List[Tuple[str, Path]], where: str
              ) -> Tuple[List[_Part], np.ndarray, np.ndarray]:
-        """Parts, positions (N, 3) float32 and stress (N,) of one state."""
+        """Parts, positions (N, 3) float32 and result fields (N, F) of one state."""
         parts = _read_state(files)
         ids = _node_ids(parts, self.node_id_field, where)
         num_points = sum(part.mesh.n_points for part in parts)
@@ -451,6 +526,11 @@ class _StateReader:
         offsets = np.cumsum([0] + [part.mesh.n_points for part in parts])
         for part, start, end in zip(parts, offsets[:-1], offsets[1:]):
             part.nodes = nodes[start:end]
+        if first and self.components:
+            names = list(dict.fromkeys(name for part in parts for name in
+                                       np.unique(_cell_parts(part, self.part_field, where)).tolist()))
+            self.roles = component_roles(names, self.components, where)
+            self.left_out = [name for name in names if name not in self.roles]
 
         points = np.concatenate([_points(part.mesh, self.displacement_field, where)
                                  for part in parts])
@@ -465,29 +545,43 @@ class _StateReader:
                              f"{apart.max():.3g} apart — the node IDs do not identify the "
                              "nodes (node_id_field '' ignores them)")
 
-        values, missing = _field(parts, self.stress_field, self.num_nodes,
-                                 transform=_scalar_stress)
-        if values is None:
-            raise ValueError(f"{where}: stress field {self.stress_field!r} missing")
-        if first and missing:
-            warnings.warn(f"{self.run_dir}: parts without stress field {self.stress_field!r} "
-                          f"(0 at their nodes): {missing}")
-        return parts, positions.astype(np.float32), values[0]
+        columns, names = [], []
+        requested = ([(self.stress_field, _scalar_stress, "stress")] if self.stress_field
+                     else []) + [(name, None, name) for name in self.fields]
+        for field, transform, name in requested:
+            values, missing = _field(parts, field, self.num_nodes, transform=transform,
+                                     part_field=self.part_field, left_out=self.left_out)
+            if values is None:
+                raise ValueError(f"{where}: field {field!r} missing")
+            if first and missing:
+                warnings.warn(f"{self.run_dir}: parts without field {field!r} "
+                              f"(no value at their nodes): {missing}")
+            columns.append(values)
+            names += _component_names(name, len(values))
+        if first:
+            self.field_names = names
+        elif names != self.field_names:
+            raise ValueError(f"{where}: fields {names}, the first state has {self.field_names}")
+        values = np.concatenate(columns).T if columns else np.zeros((self.num_nodes, 0))
+        return parts, positions.astype(np.float32), values
 
 
 def read_run(run_dir, frames: Optional[Sequence[int]] = None, stress_field: str = "stress",
              node_type_field: str = "node_type", static_fields: Sequence[str] = (),
              displacement_field: Optional[str] = None, node_id_field: Optional[str] = None,
              part_field: Optional[str] = None, actuator_parts: Sequence = (),
-             clamped_parts: Sequence = ()) -> RawTrajectory:
+             clamped_parts: Sequence = (), fields: Sequence[str] = (),
+             free_rigid_parts: Sequence[str] = (),
+             components: Optional[Dict[str, str]] = None) -> RawTrajectory:
     """One VTK time series as a ``RawTrajectory`` with all frames in memory; ``frames``
     selects states (default: all)."""
     traj = read_raw_run(run_dir, frames, stress_field=stress_field,
                         node_type_field=node_type_field, static_fields=static_fields,
                         displacement_field=displacement_field, node_id_field=node_id_field,
                         part_field=part_field, actuator_parts=actuator_parts,
-                        clamped_parts=clamped_parts)
-    blocks = list(traj.blocks())
+                        clamped_parts=clamped_parts, fields=fields,
+                        free_rigid_parts=free_rigid_parts, components=components)
+    blocks = list(traj.frame_blocks)
     traj.world_pos = blocks[0][0] if len(blocks) == 1 else np.concatenate([b[0] for b in blocks])
     traj.stress = blocks[0][1] if len(blocks) == 1 else np.concatenate([b[1] for b in blocks])
     traj.frame_blocks = None
@@ -498,12 +592,15 @@ def read_raw_run(run_dir, frames: Optional[Sequence[int]] = None, stress_field: 
                  node_type_field: str = "node_type", static_fields: Sequence[str] = (),
                  displacement_field: Optional[str] = None, node_id_field: Optional[str] = None,
                  part_field: Optional[str] = None, actuator_parts: Sequence = (),
-                 clamped_parts: Sequence = (), max_block_bytes: Optional[int] = None
-                 ) -> RawTrajectory:
+                 clamped_parts: Sequence = (), max_block_bytes: Optional[int] = None,
+                 fields: Sequence[str] = (), free_rigid_parts: Sequence[str] = (),
+                 components: Optional[Dict[str, str]] = None) -> RawTrajectory:
     """One VTK time series as a ``RawTrajectory`` whose frames are read in blocks of
     about ``max_block_bytes`` (None: one block) while ``blocks()`` is consumed;
     ``frames`` selects states (default: all). Topology, node types and static
-    fields come from the first selected state."""
+    fields come from the first selected state. ``components``: the parts of the run and
+    their roles (``export_config.py``), instead of ``actuator_parts``, ``clamped_parts``
+    and ``free_rigid_parts``; the others are left out, with the points only they hold."""
     run_dir = Path(run_dir)
     states = run_states(run_dir)
     if not states:
@@ -512,28 +609,58 @@ def read_raw_run(run_dir, frames: Optional[Sequence[int]] = None, stress_field: 
     if max(selected) >= len(states):
         raise ValueError(f"{run_dir}: state {max(selected)} requested, {len(states)} found")
 
-    reader = _StateReader(run_dir, node_id_field, displacement_field, stress_field)
+    reader = _StateReader(run_dir, node_id_field, displacement_field, stress_field, fields,
+                          components, part_field)
     where = f"{run_dir}: state {selected[0]}"
     parts, positions, stress = reader.read(states[selected[0]][1], where)
     num_nodes = reader.num_nodes
     cells = np.concatenate([part.cells()[0] for part in parts])
     cell_types = np.concatenate([part.cells()[1] for part in parts])
+    roles, kept = reader.roles, None
+    if roles is not None:
+        names = np.concatenate([_cell_parts(part, part_field, where) for part in parts])
+        in_run = np.isin(names, list(roles))
+        cells, cell_types = cells[in_run], cell_types[in_run]
+        kept = np.unique(cells[cells >= 0])
+        actuator_parts = [name for name, role in roles.items() if role == ROLE_ACTUATOR]
+        clamped_parts = [name for name, role in roles.items() if role == ROLE_FIXED]
+        free_rigid_parts = [name for name, role in roles.items() if role == ROLE_FREE_RIGID]
     for cell_type in np.unique(cell_types).tolist():
         if not distinct_corners(cells[cell_types == cell_type, :CELL_NUM_NODES[cell_type]]).all():
             raise ValueError(f"{where}: cells of VTK type {cell_type} with repeated nodes "
                              "(unsupported degenerate cell)")
     node_type = _node_types(parts, num_nodes, node_type_field, part_field, actuator_parts,
-                            clamped_parts, where)
+                            clamped_parts, where, with_roles=roles is not None)
+    free_rigid_parts = [str(name) for name in free_rigid_parts]
+    component, component_names = _node_components(
+        parts, num_nodes, part_field, where, only=roles,
+        # A rigid body moves all its nodes, also those it shares with other parts.
+        leading=free_rigid_parts if roles is not None else ())
+    if kept is not None:
+        node_type, component = node_type[kept], component[kept]
+    if free_rigid_parts:
+        unknown = sorted(set(free_rigid_parts) - set(component_names))
+        both = sorted(set(free_rigid_parts) & {str(name) for name in actuator_parts})
+        if unknown or both:
+            raise ValueError(f"{where}: free rigid parts {unknown or both} "
+                             + ("not found" if unknown else "are actuator parts as well")
+                             + f"; the run has {component_names[:20]}")
+        free = np.isin(np.asarray(component_names)[component], free_rigid_parts)
+        node_type[free & (node_type == NODE_TYPE_ACTUATOR)] = NODE_TYPE_NORMAL
     node_static: Dict[str, np.ndarray] = {}
     for name in static_fields:
-        values, _ = _field(parts, name, num_nodes)
+        values, _ = _field(parts, name, num_nodes, part_field=part_field,
+                           left_out=reader.left_out)
         if values is None:
             raise ValueError(f"{where}: static field {name!r} missing")
-        suffixes = ("x", "y", "z") if len(values) == 3 else range(len(values))
-        node_static.update({name: values[0]} if len(values) == 1 else
-                           {f"{name}_{s}": v for s, v in zip(suffixes, values)})
+        node_static.update(zip(_component_names(name, len(values)),
+                               values if kept is None else values[:, kept]))
     del parts
 
+    if kept is not None:
+        new_index = np.full(num_nodes, -1, dtype=np.int64)
+        new_index[kept] = np.arange(len(kept))
+        cells = np.where(cells >= 0, new_index[cells], -1)
     width = max(CELL_NUM_NODES[int(t)] for t in np.unique(cell_types))
     cells = cells[:, :width]
     if (cell_types == CELL_TETRA).all():
@@ -541,12 +668,14 @@ def read_raw_run(run_dir, frames: Optional[Sequence[int]] = None, stress_field: 
     globals_path = run_dir / GLOBALS_FILE
     run_globals = None
     if globals_path.exists():
-        with open(globals_path) as f:
+        with open(globals_path, encoding="utf-8") as f:
             run_globals = {str(k): float(v) for k, v in json.load(f).items()}
 
     size = (max(1, int(max_block_bytes // (_BYTES_PER_NODE_STATE * max(num_nodes, 1))))
             if max_block_bytes else len(selected))
     held = [(positions, stress)]   # the first state, handed out once
+    field_names = reader.field_names
+    stress_only = field_names == ["stress"]   # as (t, N), the layout of the other readers
 
     def frame_blocks():
         world_pos, stresses = [], []
@@ -556,13 +685,20 @@ def read_raw_run(run_dir, frames: Optional[Sequence[int]] = None, stress_field: 
             else:
                 _, state_pos, state_stress = reader.read(states[index][1],
                                                          f"{run_dir}: state {index}")
-            world_pos.append(state_pos)
-            stresses.append(state_stress)
+            world_pos.append(state_pos if kept is None else state_pos[kept])
+            stresses.append(state_stress if kept is None else state_stress[kept])
             if len(world_pos) == size or step == len(selected) - 1:
-                yield np.stack(world_pos), np.stack(stresses).astype(np.float32)
+                fields_block = np.stack(stresses).astype(np.float32)
+                yield np.stack(world_pos), fields_block[..., 0] if stress_only else fields_block
                 world_pos, stresses = [], []
 
-    return RawTrajectory(node_type=node_type, mesh_pos=positions, cells=cells.astype(np.int32),
+    return RawTrajectory(node_type=node_type, mesh_pos=positions if kept is None else positions[kept],
+                         cells=cells.astype(np.int32),
                          world_pos=None, stress=None, cell_types=cell_types,
                          globals=run_globals, node_static=node_static or None,
-                         frame_blocks=frame_blocks())
+                         frame_blocks=frame_blocks(),
+                         field_names=None if stress_only else field_names,
+                         component=component, component_names=component_names,
+                         rigid_bodies=[name for name in component_names
+                                       if name in free_rigid_parts] or None,
+                         component_roles=roles, left_out=reader.left_out if roles else None)

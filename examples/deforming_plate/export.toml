@@ -1,0 +1,23 @@
+# ============================================================
+# CrashDefNet — deforming_plate: export for the first training
+# ============================================================
+# 40 plates of DeepMind's test.tfrecord at every 8th time step: 28 for training, 8 for
+# validation, 4 for the test. Walk-through: docs/getting-started/first-training.md
+#
+#   python -m dataset_preprocessor.export --config examples/deforming_plate/export.toml
+#
+# Every key: docs/reference/configuration.md.
+# ============================================================
+
+[raw]
+format  = "tfrecord"
+dir     = "datasets/deforming_plate/raw_dataset"   # with meta.json: contact radius and steps
+sources = ["test.tfrecord"]
+
+[dataset]
+out_dir     = "data/deforming_plate_s8_t40"
+n_train     = 28
+n_val       = 8
+n_test      = 4
+num_steps   = 50      # frames per plate
+time_stride = 8       # raw time steps between two of them

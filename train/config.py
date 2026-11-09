@@ -1,7 +1,7 @@
 """
 config.py — Training configuration: TOML file -> flat ``TrainingConfig``.
 
-The TOML sections (see ``config.example.toml``) map onto the
+The TOML sections (see ``examples/quick_start/train.toml``) map onto the
 fields of one flat dataclass via ``TOML_KEYS``. Unknown keys are reported, so
 typos and settings that no longer exist do not go unnoticed. The config is
 stored in every checkpoint (``to_dict``) and restored with ``from_dict``,
@@ -28,6 +28,7 @@ import torch
 from dataset_preprocessor.graph_features import (
     DEFAULT_WORLD_EDGE_EXCLUDE_DISTANCE,
     WORLD_EDGE_MODES,
+    FeatureSelection,
 )
 from models.mgn_t import TRANSFORMER_NODES
 from train.early_stopping import CRITERIA
@@ -35,6 +36,10 @@ from train.early_stopping import CRITERIA
 SCHEDULERS = ("exponential", "plateau", "cosine", "none")
 LOSS_TYPES = ("mse", "mae", "huber", "smooth_l1")
 ARCHITECTURES = ("meshgraphnets", "mgn_t")
+# Fields with a fixed set of values: checked on construction, listed in the reference.
+CHOICES = {"architecture": ARCHITECTURES, "world_edges": WORLD_EDGE_MODES,
+           "mgn_t_transformer_nodes": TRANSFORMER_NODES, "scheduler": SCHEDULERS,
+           "loss_type": LOSS_TYPES}
 # Up to v0.2.0 the architecture was misspelled "meshgraphnet"; it was corrected to
 # "meshgraphnets" to match the name of the method, MeshGraphNets (Pfaff et al., 2021).
 # Configs and checkpoints of v0.2.0 still carry the old spelling, so it is translated
@@ -54,6 +59,13 @@ LEGACY_CRITERIA = {"gap"}
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def setting(default: Any = dataclasses.MISSING, doc: str = "", *,
+            default_factory: Any = dataclasses.MISSING) -> Any:
+    """A config field with its description, the text of the configuration
+    reference in the documentation (``utils/docs_reference.py``)."""
+    return field(default=default, default_factory=default_factory, metadata={"doc": doc})
+
+
 @dataclass
 class TrainingConfig:
     """All training settings. Defaults follow the paper where it gives a value."""
@@ -64,94 +76,161 @@ class TrainingConfig:
     config_overrides: Dict[str, Any] = field(default_factory=dict)  # command-line options
 
     # [data]
-    data_dir: str = "data/deforming_plate_s10_small"
-    num_dataloader_workers: int = 0          # > 0: build graphs in spawned workers
-    lazy_loading: bool = False               # read frames from the DB on access (v2 DB)
-    cache_frames: int = 0                    # lazy: LRU cache per worker, in frames
-    static_cache_mb: float = 1024            # lazy: static graph data per worker (LRU), MB
+    data_dir: str = setting("data/deforming_plate_s10_small",
+                            "dataset folder written by the exporter (`dataset.db`, "
+                            "`normalizer.json`, `metadata.json`)")
+    num_dataloader_workers: int = setting(0, "DataLoader processes that build the graphs; "
+                                             "0: in the main process (CPU), 2–4 on a GPU machine")
+    lazy_loading: bool = setting(False, "read the frames from `dataset.db` on access instead of "
+                                        "loading the splits into memory, for splits that do not "
+                                        "fit into RAM")
+    cache_frames: int = setting(0, "lazy: frames kept per process, least recently used out; "
+                                   "0: no cache")
+    static_cache_mb: float = setting(1024, "lazy: static graph data (mesh edges, world edge "
+                                           "selection, rest positions) kept per process, in MB")
+    local_features: Optional[List[str]] = setting(
+        None, "local input features the model sees: static node features of the export by "
+              "name (`static_feature_names` in `metadata.json`); `[]`: none; unset: all")
+    global_features: Optional[List[str]] = setting(
+        None, "global input features the model sees: run parameters of the export by name "
+              "(`global_feature_names` in `metadata.json`); `[]`: none; unset: all")
+    target_fields: Optional[List[str]] = setting(
+        None, "result fields the model predicts besides the velocity, by name "
+              "(`target_feature_names` in `metadata.json`), with their `<name>_prev` inputs; "
+              "`[]`: the velocity only; unset: all")
+    start_frame: Optional[int] = setting(
+        None, "raw frame of the run the training starts with: the first current frame of the "
+              "samples and the initial state of the rollouts (validation, test, and by default "
+              "`predict/rollout.py`), one of the dataset; unset: its first frame")
+    end_frame: Optional[int] = setting(
+        None, "raw frame of the run the training ends with: the last target of the samples and "
+              "of the rollouts, one of the dataset; unset: its last frame")
 
     # [model]
-    architecture: str = "meshgraphnets"
-    residual_target: bool = False            # predict the change vs. *_prev (needs history)
-    world_edges: str = "all"                 # all (paper) | contact | self_contact_aware
-    # self_contact_aware: pairs connected through the material get no world edge, i.e.
-    # with a path along the mesh edges shorter than this many contact radii
-    world_edge_exclude_distance: float = DEFAULT_WORLD_EDGE_EXCLUDE_DISTANCE
-    world_edge_exclude_hops: Optional[int] = None   # instead: up to N mesh edges (to v0.3.0)
-    latent_size: int = 128
-    num_mlp_layers: int = 2
-    num_message_passing_steps: int = 15
-    aggregation: str = "sum"
+    architecture: str = setting("meshgraphnets", "model architecture")
+    residual_target: bool = setting(False, "predict the change of every target that has a "
+                                           "`*_prev` input instead of its value; needs an "
+                                           "export with `--history 1`")
+    world_edges: str = setting("all", "node pairs within the contact radius that get a world "
+                                      "edge: `all` (paper), `contact` (different bodies only), "
+                                      "`self_contact_aware` (pairs not connected through the "
+                                      "material)")
+    world_edge_exclude_distance: float = setting(
+        DEFAULT_WORLD_EDGE_EXCLUDE_DISTANCE,
+        "`self_contact_aware`: pairs with a path along the mesh edges of the rest state "
+        "shorter than this many contact radii get no world edge")
+    world_edge_exclude_hops: Optional[int] = setting(
+        None, "`self_contact_aware`: pairs at most this many mesh edges apart get no world "
+              "edge; instead of `world_edge_exclude_distance`")
+    latent_size: int = setting(128, "width of every MLP and latent (paper 128)")
+    num_mlp_layers: int = setting(2, "hidden layers of every MLP")
+    num_message_passing_steps: int = setting(15, "message passing steps of the processor "
+                                                 "(paper 15)")
+    aggregation: str = setting("sum", "aggregation of the messages at a node: `sum` (paper) "
+                                      "or `mean`")
 
     # [model.mgn_t] — MeshGraphNet-Transformer (arXiv:2601.23177v4; see models/mgn_t.py)
-    mgn_t_latent_size: int = 64              # width of the message passing stages
-    mgn_t_token_dim: int = 32                # width of the transformer
-    mgn_t_num_tokens: int = 128              # physical tokens P
-    mgn_t_num_heads: int = 4
-    mgn_t_num_transformer_blocks: int = 2
-    mgn_t_num_pre_mp_steps: int = 2
-    mgn_t_num_post_mp_steps: int = 2
-    mgn_t_pe_frequencies: int = 8            # not given in the paper
-    mgn_t_ffn_ratio: int = 4                 # not given in the paper
-    mgn_t_tau_init: float = 0.5              # see models/mgn_t.py (softplus)
-    mgn_t_transformer_nodes: str = "structure"   # structure (paper) | all (up to v0.2.0)
+    mgn_t_latent_size: int = setting(64, "width of the message passing stages")
+    mgn_t_token_dim: int = setting(32, "width of the transformer")
+    mgn_t_num_tokens: int = setting(128, "physical tokens P of the physics attention "
+                                         "(paper, deforming_plate: 16)")
+    mgn_t_num_heads: int = setting(4, "attention heads")
+    mgn_t_num_transformer_blocks: int = setting(2, "transformer blocks")
+    mgn_t_num_pre_mp_steps: int = setting(2, "local message passing steps before the "
+                                             "transformer")
+    mgn_t_num_post_mp_steps: int = setting(2, "local message passing steps after the "
+                                              "transformer")
+    mgn_t_pe_frequencies: int = setting(8, "frequencies of the positional encoding (not given "
+                                           "in the paper)")
+    mgn_t_ffn_ratio: int = setting(4, "hidden width of the feed-forward block over "
+                                      "`token_dim` (not given in the paper)")
+    mgn_t_tau_init: float = setting(0.5, "initial temperature of the slice weights under "
+                                         "softplus: τ starts at `tau_init` + ln 2 (paper: "
+                                         "τ₀ = 1.0; see models/mgn_t.py)")
+    mgn_t_transformer_nodes: str = setting("structure", "nodes of the global stage: "
+                                                        "`structure` (paper: without the "
+                                                        "actuator) or `all` (every node)")
 
     # [training]
-    epochs: int = 100
-    batch_size: int = 2
-    # Machine setting: graphs per forward pass; batch_size / micro_batch_size passes
-    # make one optimizer step (gradient accumulation, the same step). None: batch_size
-    micro_batch_size: Optional[int] = None
-    learning_rate: float = 1e-4
-    weight_decay: float = 0.0
-    max_grad_norm: float = 1.0               # gradient clipping (not in the paper)
-    seed: int = 42
-    device: str = "auto"                     # auto -> cuda if available, else cpu
+    epochs: int = setting(100, "training epochs")
+    batch_size: int = setting(2, "graphs per optimizer step (MeshGraphNets paper 2, MGN-T "
+                                 "paper 32)")
+    micro_batch_size: Optional[int] = setting(
+        None, "machine setting: graphs per forward pass, a divisor of `batch_size`; "
+              "`batch_size / micro_batch_size` passes make one optimizer step with the same "
+              "result. Unset: `batch_size`")
+    learning_rate: float = setting(1e-4, "initial learning rate of Adam (paper 1e-4)")
+    weight_decay: float = setting(0.0, "weight decay of Adam")
+    max_grad_norm: float = setting(1.0, "gradient clipping to this norm (not in the paper)")
+    seed: int = setting(42, "seed of the weight initialization, the sample order and the noise")
+    device: str = setting("auto", "`auto` (GPU if available), `cpu` or `cuda`")
 
     # [training.scheduler]
-    scheduler: str = "exponential"           # exponential | plateau | cosine | none
-    min_learning_rate: float = 1e-6          # end LR (exponential), floor (plateau, cosine)
-    lr_decay_steps: Union[int, str] = 5_000_000   # exponential: optimizer steps to reach the
-                                                  # end LR; "auto" = epochs x steps per epoch
-    scheduler_patience: int = 8              # plateau: epochs without improvement
-    scheduler_factor: float = 0.5            # plateau: LR multiplier
+    scheduler: str = setting("exponential", "learning rate schedule: per optimizer step "
+                                            "(`exponential`), per epoch (`cosine`), at "
+                                            "evaluations (`plateau`) or none")
+    min_learning_rate: float = setting(1e-6, "end learning rate (`exponential`), lower bound "
+                                             "(`plateau`, `cosine`)")
+    lr_decay_steps: Union[int, str] = setting(
+        5_000_000, "`exponential`: optimizer steps to reach `min_lr` (paper 5 M); `\"auto\"` "
+                   "= epochs × optimizer steps per epoch, so it is reached at the end of the run")
+    scheduler_patience: int = setting(8, "`plateau`: evaluations without improvement of the "
+                                         "first criterion before the learning rate drops")
+    scheduler_factor: float = setting(0.5, "`plateau`: factor of the drop")
 
     # [training.rollout_validation]
-    rollout_validation: bool = False         # select the model by the val rollout error
-    rollout_validation_every: int = 1
-    rollout_validation_max_sequences: Optional[int] = None
+    rollout_validation: bool = setting(False, "roll out the val split at evaluations; its "
+                                              "errors become selection criteria")
+    rollout_validation_every: int = setting(1, "epochs between evaluations (also in the first "
+                                               "and last epoch)")
+    rollout_validation_max_sequences: Optional[int] = setting(
+        None, "roll out only the first N val trajectories. Unset: all")
 
     # [training.early_stopping] — also the model selection (train/early_stopping.py)
-    early_stopping: bool = True              # False: all epochs, the selection still applies
-    early_stopping_patience: int = 30        # evaluations the selected model may be old
-    early_stopping_min_epochs: int = 30
-    # selected: the evaluation closest to the best value in all criteria at once
-    early_stopping_criteria: List[str] = field(default_factory=lambda: list(CRITERIA))
+    early_stopping: bool = setting(True, "stop when no criterion reaches a new low; `false`: "
+                                         "all epochs, the model selection still applies")
+    early_stopping_patience: int = setting(30, "evaluations without a new low in any "
+                                               "criterion before the run stops")
+    early_stopping_min_epochs: int = setting(30, "epochs before a run may stop")
+    early_stopping_criteria: List[str] = setting(
+        doc="selection criteria; the evaluation closest to the best value in all of them at "
+            "once is selected",
+        default_factory=lambda: list(CRITERIA))
 
     # [loss]
-    loss_type: str = "mse"
+    loss_type: str = setting("mse", "loss on the normalized targets")
 
     # [noise]
-    world_noise_std: float = 0.0             # position noise on free nodes (paper: 3e-3)
-    stress_noise_std: float = 0.0            # noise on stress_prev in Pa (history only)
+    world_noise_std: float = setting(0.0, "position noise on the free nodes, standard "
+                                          "deviation in the length unit of the data "
+                                          "(`length_unit` of the export; paper 3e-3 m)")
+    stress_noise_std: float = setting(0.0, "noise on `stress_prev`, standard deviation in "
+                                           "the stress unit of the data (`stress_unit` of the "
+                                           "export, Pa by default; history layout only)")
 
     # [scheduled_sampling]
-    scheduled_sampling: bool = False         # needs history; paper: off
-    scheduled_sampling_start_ratio: float = 1.0   # teacher-forcing ratio at epoch 0
-    scheduled_sampling_end_ratio: float = 0.3     # ... after the warmup
-    scheduled_sampling_warmup_epochs: int = 50
+    scheduled_sampling: bool = setting(False, "replace the `*_prev` inputs of a share of the "
+                                              "nodes by the model's prediction (history layout "
+                                              "only; not in the paper)")
+    scheduled_sampling_start_ratio: float = setting(1.0, "share of the nodes that keep the "
+                                                         "ground truth at epoch 0")
+    scheduled_sampling_end_ratio: float = setting(0.3, "share of the nodes that keep the "
+                                                       "ground truth after the warmup")
+    scheduled_sampling_warmup_epochs: int = setting(50, "epochs over which the share goes "
+                                                        "linearly from the start to the end "
+                                                        "ratio")
 
     # [checkpointing]
-    checkpoint_dir: str = "checkpoints"
-    save_every: int = 10                     # periodic checkpoint every N epochs
-    log_every: int = 1                       # epoch summary every N epochs
-    resume: Optional[str] = None             # checkpoint to continue from
+    checkpoint_dir: str = setting("checkpoints", "output folder of the run")
+    save_every: int = setting(10, "write `checkpoint_epoch_N.pt` every N epochs "
+                                  "(`best_model.pt` always)")
+    log_every: int = setting(1, "epoch summary in the log every N epochs")
+    resume: Optional[str] = setting(None, "checkpoint to continue from")
 
     def __post_init__(self) -> None:
         self.architecture = LEGACY_ARCHITECTURE_NAMES.get(self.architecture, self.architecture)
-        _check_choice("architecture", self.architecture, ARCHITECTURES)
-        _check_choice("world_edges", self.world_edges, WORLD_EDGE_MODES)
-        _check_choice("transformer_nodes", self.mgn_t_transformer_nodes, TRANSFORMER_NODES)
+        for name, choices in CHOICES.items():
+            _check_choice(name, getattr(self, name), choices)
         if self.world_edge_exclude_hops is not None and self.world_edge_exclude_hops < 1:
             raise ValueError(f"world_edge_exclude_hops must be >= 1, "
                              f"got {self.world_edge_exclude_hops}")
@@ -160,11 +239,17 @@ class TrainingConfig:
                 and self.batch_size % self.micro_batch_size == 0):
             raise ValueError(f"micro_batch_size must divide batch_size {self.batch_size}, "
                              f"got {self.micro_batch_size}")
+        if None not in (self.start_frame, self.end_frame) and self.end_frame <= self.start_frame:
+            raise ValueError(f"end_frame {self.end_frame} must come after start_frame "
+                             f"{self.start_frame}")
         if self.world_edge_exclude_distance <= 0:
             raise ValueError(f"world_edge_exclude_distance must be > 0, "
                              f"got {self.world_edge_exclude_distance}")
-        _check_choice("scheduler", self.scheduler, SCHEDULERS)
-        _check_choice("loss_type", self.loss_type, LOSS_TYPES)
+        for name in ("local_features", "global_features", "target_fields"):
+            names = getattr(self, name)
+            if names is not None and not (isinstance(names, list)
+                                          and all(isinstance(n, str) for n in names)):
+                raise ValueError(f"{name} must be a list of names, got {names!r}")
         self.early_stopping_criteria = [c for c in self.early_stopping_criteria
                                         if c not in LEGACY_CRITERIA]
         unknown = [c for c in self.early_stopping_criteria if c not in CRITERIA]
@@ -190,8 +275,8 @@ class TrainingConfig:
         values: Dict[str, Any] = {}
         unknown, obsolete = [], []
         for key, value in _flatten(raw):
-            if key in TOML_KEYS:
-                values[TOML_KEYS[key]] = value
+            if key in TOML_KEYS or key in LEGACY_TOML_KEYS:
+                values[TOML_KEYS.get(key) or LEGACY_TOML_KEYS[key]] = value
             elif key in OBSOLETE_TOML_KEYS:
                 obsolete.append(key)
             else:
@@ -201,11 +286,12 @@ class TrainingConfig:
                   file=sys.stderr)
         if obsolete:
             print(f"Note: {path}: no longer used (early stopping by criteria, see "
-                  f"docs/training.md): {', '.join(obsolete)}", file=sys.stderr)
+                  f"docs/concepts/training.md): {', '.join(obsolete)}", file=sys.stderr)
         dropped = LEGACY_CRITERIA.intersection(values.get("early_stopping_criteria", ()))
         if dropped:
             print(f"Note: {path}: no longer a selection criterion (it favours early, "
-                  f"undertrained epochs, see docs/training.md): {', '.join(sorted(dropped))}",
+                  f"undertrained epochs, see docs/concepts/training.md): "
+                  f"{', '.join(sorted(dropped))}",
                   file=sys.stderr)
         if {"world_edge_exclude_distance", "world_edge_exclude_hops"} <= values.keys():
             raise ValueError(f"{path}: set world_edge_exclude_distance or (as up to v0.3.0) "
@@ -237,6 +323,11 @@ class TrainingConfig:
                 values.get("rollout_selection_metric", "mse"),
                 values.get("rollout_validation", False))
         return cls(**restored)
+
+    @property
+    def features(self) -> FeatureSelection:
+        """The features of the export this run uses."""
+        return FeatureSelection(self.local_features, self.global_features, self.target_fields)
 
     @property
     def accumulation_steps(self) -> int:
@@ -297,6 +388,11 @@ TOML_KEYS = {
     "data.lazy": "lazy_loading",
     "data.cache_frames": "cache_frames",
     "data.static_cache_mb": "static_cache_mb",
+    "data.local_features": "local_features",
+    "data.global_features": "global_features",
+    "data.target_fields": "target_fields",
+    "data.start_frame": "start_frame",
+    "data.end_frame": "end_frame",
 
     "model.architecture": "architecture",
     "model.residual_target": "residual_target",
@@ -307,11 +403,6 @@ TOML_KEYS = {
     "model.meshgraphnets.num_mlp_layers": "num_mlp_layers",
     "model.meshgraphnets.num_message_passing_steps": "num_message_passing_steps",
     "model.meshgraphnets.aggregation": "aggregation",
-    # former, misspelled section [model.meshgraphnet] (up to v0.2.0, see ARCHITECTURES)
-    "model.meshgraphnet.latent_size": "latent_size",
-    "model.meshgraphnet.num_mlp_layers": "num_mlp_layers",
-    "model.meshgraphnet.num_message_passing_steps": "num_message_passing_steps",
-    "model.meshgraphnet.aggregation": "aggregation",
 
     "model.mgn_t.latent_size": "mgn_t_latent_size",
     "model.mgn_t.token_dim": "mgn_t_token_dim",
@@ -338,7 +429,6 @@ TOML_KEYS = {
 
     "training.scheduler.type": "scheduler",
     "training.scheduler.min_lr": "min_learning_rate",
-    "training.scheduler.lr": "min_learning_rate",            # former name
     "training.scheduler.decay_steps": "lr_decay_steps",
     "training.scheduler.patience": "scheduler_patience",
     "training.scheduler.factor": "scheduler_factor",
@@ -346,8 +436,6 @@ TOML_KEYS = {
     "training.rollout_validation.enabled": "rollout_validation",
     "training.rollout_validation.every_n_epochs": "rollout_validation_every",
     "training.rollout_validation.max_sequences": "rollout_validation_max_sequences",
-    # former single selection metric, translated into the criteria by from_toml
-    "training.rollout_validation.selection_metric": "selection_metric",
 
     "training.early_stopping.enabled": "early_stopping",
     "training.early_stopping.patience": "early_stopping_patience",
@@ -363,16 +451,28 @@ TOML_KEYS = {
     "scheduled_sampling.start_ratio": "scheduled_sampling_start_ratio",
     "scheduled_sampling.end_ratio": "scheduled_sampling_end_ratio",
     "scheduled_sampling.warmup_epochs": "scheduled_sampling_warmup_epochs",
-    # former section [rollout]
-    "rollout.scheduled_sampling": "scheduled_sampling",
-    "rollout.scheduled_sampling_start_ratio": "scheduled_sampling_start_ratio",
-    "rollout.scheduled_sampling_end_ratio": "scheduled_sampling_end_ratio",
-    "rollout.scheduled_sampling_warmup_epochs": "scheduled_sampling_warmup_epochs",
 
     "checkpointing.checkpoint_dir": "checkpoint_dir",
     "checkpointing.save_every": "save_every",
     "checkpointing.log_every": "log_every",
     "checkpointing.resume": "resume",
+}
+
+# Former TOML keys, translated when a config is read (never written).
+LEGACY_TOML_KEYS = {
+    # misspelled section [model.meshgraphnet] (up to v0.2.0, see ARCHITECTURES)
+    "model.meshgraphnet.latent_size": "latent_size",
+    "model.meshgraphnet.num_mlp_layers": "num_mlp_layers",
+    "model.meshgraphnet.num_message_passing_steps": "num_message_passing_steps",
+    "model.meshgraphnet.aggregation": "aggregation",
+    "training.scheduler.lr": "min_learning_rate",
+    # single selection metric, translated into the criteria by from_toml
+    "training.rollout_validation.selection_metric": "selection_metric",
+    # section [rollout]
+    "rollout.scheduled_sampling": "scheduled_sampling",
+    "rollout.scheduled_sampling_start_ratio": "scheduled_sampling_start_ratio",
+    "rollout.scheduled_sampling_end_ratio": "scheduled_sampling_end_ratio",
+    "rollout.scheduled_sampling_warmup_epochs": "scheduled_sampling_warmup_epochs",
 }
 
 # Keys of the former early stopping (one metric with min_delta, smoothing and the

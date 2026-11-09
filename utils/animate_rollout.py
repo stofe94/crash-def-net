@@ -6,16 +6,18 @@ the predictions of one or more models.
 Reads rollout folders written by ``predict/rollout.py`` with the ``.vtu`` export
 (``<split>/<trajectory>/tNNNN.vtu``) and renders one trajectory side by side: the
 ground truth (FEM) of the first rollout, then the prediction of every rollout,
-coloured by von Mises stress on one scale. The actuator (node type 1, read from
-the rollout's ``dataset.db``) is grey. All rollouts must come from the same
-dataset and cover the same steps. Writes ``rollout_<trajectory>.gif`` to a new
+coloured by von Mises stress on one scale (datasets without a stress: by their
+first result field). The actuator (node type 1, read from
+the rollout's ``dataset.db``) is grey; the lines that tie a free rigid body
+together (export ``--free-rigid-parts``) are not drawn. All rollouts must come from
+the same dataset and cover the same steps. Writes ``rollout_<trajectory>.gif`` to a new
 folder ``evaluations/<YYYYMMDD_HHMMSS>_animation/``, or to ``--output``.
 
 Rendering runs off-screen with Mesa's software renderer, so the frames are the
 same on every machine and need neither a GPU nor a display (set
 ``LIBGL_ALWAYS_SOFTWARE=0`` to use the GPU driver instead). Needs ``pyvista``.
 
-The animation in the README and in docs/results.md:
+The animation in docs/results/deforming-plate.md:
 
     python utils/animate_rollout.py rollouts/<mgn_t rollout> rollouts/<mgn rollout> \\
         --trajectory test_traj0136 --output docs/assets/rollout_test_traj0136.gif
@@ -37,7 +39,7 @@ import sys
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
 # Before VTK loads OpenGL: off-screen, the GPU driver of WSL2 (D3D12) returns a
 # black first frame or crashes; in software the whole GIF takes ~20 s.
@@ -60,6 +62,7 @@ from dataset_preprocessor.dataset import connect_readonly  # noqa: E402
 from dataset_preprocessor.graph_features import NODE_TYPE_ACTUATOR  # noqa: E402
 from utils.plot_losses import SURFACE, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY  # noqa: E402
 from utils.timezone import now  # noqa: E402
+from utils.units import SI_STRESS, STRESS_UNITS, stress_display  # noqa: E402
 
 EVALUATIONS_DIR = _REPO_ROOT / "evaluations"
 # "meshgraphnet": misspelling of rollouts from v0.2.0 checkpoints (see train/config.py)
@@ -84,6 +87,25 @@ class Rollout:
     steps: List[Path]        # tNNNN.vtu of the trajectory, in step order
 
     @property
+    def initial_frame(self) -> int:
+        """Raw frame of the run the rollout starts from; it and the frames before are ground
+        truth (rollouts up to v0.4.0 with history: the first two frames)."""
+        recorded = (self.info.get("results") or {}).get("initial_frame")
+        if recorded is not None:
+            return int(recorded)
+        metadata = self.info["data"].get("metadata") or {}
+        return int(metadata.get("first_frame", metadata.get("history", 0)))
+
+    @property
+    def frames(self) -> List[int]:
+        """Raw frame of the run of every file (tNNNN). Up to v0.4.0 the files counted the
+        rollout steps from 1, without the given frames."""
+        numbers = [int(path.stem[1:]) for path in self.steps]
+        if "initial_frame" in (self.info.get("results") or {}) or 0 in numbers:
+            return numbers
+        return [n + self.initial_frame for n in numbers]
+
+    @property
     def label(self) -> str:
         model = self.info["model"]
         name = ARCHITECTURE_NAMES.get(model["architecture"], model["architecture"])
@@ -100,7 +122,7 @@ def load_rollout(folder: Path, trajectory: Optional[str]) -> Rollout:
     info_path = folder / "rollout_info.json"
     if not info_path.exists():
         raise SystemExit(f"{folder}: no rollout_info.json (not a rollout folder)")
-    with open(info_path) as f:
+    with open(info_path, encoding="utf-8") as f:
         info = json.load(f)
     trajectory = trajectory or info["results"]["sequences"][0]
     steps = sorted((folder / info["data"]["split"] / trajectory).glob("t[0-9]*.vtu"))
@@ -110,9 +132,10 @@ def load_rollout(folder: Path, trajectory: Optional[str]) -> Rollout:
     return Rollout(folder, info, steps)
 
 
-def node_types(rollouts: Sequence[Rollout], trajectory: str) -> np.ndarray:
-    """Raw node types of the trajectory from the first dataset.db that is found
-    (recorded absolute path, else the path relative to the repository)."""
+def read_nodes(rollouts: Sequence[Rollout], trajectory: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Raw node types of the trajectory and the mask of its nodes in free rigid bodies,
+    from the first dataset.db that is found (recorded absolute path, else the path
+    relative to the repository)."""
     candidates = [Path(p) for r in rollouts for p in (
         r.info["data"]["dataset_db"]["absolute_path"],
         _REPO_ROOT / r.info["data"]["dataset_db"]["path"])]
@@ -122,14 +145,24 @@ def node_types(rollouts: Sequence[Rollout], trajectory: str) -> np.ndarray:
                          + "\n  ".join(map(str, dict.fromkeys(candidates))))
     conn = connect_readonly(db)
     try:
-        row = conn.execute("SELECT node_type FROM trajectories WHERE split = ? AND "
-                           "sequence_id = ?", (rollouts[0].info["data"]["split"],
-                                               trajectory)).fetchone()
+        info = dict(conn.execute("SELECT key, value FROM info WHERE key IN "
+                                 "('rigid_bodies', 'component_names')"))
+        bodies = json.loads(info.get("rigid_bodies", "[]"))
+        # Exports without components have no such column.
+        components = "components" if bodies else "NULL"
+        row = conn.execute(f"SELECT node_type, {components} FROM trajectories WHERE split = ? "
+                           "AND sequence_id = ?", (rollouts[0].info["data"]["split"],
+                                                   trajectory)).fetchone()
     finally:
         conn.close()
     if row is None:
         raise SystemExit(f"{db}: no trajectory {trajectory}")
-    return np.frombuffer(row[0], dtype=np.uint8)
+    node_type = np.frombuffer(row[0], dtype=np.uint8)
+    if not bodies:
+        return node_type, np.zeros(len(node_type), dtype=bool)
+    names = json.loads(info["component_names"])
+    return node_type, np.isin(np.frombuffer(row[1], dtype=np.uint32),
+                              [names.index(name) for name in bodies])
 
 
 def check_consistent(rollouts: Sequence[Rollout]) -> None:
@@ -141,9 +174,35 @@ def check_consistent(rollouts: Sequence[Rollout]) -> None:
             raise SystemExit(f"{r.folder.name}: other rollout steps than {first.folder.name}")
 
 
-def read_frames(rollouts: Sequence[Rollout]):
-    """Per step: positions and stress [kPa] of the ground truth and of each rollout."""
+def colour_field(step: Path) -> Optional[str]:
+    """The result field the panels are coloured by: the stress if the rollout has it,
+    else its first other result field; None if it has none."""
     import pyvista as pv
+
+    names = [name[:-len("_gt")] for name in pv.read(step).point_data.keys()
+             if name.endswith("_gt")]
+    fields = [name for name in names if name != "world_pos" and not name.startswith("velocity_")]
+    return "stress" if "stress" in fields else (fields[0] if fields else None)
+
+
+def field_scale(field: Optional[str], stress_unit: str = SI_STRESS) -> Tuple[float, str]:
+    """Factor from the stored values to the colour scale, and its title; the stress of
+    data in ``stress_unit`` as the reports show it (``utils.units.stress_display``)."""
+    if field == "stress":
+        unit = stress_display(stress_unit)[1]
+        return STRESS_UNITS[stress_unit] / STRESS_UNITS[unit], f"von Mises stress [{unit}]"
+    return 1.0, field or "no result field"
+
+
+def read_frames(rollouts: Sequence[Rollout], field: Optional[str], factor: float = 1.0):
+    """Per step: positions and the values of ``field`` (times ``factor``, see
+    ``field_scale``; 0 without a field) of the ground truth and of each rollout."""
+    import pyvista as pv
+
+    def values(mesh, kind):
+        if field is None:
+            return np.zeros(mesh.n_points)
+        return np.asarray(mesh.point_data[f"{field}_{kind}"]) * factor
 
     frames = []
     for step in range(len(rollouts[0].steps)):
@@ -153,15 +212,15 @@ def read_frames(rollouts: Sequence[Rollout]):
             if not np.allclose(mesh.point_data["world_pos_gt"], truth, atol=1e-6):
                 raise SystemExit(f"{r.folder.name}: other ground truth than "
                                  f"{rollouts[0].folder.name} (step {step + 1})")
-        frames.append([(truth, np.asarray(meshes[0].point_data["stress_gt"]) / 1e3)]
-                      + [(np.asarray(m.points), np.asarray(m.point_data["stress_pred"]) / 1e3)
-                         for m in meshes])
+        frames.append([(truth, values(meshes[0], "gt"))]
+                      + [(np.asarray(m.points), values(m, "pred")) for m in meshes])
     return frames
 
 
-def body_surfaces(first_step: Path, node_type: np.ndarray):
+def body_surfaces(first_step: Path, node_type: np.ndarray, rigid: np.ndarray):
     """Surfaces of the deformable bodies and of the actuator, each with the
-    indices of its points in the full mesh (point data ``node``)."""
+    indices of its points in the full mesh (point data ``node``). Without the lines of
+    the nodes in ``rigid``: they tie a free rigid body together and are no structure."""
     import pyvista as pv
 
     grid = pv.read(first_step)
@@ -170,11 +229,16 @@ def body_surfaces(first_step: Path, node_type: np.ndarray):
                          f"{len(node_type)} nodes in this trajectory")
     grid.clear_data()
     grid.point_data["node"] = np.arange(grid.n_points)
-    # Bodies share no cells, so the first node of a cell tells its body.
-    actuator_cell = node_type[grid.cell_connectivity[grid.offset[:-1]]] == NODE_TYPE_ACTUATOR
+    # Bodies share no cells, so the first node of a cell tells its body. The cell
+    # arrays come from VTK: pyvista renamed its accessor for the offsets in 0.49.
+    cells = grid.GetCells()
+    first_node = pv.convert_array(cells.GetConnectivityArray())[
+        pv.convert_array(cells.GetOffsetsArray())[:-1]]
+    actuator_cell = node_type[first_node] == NODE_TYPE_ACTUATOR
+    tie = rigid[first_node] & (grid.celltypes == pv.CellType.LINE)
     with warnings.catch_warnings():   # pyvista >= 0.47 announces a new default algorithm
         warnings.filterwarnings("ignore", message=".*`algorithm`")
-        return (grid.extract_cells(np.flatnonzero(~actuator_cell)).extract_surface(),
+        return (grid.extract_cells(np.flatnonzero(~actuator_cell & ~tie)).extract_surface(),
                 grid.extract_cells(np.flatnonzero(actuator_cell)).extract_surface())
 
 
@@ -227,8 +291,11 @@ def render(frames, structure, actuator, stress_max: float, cmap) -> List[np.ndar
     return images
 
 
-def compose(images, labels, stress_max: float, cmap, footer: str) -> List[Image.Image]:
-    """Titles, colour bar, footer and step counter around the rendered row."""
+def compose(images, labels, stress_max: float, cmap, footer: str,
+            scale_title: str = "von Mises stress [kPa]",
+            counters: Optional[Sequence[str]] = None) -> List[Image.Image]:
+    """Titles, colour bar, footer and counter (``counters``, one per image; default:
+    step k / n) around the rendered row."""
     n_panels = len(labels)
     width = PANEL_PX[0] * n_panels
     height = HEADER_PX + PANEL_PX[1] + LEGEND_PX + FOOTER_PX
@@ -244,16 +311,16 @@ def compose(images, labels, stress_max: float, cmap, footer: str) -> List[Image.
                        orientation="horizontal")
     bar.outline.set_visible(False)
     cax.tick_params(labelsize=7.5, colors=TEXT_SECONDARY, length=2)
-    cax.set_title("von Mises stress [kPa]", fontsize=7.5, color=TEXT_SECONDARY, loc="left",
-                  pad=3)
+    cax.set_title(scale_title, fontsize=7.5, color=TEXT_SECONDARY, loc="left", pad=3)
     fig.text(0.01, 5 / height, footer, fontsize=7.5, color=TEXT_MUTED, va="bottom")
-    counter = fig.text(0.99, 5 / height, "", fontsize=7.5, color=TEXT_MUTED, ha="right",
-                       va="bottom")
+    # Left of the colour bar, clear of the footer, which can span the whole width.
+    counter = fig.text(0.01, (FOOTER_PX + 18) / height, "", fontsize=8.5,
+                       color=TEXT_SECONDARY, ha="left", va="bottom")
 
     frames = []
     for step, image in enumerate(images, start=1):
         shown.set_data(image)
-        counter.set_text(f"step {step} / {len(images)}")
+        counter.set_text(counters[step - 1] if counters else f"step {step} / {len(images)}")
         fig.canvas.draw()
         frames.append(Image.fromarray(np.asarray(fig.canvas.buffer_rgba())[..., :3]))
     plt.close(fig)
@@ -266,8 +333,28 @@ def save_gif(frames: List[Image.Image], path: Path) -> None:
     palette = sample.quantize(colors=255, method=Image.Quantize.MAXCOVERAGE)
     indexed = [f.quantize(palette=palette, dither=Image.Dither.NONE) for f in frames]
     path.parent.mkdir(parents=True, exist_ok=True)
-    indexed[0].save(path, save_all=True, append_images=indexed[1:], loop=0,
+    partial = path.with_name(f"{path.name}.part")   # stopped while saving: no GIF that looks finished
+    indexed[0].save(partial, format="GIF", save_all=True, append_images=indexed[1:], loop=0,
                     duration=[FRAME_MS] * (len(frames) - 1) + [LAST_FRAME_MS])
+    partial.replace(path)
+
+
+def nice_ceiling(value: float) -> float:
+    """The smallest 1, 2 or 5 times a power of ten that is at least ``value`` (> 0);
+    1 for no positive value."""
+    if not value > 0:
+        return 1.0
+    power = 10.0 ** math.floor(math.log10(value))
+    return next(f * power for f in (1, 2, 5, 10) if f * power >= value)
+
+
+def scale_end(field: Optional[str], peak: float) -> float:
+    """Upper end of the colour scale for ``peak`` in the units of the scale: a stress of
+    at least 50 up to the next 50, any other value by ``nice_ceiling``, e.g. a stress in
+    GPa, which a step of 50 would leave without colours."""
+    if field == "stress" and peak >= 50.0:
+        return 50.0 * math.ceil(peak / 50.0)
+    return nice_ceiling(peak)
 
 
 def new_output_dir() -> Path:
@@ -279,7 +366,8 @@ def new_output_dir() -> Path:
     return path
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Command line options; the reference in docs/reference/cli.md is generated from them."""
     parser = argparse.ArgumentParser(
         description="Animated GIF of one rollout trajectory: ground truth and models.")
     parser.add_argument("rollouts", nargs="+", type=Path,
@@ -291,11 +379,20 @@ def main(argv=None) -> int:
                         help="panel titles, one per rollout "
                              "(default: architecture and parameters)")
     parser.add_argument("--stress-max", type=float, default=None,
-                        help="upper end of the colour scale in kPa (default: 99.9th "
-                             "percentile of the ground-truth stress, rounded up to 50 kPa)")
+                        help="upper end of the colour scale: the stress in kPa, for data in "
+                             "MPa or GPa (--stress-unit of the export) in that unit; for a "
+                             "dataset without stress in the unit of its first result field "
+                             "(default: 99.9th percentile of the ground truth, a stress of at "
+                             "least 50 rounded up to the next 50, any other value to 1, 2 or 5 "
+                             "times a power of ten)")
     parser.add_argument("--output", type=Path, default=None,
                         help="GIF file (default: evaluations/<time>_animation/"
                              "rollout_<trajectory>.gif)")
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
     if args.labels is not None and len(args.labels) != len(args.rollouts):
         parser.error(f"{len(args.labels)} labels for {len(args.rollouts)} rollouts")
@@ -305,27 +402,33 @@ def main(argv=None) -> int:
     rollouts = [first] + [load_rollout(f, trajectory) for f in args.rollouts[1:]]
     check_consistent(rollouts)
 
-    frames = read_frames(rollouts)
-    structure, actuator = body_surfaces(first.steps[0], node_types(rollouts, trajectory))
+    field = colour_field(first.steps[0])
+    data = first.info["data"]
+    factor, scale_title = field_scale(field, data["metadata"].get("stress_unit", SI_STRESS))
+    frames = read_frames(rollouts, field, factor)
+    structure, actuator = body_surfaces(first.steps[0], *read_nodes(rollouts, trajectory))
     # A percentile, not the maximum: single peaks would wash out the colours.
-    peak = float(np.percentile(np.concatenate([frame[0][1] for frame in frames]), 99.9))
-    stress_max = args.stress_max or 50.0 * max(1, math.ceil(peak / 50.0))
+    peak = float(np.nanpercentile(np.concatenate([frame[0][1] for frame in frames]), 99.9))
+    stress_max = args.stress_max or scale_end(field, peak)
     cmap = LinearSegmentedColormap.from_list("stress", STRESS_COLORS)
 
-    data = first.info["data"]
     stride = data["metadata"].get("time_stride", 1)
     split_note = " (not seen in training)" if data["split"] == "test" else ""
+    initial = first.initial_frame
     footer = (f"{data['metadata'].get('dataset', '')} · {trajectory}{split_note} · "
-              f"autoregressive rollout, {len(frames)} steps at stride {stride}"
+              f"autoregressive rollout, {sum(f > initial for f in first.frames)} steps "
+              f"at stride {stride}"
               + (" · grey: actuator" if actuator.n_points else ""))
     labels = ["Ground truth (FEM)"] + (args.labels or [r.label for r in rollouts])
 
     images = render(frames, structure, actuator, stress_max, cmap)
-    gif = compose(images, labels, stress_max, cmap, footer)
+    counters = [f"frame {f} / {first.frames[-1]}" + (" · ground truth" if f <= initial else "")
+                for f in first.frames]
+    gif = compose(images, labels, stress_max, cmap, footer, scale_title, counters)
     output = args.output or new_output_dir() / f"rollout_{trajectory}.gif"
     save_gif(gif, output)
     print(f"{output} ({len(gif)} frames, {output.stat().st_size / 1e6:.1f} MB, "
-          f"stress scale 0-{stress_max:g} kPa)")
+          f"colour scale 0-{stress_max:g}: {scale_title})")
     return 0
 
 

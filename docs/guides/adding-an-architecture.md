@@ -8,7 +8,9 @@ steps.
 This holds for architectures that take the graph of the pipeline and predict the targets
 per node. Depending on how an architecture is built, other inputs, graph structures,
 outputs or training procedures can need changes to the pipeline as well, e.g. to the
-graph building, the training loop or the rollout.
+graph building, the training loop or the rollout. Such changes model the physics of the
+crash in more detail; inputs without a physical role are not added
+([design principles](../concepts/overview.md#design-principles)).
 
 ## 1. The model (`models/<name>.py`)
 
@@ -25,7 +27,8 @@ class MyModel(nn.Module):
         ...
 ```
 
-The input dimensions come from the dataset's `metadata.json`; the model does not need to
+The input dimensions come from the dataset's `metadata.json` and the
+[features the config selects](training.md#choose-the-features); the model does not need to
 know the feature layout. `data` is a (batched) PyTorch Geometric graph with
 
 | Attribute | Shape | Content |
@@ -36,17 +39,25 @@ know the feature layout. `data` is a (batched) PyTorch Geometric graph with
 | `mesh_pos` | (N, 3) | undeformed positions (e.g. for positional encodings) |
 | `world_pos` | (N, 3) | current positions, raw units |
 | `batch` | (N,) | graph index of each node; missing for a single graph (e.g. in the rollout) |
+| `u` | (B, global_in_dim) | normalized run parameters, one row per graph; only for datasets with run parameters |
 
-Details of the features: [data.md](data.md). The building blocks of the existing models
+For a dataset with run parameters `create_model` also passes `global_in_dim`; a model
+that accepts it can use them (the existing ones in their
+[global block](../concepts/models.md#global-block-run-parameters)).
+
+Details of the features: [data and graphs](../concepts/graphs.md). The building blocks of the existing models
 can be reused, e.g. `make_mlp` and `GraphNetBlock` from `models/meshgraphnets.py`.
 
 ## 2. The config (`train/config.py`)
 
 - Add the name to `ARCHITECTURES`.
 - Add a field per hyperparameter to `TrainingConfig`, prefixed with the name, with a
-  default (the paper value where there is one), e.g. `my_model_latent_size: int = 64`.
+  default (the paper value where there is one) and a description, e.g.
+  `my_model_latent_size: int = setting(64, "width of the latents")`.
 - Map the TOML keys onto the fields in `TOML_KEYS`, e.g.
   `"model.my_model.latent_size": "my_model_latent_size"`.
+- Rewrite the [configuration reference](../reference/configuration.md) from the code:
+  `python utils/docs_reference.py` adds the section `[model.my_model]`.
 
 The config file then gets its own section:
 
@@ -60,10 +71,11 @@ latent_size = 64
 
 ## 3. Building the model (`train/trainer.py`)
 
-Add a branch to `create_model` that passes the dimensions and the hyperparameters:
+Add a branch to `create_model`, before the final `else` that builds MeshGraphNets, that
+passes the dimensions and the hyperparameters:
 
 ```python
-if config.architecture == "my_model":
+elif config.architecture == "my_model":
     from models.my_model import MyModel
     model = MyModel(**dims, latent_size=config.my_model_latent_size)
 ```
@@ -83,23 +95,11 @@ tables and reports, in `utils/animate_rollout.py` the panel title of the animati
 ```bash
 # quick check on the CPU with the small dataset (architecture = "my_model" in the config)
 python train/train.py --config configs/my_model.toml --epochs 1
-
-# full comparison with MeshGraphNets under the comparison protocol: copy
-# protocols/deforming_plate_s4_t150.toml, change only [model] (world_edges =
-# "self_contact_aware", as the comparable MeshGraphNets baseline), train, roll out
-python train/train.py --config configs/my_model_s4_t150.toml
-python predict/rollout.py --checkpoint checkpoints/<run>/best_model.pt \
-    --data-dir data/deforming_plate_s4_t150 --split test
-python utils/check_protocol.py rollouts/<mgn baseline rollout> rollouts/<my_model rollout>
-python utils/evaluate_run.py rollouts/<my_model rollout>
-python utils/compare_paper.py rollouts/<my_model rollout> rollouts/<mgn baseline rollout>
 ```
 
-The [comparison protocol](comparison-protocol.md) fixes dataset, seed, budget and
-training recipe, lists the allowed variations (world edges), names the two MeshGraphNets
-baselines (the paper's original and the comparable one for new architectures) and
-explains how to read the per-trajectory comparison.
+The full comparison with MeshGraphNets follows the
+[steps of the comparison protocol](../guides/comparison-protocol.md#steps).
 
 Everything else applies to the new model automatically: position noise, rollout
 validation and model selection, early stopping, the optional residual target, the
-paper metrics, the `.vtu` export and the traceability records of every rollout.
+rollout metrics and the `.vtu` export.

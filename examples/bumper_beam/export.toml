@@ -1,0 +1,49 @@
+# ============================================================
+# CrashDefNet — bumper beam against a pole: export
+# ============================================================
+# OpenRadioss runs of BumperBeamCrashExample (Hugging Face), with the pole remeshed by
+# utils/remesh_pole.py so that it acts through contact edges. Walk-through:
+# docs/getting-started/bumper-beam.md
+#
+#   python utils/remesh_pole.py --out-dir datasets/BumperBeamCrashExample_remeshed/RAW_DATA
+#   python -m dataset_preprocessor.export --config examples/bumper_beam/export.toml --list-parts
+#   python -m dataset_preprocessor.export --config examples/bumper_beam/export.toml
+#
+# Every key: docs/reference/configuration.md.
+# ============================================================
+
+[raw]
+format  = "d3plot"     # d3plot converted from OpenRadioss, with the starter deck next to it
+dir     = "datasets/BumperBeamCrashExample_remeshed/RAW_DATA"
+# One source per split: train, val, test. Train and val take contiguous ranges of
+# TRAINING_DATA without overlap; the 7 runs of VALIDATION_DATA are the test split.
+sources = ["TRAINING_DATA", "TRAINING_DATA", "VALIDATION_DATA"]
+
+[dataset]
+out_dir     = "data/bumper_beam_remeshed"
+n_train     = 110
+n_val       = 14
+n_test      = 7
+num_steps   = 11      # every state: 0 to 100 ms at 10 ms
+time_stride = 1
+history     = 1       # previous velocity and stress as inputs: the motion comes from inertia
+
+[units]               # of the decks: kg, mm, ms
+length = "mm"
+stress = "GPa"
+
+# What goes into the dataset. Not listed, and so left out: the shells "New SECT 1", which
+# only display a section of the output and carry no stress.
+[components]
+"crash_box_*"          = "deformable"
+"BumperBeam_*"         = "deformable"
+"CONNECTION_SPOTWELD*" = "deformable"
+"Body_in_White"        = "free_rigid"   # rigid body with mass: its motion results from the crash
+"RWALL"                = "actuator"     # the remeshed pole, standing still
+
+[contact]
+radius         = 30       # mm
+use_deck_walls = false    # the pole acts through contact edges, not as wall features
+
+[features]
+local = ["thickness"]     # shell thickness from /PROP/SHELL of the starter deck

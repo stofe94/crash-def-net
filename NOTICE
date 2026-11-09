@@ -1,4 +1,36 @@
 CrashDefNet
 Copyright 2026 Felix Stocker
 
-This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+This product is licensed under the GNU Affero General Public License, Version 3
+(see LICENSE). Releases up to v0.4.0 were licensed under the Apache License, Version 2.0.
+
+Third-party material
+
+The images and figures below are derived from simulation data of third parties: they show
+the simulation results of a dataset, or evaluate models trained on it against them. They
+were made by CrashDefNet from the runs of these datasets. The datasets themselves are not
+part of this repository, and the AGPL does not extend to the data shown in these images.
+
+BumperBeamCrashExample
+(https://huggingface.co/datasets/AIRBORNEPANDA/BumperBeamCrashExample), whose decks carry
+the notice "Copyright Altair Engineering, CC BY-NC 4.0"; rendered from its runs with the
+pole remeshed. These images are licensed under the Creative Commons
+Attribution-NonCommercial 4.0 International License
+(https://creativecommons.org/licenses/by-nc/4.0/):
+
+  docs/assets/bumper_beam_test_traj0128.gif
+  docs/assets/bumper_beam_error_per_step.png
+
+deforming_plate of DeepMind's MeshGraphNets release
+(https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets). DeepMind
+states no explicit license for the datasets (the Apache License 2.0 of that repository
+covers its code), so the terms of the source apply to the data shown in these images, in
+particular for commercial use:
+
+  docs/assets/plates/plate_13.png, plate_18.png, plate_29.png, plate_38.png,
+    plate_76.png, plate_88.png (also shown by the CrashDefNet app)
+  docs/assets/rollout_test_traj0136.gif
+  docs/assets/absolute_errors.png
+  docs/assets/error_per_step.png
+  docs/assets/error_per_trajectory.png
+  docs/assets/first_training.png

@@ -3,9 +3,10 @@
 This protocol fixes how a new architecture is compared with MeshGraphNets on a subset
 of DeepMind's original `deforming_plate` splits: same dataset, budget, recipe and
 evaluation; only the model and a few declared variations change, checked with
-[`utils/check_protocol.py`](../utils/check_protocol.py). The subset is small on purpose,
+[`utils/check_protocol.py`](https://github.com/stofe94/crash-def-net/blob/main/utils/check_protocol.py). The subset is small on purpose,
 so that a run takes hours on one GPU; the numbers compare with each other, not with the
-papers ([results](results.md#why-the-numbers-are-not-comparable-with-the-paper)).
+papers ([results](../results/deforming-plate.md#why-the-numbers-are-not-comparable-with-the-paper)). A
+walk-through with both architectures: [compare architectures](compare-architectures.md).
 
 ## Baselines
 
@@ -13,14 +14,14 @@ Results are related to MeshGraphNets in two ways:
 
 | Reference | What it is | Role |
 |---|---|---|
-| Original | the published results of the MeshGraphNets paper, with world edges between all node pairs closer than r_W that are not mesh neighbours (`world_edges = "all"`; Pfaff et al. 2021, Sec. 3.1 on p. 4); taken from the paper, not reproduced here | relates results to the literature ([`compare_paper.py`](rollout-and-evaluation.md#comparison-with-the-paper)) |
+| Original | the published results of the MeshGraphNets paper, with world edges between all node pairs closer than r_W that are not mesh neighbours (`world_edges = "all"`; Pfaff et al. 2021, Sec. 3.1 on p. 4); taken from the paper, not reproduced here | relates results to the literature ([`compare_paper.py`](../guides/evaluation.md#compare-with-the-papers)) |
 | Comparable baseline | MeshGraphNets in paper size, trained under this protocol with `world_edges = "self_contact_aware"` (declared variation) | the reference for new architectures, with the contact edges they use (`check_protocol.py`) |
 
 New architectures are compared with the comparable baseline. The reason is scalability:
 `"all"` also links near neighbours inside a body, their number grows with the mesh
-density (here up to 250,000 edges and ~13.5 GiB of activations for one graph), which
+density ([memory](../concepts/scaling.md#memory-of-one-sample)), which
 does not carry over to crash meshes; `self_contact_aware` keeps only contact between
-bodies and self-contact ([data.md](data.md#world-edge-variants-model-world_edges)). With
+bodies and self-contact ([world edge variants](../concepts/graphs.md#world-edge-variants-model-world_edges)). With
 the same edges on both sides a difference comes from the architecture. Every result
 states which reference it is compared with. The protocol config itself keeps the
 paper's setting `"all"`.
@@ -28,14 +29,14 @@ paper's setting `"all"`.
 ## Steps
 
 ```bash
-# 1) Dataset (once, ~90 s, ~330 MB; needs train, valid and test.tfrecord, see docs/installation.md)
+# 1) Dataset (once, ~110 s, ~330 MB; needs train, valid and test.tfrecord, see Installation)
 python -m dataset_preprocessor.export --out-dir data/deforming_plate_s4_t150 \
-    --source-tfrecord train.tfrecord valid.tfrecord test.tfrecord --select-seed 42 \
+    --sources train.tfrecord valid.tfrecord test.tfrecord --select-seed 42 \
     --n-train 100 --n-val 30 --n-test 20 --num-steps 100 --time-stride 4
 
 # 2) Training: copy the protocol config, change only [model] (and checkpoint_dir);
 #    world_edges = "self_contact_aware", as the comparable baseline
-cp protocols/deforming_plate_s4_t150.toml configs/my_model_s4_t150.toml
+mkdir -p configs && cp protocols/deforming_plate_s4_t150.toml configs/my_model_s4_t150.toml
 python train/train.py --config configs/my_model_s4_t150.toml
 
 # 3) Rollout of the selected model on the whole test split
@@ -50,10 +51,8 @@ python utils/evaluate_run.py rollouts/<new rollout>
 python utils/compare_paper.py rollouts/<new rollout> rollouts/<baseline rollout>
 ```
 
-The comparable baseline is trained with the protocol config and
-`world_edges = "self_contact_aware"`. `check_protocol.py` checks against
-`protocols/deforming_plate_s4_t150.toml` unless `--protocol` names another protocol
-config.
+`check_protocol.py` checks against `protocols/deforming_plate_s4_t150.toml` unless
+`--protocol` names another protocol config.
 
 ## Dataset
 
@@ -63,13 +62,13 @@ config.
 | Frames | 100 per trajectory at stride 4 (400 simulation steps) → 99 samples per trajectory |
 | Samples | 9,900 train / 2,970 val / 1,980 test |
 
-The dataset is not distributed: everyone exports it with step 1. All rollouts of one
+The dataset is not distributed: everyone exports it with step 1 above. All rollouts of one
 comparison must come from the same export, which the check verifies by the content
 fingerprint: train the baseline on your own export.
 
 ## Training
 
-The protocol config [`protocols/deforming_plate_s4_t150.toml`](../protocols/deforming_plate_s4_t150.toml)
+The protocol config [`protocols/deforming_plate_s4_t150.toml`](https://github.com/stofe94/crash-def-net/blob/main/protocols/deforming_plate_s4_t150.toml)
 holds the fixed settings:
 
 | Setting | Value |
@@ -92,13 +91,13 @@ not equalized.
 
 Machine settings are free: `data_dir`, data loading (`num_dataloader_workers`, `lazy`),
 `micro_batch_size` (gradient accumulation, the same optimizer step, see
-[training](training.md#what-happens-during-training)), `device`, `checkpoint_dir`,
+[training](../concepts/training.md#loss-and-optimizer-step)), `device`, `checkpoint_dir`,
 `save_every`, `log_every`.
 
 Memory: with `world_edges = "all"` MeshGraphNets in paper size keeps up to ~13.5 GiB of
 activations for the largest graph of this dataset, so the protocol config trains it in
 micro-batches of one graph (`micro_batch_size = 1`, 16 GB GPU). With
-`self_contact_aware` both models of the [results](results.md) train at batch 8 without
+`self_contact_aware` both models of the [results](../results/deforming-plate.md) train at batch 8 without
 micro-batches.
 
 ## Declared variations
@@ -109,14 +108,14 @@ result:
 | Variation | Settings | Why it is open |
 |---|---|---|
 | Architecture | `[model] architecture` and the model's own section | the subject of the comparison |
-| World edges | `world_edges`, `world_edge_exclude_distance` (or `world_edge_exclude_hops` of configs up to v0.3.0) | edge construction that scales to larger meshes |
+| World edges | `world_edges`, `world_edge_exclude_distance` | edge construction that scales to larger meshes |
 
 Dataset, seed, model selection and early stopping are not variations: every model
 trains on the same data with the same seed and is selected by the same rule.
 
 ## Reading the result
 
-The test split holds 20 trajectories. The ± of the paper metrics is the standard error
+The test split holds 20 trajectories. The ± of the rollout metrics is the standard error
 over these trajectories: it shows how different the geometries are, not how precisely a
 model is measured. Both models are evaluated on the same trajectories, so
 `check_protocol.py` compares them **per trajectory** (paired): the difference on each
@@ -124,21 +123,16 @@ trajectory and how often each model has the lower error, for RMSE-all and RMSE-1
 position and stress. Relative differences up to 0.1 % count as equal (numerical noise
 between machines). `--exclude` adds the counts without the given trajectories.
 
-A few trajectories with large deformations can dominate the pooled paper metrics; the
+A few trajectories with large deformations can dominate the pooled rollout metrics; the
 median trajectory is in the report of
-[`utils/evaluate_run.py`](rollout-and-evaluation.md#evaluating-a-run).
+[`utils/evaluate_run.py`](../guides/evaluation.md#evaluate-a-run).
 
 ## Reference run
 
-The comparable baseline: MeshGraphNets in paper size (3.85 M parameters) with
-`world_edges = "self_contact_aware"`, trained for v0.4.0 with the protocol's recipe, all
-60 epochs in 7 h 34 min on an RTX A4000 (about 8 GB of GPU memory), selected epoch 56.
-Its numbers are orientation values; a comparison always uses your own baseline run.
-
-| Test split (20 trajectories, 98 steps) | q RMSE-all [mm] | σ RMSE-all [kPa] | q RMSE-1 [mm] | σ RMSE-1 [kPa] |
-|---|---|---|---|---|
-| all trajectories (pooled) | 26.4 ± 4.9 | 16.1 ± 1.9 | 1.36 ± 0.26 | 7.15 ± 0.77 |
-| median trajectory | 4.64 | 11.0 | 0.277 | 5.22 |
+The comparable baseline of the [deforming plate results](../results/deforming-plate.md): MeshGraphNets in paper
+size with `self_contact_aware`, trained with the protocol's recipe
+([setup](../results/deforming-plate.md#setup), [values](../results/deforming-plate.md#results)). Its numbers are
+orientation values; a comparison always uses your own baseline run.
 
 ## Relation to the MeshGraphNets paper
 

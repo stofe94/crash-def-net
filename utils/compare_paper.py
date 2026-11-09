@@ -3,7 +3,7 @@
 compare_paper.py — Own rollout results next to the MGN-T paper.
 
 Reads rollout folders written by ``predict/rollout.py`` (``rollouts/<...>/``)
-and compares their paper metrics on deforming_plate with MGN-T (Iparraguirre et
+and compares their rollout metrics on deforming_plate with MGN-T (Iparraguirre et
 al., "MeshGraphNet-Transformer", arXiv:2601.23177v4, Table 3 on p. 7) and with
 MeshGraphNets (Pfaff et al., ICLR 2021, arXiv:2010.03409, Table 1 on p. 7). Writes
 a new folder ``evaluations/<YYYYMMDD_HHMMSS>_paper_comparison/`` with
@@ -60,7 +60,9 @@ from utils.plot_losses import (  # noqa: E402
     TEXT_PRIMARY,
     TEXT_SECONDARY,
 )
+from utils.results import current_metric_names  # noqa: E402
 from utils.timezone import now  # noqa: E402
+from utils.units import SI_STRESS, stress_display  # noqa: E402
 
 ROLLOUTS_DIR = _REPO_ROOT / "rollouts"
 EVALUATIONS_DIR = _REPO_ROOT / "evaluations"
@@ -127,11 +129,12 @@ VARIABLE_NAMES = {"q": "Position q", "stress": "Von Mises stress σ"}
 HORIZON_NAMES = {"1": "RMSE-1 (one step)", "all": "RMSE-all (whole rollout)"}
 
 
-def display(key: str) -> Tuple[float, str]:
-    """(factor, unit) that turns an SI value of ``key`` into the table units."""
+def display(key: str, stress_unit: str = SI_STRESS) -> Tuple[float, str]:
+    """(factor, unit) that turns an SI value of ``key`` into the table units; the stress
+    as ``utils.units.stress_display`` for data in ``stress_unit``."""
     if "_r_rmse" in key:
         return 100.0, "%"
-    return (1e3, "mm") if key.startswith("q_") else (1e-3, "kPa")
+    return (1e3, "mm") if key.startswith("q_") else stress_display(stress_unit)
 
 
 def _significant(value: float, digits: int) -> str:
@@ -173,6 +176,36 @@ class Rollout:
         return self.model["training_config"].get("world_edges", "all")   # up to v0.2.0: all
 
     @property
+    def frames(self) -> List[int]:
+        """Raw frames of the run, from the first frame of the dataset to the last predicted
+        one (the summary's ``frames``; older rollouts: from the export settings, from 0)."""
+        summary = self.summary or {}
+        if "frames" in summary:
+            return list(summary["frames"])
+        metadata = self.info["data"].get("metadata") or {}
+        given = 1 + int(metadata.get("first_frame", metadata.get("history", 0)))
+        stride = int(metadata.get("time_stride", 1))
+        return [k * stride for k in range(given + len(summary.get("position_rmse_per_step", [])))]
+
+    @property
+    def initial_frame(self) -> int:
+        """Raw frame the rollout starts from; it and the frames before are ground truth
+        (up to v0.4.0 with history the first two frames)."""
+        summary = self.summary or {}
+        if "initial_frame" in summary:
+            return int(summary["initial_frame"])
+        metadata = self.info["data"].get("metadata") or {}
+        return self.frames[int(metadata.get("first_frame", metadata.get("history", 0)))]
+
+    def over_frames(self, per_step: Sequence[float]) -> Tuple[np.ndarray, np.ndarray]:
+        """Values per rollout step over the raw frames of the run they were predicted for:
+        from the first frame after the initial state on. The given frames carry no value, so
+        that a curve starts with the first prediction instead of an error of 0."""
+        first = self.frames.index(self.initial_frame) + 1
+        frames = np.asarray(self.frames[first:first + len(per_step)])
+        return frames, np.asarray(per_step, float)[:len(frames)]
+
+    @property
     def name(self) -> str:
         architecture = self.model["architecture"]
         variant = ("" if self.world_edges == PAPER_WORLD_EDGES.get(architecture)
@@ -189,15 +222,30 @@ def load_rollout(folder: Path) -> Optional[Rollout]:
     info_path = folder / "rollout_info.json"
     if not info_path.exists():
         return None
-    with open(info_path) as f:
-        info = json.load(f)
+    with open(info_path, encoding="utf-8") as f:
+        info = json.load(f, object_hook=current_metric_names)
     summary_name = (info.get("results") or {}).get(
         "summary_file", f"{info['data']['split']}_rollout_summary.json")
     summary = None
     if info.get("status") == "finished" and (folder / summary_name).exists():
-        with open(folder / summary_name) as f:
-            summary = json.load(f)
+        with open(folder / summary_name, encoding="utf-8") as f:
+            summary = json.load(f, object_hook=current_metric_names)
     return Rollout(folder, info, summary)
+
+
+def dataset_metadata(rollout: Rollout) -> Optional[Dict]:
+    """metadata.json of the rollout's dataset, None if it is not here. rollout_info.json
+    keeps only its scalar entries, not the splits."""
+    data_dir = rollout.info["data"].get("data_dir")
+    if data_dir is None:
+        return None
+    path = Path(data_dir) / "metadata.json"
+    if not path.is_absolute():
+        path = _REPO_ROOT / path
+    if not path.exists():
+        return None
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def node_counts(rollout: Rollout) -> Dict[str, int]:
@@ -211,9 +259,9 @@ def node_counts(rollout: Rollout) -> Dict[str, int]:
 
 def pooled_metrics(rollout: Rollout, exclude: Sequence[str]
                    ) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
-    """Paper metrics of the rollout; without ``exclude`` taken from the summary,
+    """Rollout metrics of the rollout; without ``exclude`` taken from the summary,
     otherwise pooled from the per-trajectory values (weights: node count)."""
-    paper = rollout.summary["paper_metrics"]
+    paper = rollout.summary["rollout_metrics"]
     sequences = rollout.summary["sequences"]
     kept = [sid for sid in sequences if sid not in exclude]
     if len(kept) == len(sequences):
@@ -221,7 +269,7 @@ def pooled_metrics(rollout: Rollout, exclude: Sequence[str]
     nodes = node_counts(rollout)
     out = {}
     for key in ALL_KEYS:
-        values = [(sequences[sid]["paper_metrics"].get(key), nodes.get(sid, 1)) for sid in kept]
+        values = [(sequences[sid]["rollout_metrics"].get(key), nodes.get(sid, 1)) for sid in kept]
         values = [(v, w) for v, w in values if v is not None]
         if not values:
             out[key] = (None, None)
@@ -344,28 +392,35 @@ def plot_steps(own: List[Entry], path: Path) -> None:
     panels = [("position_rmse_per_step", None, 1e3,
                "Position error per step [mm]"),
               ("rmse_per_field_per_step", "stress", 1e-3, "Stress, RMSE per step [kPa]")]
+    first = own[0].rollout
+    first_prediction = first.frames[min(first.frames.index(first.initial_frame) + 1,
+                                        len(first.frames) - 1)]
     for ax, (key, field_name, factor, label) in zip(axes, panels):
+        ax.axvspan(first.frames[0], first_prediction, color=tint(TEXT_MUTED, 0.82),
+                   linewidth=0)   # before the first prediction: ground truth
         for entry in own:
             series = entry.rollout.summary[key]
             series = series[field_name] if field_name else series
-            steps = np.arange(1, len(series) + 1)
-            values = np.array(series) * factor
-            ax.plot(steps, values, color=entry.color, linewidth=2, label=entry.label,
+            frames, values = entry.rollout.over_frames(series)
+            values = values * factor
+            ax.plot(frames, values, color=entry.color, linewidth=2, label=entry.label,
                     solid_joinstyle="round", solid_capstyle="round")
-            ax.text(steps[-1] + 0.6, values[-1], entry.label.split(" · ")[0], va="center",
+            ax.text(frames[-1] + 0.6, values[-1], entry.label.split(" · ")[0], va="center",
                     fontsize=9, color=TEXT_PRIMARY)
-        ax.set_xlim(0, len(steps) * 1.14)
+        start = first.frames[0]
+        ax.set_xlim(start, start + (frames[-1] - start) * 1.14)
         ax.set_ylim(bottom=0)
-        ax.set_xlabel("Rollout step", fontsize=10, color=TEXT_SECONDARY)
+        ax.set_xlabel("Frame of the run", fontsize=10, color=TEXT_SECONDARY)
         ax.set_title(label, loc="left", fontsize=11.5, color=TEXT_PRIMARY, pad=8)
         _style(ax, "both")
     legend = axes[0].legend(fontsize=9, frameon=False, loc="upper left")
     for text in legend.get_texts():
         text.set_color(TEXT_PRIMARY)
     top = _figure_header(fig, "Error over the rollout",
-                         "Mean over all trajectories of the rollout. Position error = length "
-                         "of the error vector per node (internal quantity, not the paper's "
-                         "definition); the paper shows no curve per step.")
+                         "Mean over all trajectories of the rollout, from the first predicted "
+                         "frame on; grey: before the first prediction (ground truth). Position error = length of the error vector per "
+                         "node (internal quantity, not the paper's definition); the paper shows "
+                         "no curve per step.")
     fig.tight_layout(rect=(0, 0, 1, top))
     fig.savefig(path, dpi=180, facecolor=SURFACE)
     plt.close(fig)
@@ -378,8 +433,8 @@ def trajectory_spread(entry: Entry, key: str) -> List[Tuple[float, Optional[str]
     """(value, trajectory) of ``SPREAD_ROWS``: all trajectories pooled (the row's paper
     metric), the median, the best and the worst trajectory."""
     sequences = entry.rollout.summary["sequences"]
-    ranked = sorted((s["paper_metrics"][key], sid) for sid, s in sequences.items()
-                    if s["paper_metrics"].get(key) is not None)
+    ranked = sorted((s["rollout_metrics"][key], sid) for sid, s in sequences.items()
+                    if s["rollout_metrics"].get(key) is not None)
     return [(entry.values[key][0], None), (float(np.median([v for v, _ in ranked])), None),
             ranked[0], ranked[-1]]
 
@@ -524,21 +579,17 @@ def training_summary(rollout: Rollout) -> Dict[str, str]:
     """Conditions of an own result: data, rollout, model, training."""
     info, model = rollout.info, rollout.model
     config = model["training_config"]
-    metadata_path = Path(info["data"]["data_dir"]) / "metadata.json"
-    if not metadata_path.is_absolute():
-        metadata_path = _REPO_ROOT / metadata_path
-    splits, source = {}, rollout.info["data"]["metadata"].get("source_tfrecord", "?")
-    if metadata_path.exists():
-        with open(metadata_path) as f:
-            metadata = json.load(f)
+    splits, source = {}, source_names(rollout.info["data"]["metadata"], "?")
+    metadata = dataset_metadata(rollout)
+    if metadata is not None:
         splits = {k: v["count"] for k, v in metadata.get("splits", {}).items()}
-        source = metadata.get("source_tfrecord", source)
+        source = source_names(metadata, source)
     if not isinstance(source, str):   # one source per split
         source = ", ".join(source)
     history_path = Path(model["checkpoint"]["absolute_path"]).parent / "history.json"
     trained = "unknown"
     if history_path.exists():
-        with open(history_path) as f:
+        with open(history_path, encoding="utf-8") as f:
             history = json.load(f)
         minutes = round(sum(r.get("epoch_time_seconds", 0) for r in history) / 60)
         duration = f"{minutes // 60} h {minutes % 60:02d} min" if minutes >= 60 else \
@@ -609,7 +660,13 @@ def new_output_dir() -> Path:
     return path
 
 
-def main(argv=None) -> int:
+def source_names(metadata: Dict, default):
+    """The sources of an export of any version (``source_tfrecord`` up to v0.4.0)."""
+    return metadata.get("sources", metadata.get("source_tfrecord", default))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Command line options; the reference in docs/reference/cli.md is generated from them."""
     parser = argparse.ArgumentParser(
         description="Compare rollout results with the MGN-T paper (deforming_plate).")
     parser.add_argument("rollouts", nargs="*", type=Path,
@@ -621,7 +678,15 @@ def main(argv=None) -> int:
                              "e.g. test_traj0149")
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="default: evaluations/<time>_paper_comparison")
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
+    # Windows writes redirected output in its code page, which lacks characters such as
+    # σ: replace them there instead of failing at the end (PYTHONUTF8=1 keeps them).
+    sys.stdout.reconfigure(errors="replace")
 
     folders = args.rollouts or sorted(p for p in ROLLOUTS_DIR.iterdir() if p.is_dir())
     loaded = [r for r in (load_rollout(f) for f in folders) if r is not None]

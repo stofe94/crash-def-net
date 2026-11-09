@@ -1,38 +1,42 @@
 # ============================================================
-# CrashDefNet — example training config (deforming_plate)
+# CrashDefNet — deforming_plate: first training (MGN-T)
 # ============================================================
-# MGN-T in a minimal size that trains on a CPU in about two and a half minutes
-# (5 epochs of ~30 s) and runs every stage of the pipeline: loading, training, rollout
-# validation, early stopping, checkpoints and test metrics. Accuracy is not
-# the goal here. For MeshGraphNets set [model] architecture = "meshgraphnets".
+# MGN-T in the size of its paper (arXiv v4, 0.51 M parameters) on 40 plates of
+# test.tfrecord: examples/quick_start/train.toml with the settings of the tutorial
+# docs/getting-started/first-training.md. About an hour on one NVIDIA RTX A4000 (16 GB),
+# much longer on a CPU.
 #
-# Dataset (small set, ~3 s, ~11 MB):
-#   python -m dataset_preprocessor.export
-# Training:
-#   python train/train.py --config config.example.toml
+#   python -m dataset_preprocessor.export --config examples/deforming_plate/export.toml
+#   python train/train.py --config examples/deforming_plate/train.toml
+#   python predict/rollout.py --config examples/deforming_plate/rollout.toml
 #
-# For your own experiments copy this file (e.g. to configs/my_run.toml) and
-# adapt it. Values of the papers are given in the comments; see
-# docs/training.md for every key. Unknown keys are reported at start-up.
+# Every key: docs/reference/configuration.md.
 # ============================================================
 
 [data]
-data_dir               = "data/deforming_plate_s10_small"   # folder written by the exporter
-num_dataloader_workers = 0       # CPU: 0; GPU: 2-4 (build graphs in worker processes)
+data_dir               = "data/deforming_plate_s8_t40"      # examples/deforming_plate/export.toml
+num_dataloader_workers = 3       # on a CPU: 0
 lazy                   = false   # true: read frames from dataset.db on access (large datasets)
 # static_cache_mb      = 1024    # lazy: static graph data kept per process (MB)
+# Features of the export this run uses, by name (docs/guides/training.md); without these
+# keys it uses all of them. deforming_plate has no static node features and no run
+# parameters, and the stress as its result field; adapt them for other data.
+local_features         = []            # static node features, e.g. ["thickness"]
+global_features        = []            # run parameters, e.g. ["impact_velocity"]
+target_fields          = ["stress"]    # result fields, besides the velocity
 
 [model]
 architecture    = "mgn_t"        # "mgn_t" (MeshGraphNet-Transformer) or "meshgraphnets"
 residual_target = false          # true: predict the change w.r.t. *_prev (needs --history 1)
 world_edges     = "self_contact_aware"   # contact between bodies and self-contact (MGN-T paper v4);
-                                        # "all" (MeshGraphNets paper) | "contact" (docs/data.md)
+                                        # "all" (MeshGraphNets paper) | "contact" (docs/concepts/graphs.md)
 world_edge_exclude_distance = 2.0   # self_contact_aware: pairs with a path through the mesh
                                     # shorter than this x contact radius get none
 
 [model.meshgraphnets]
 # Paper (Pfaff et al. 2021): latent_size 128, 15 message passing steps. The
-# values below train on a CPU too, at ~2.5 min per epoch (docs/installation.md).
+# values below train on a CPU too, at ~2 min per epoch on the same CPU
+# (docs/getting-started/installation.md).
 latent_size               = 64
 num_mlp_layers            = 2
 num_message_passing_steps = 8
@@ -40,25 +44,24 @@ aggregation               = "sum"
 
 [model.mgn_t]
 # Paper (Iparraguirre et al. 2026, arXiv v4, Sec. 3.2 / 5.1): 2+2 message passing
-# steps, 2 transformer blocks, 4 heads, 16 tokens for deforming_plate; widths
-# 64-32-64 in v3 (Tab. 2). Smaller widths and 1+1 steps here (~50 k parameters),
-# so that it trains quickly on a CPU.
-latent_size            = 32      # v3: 64
-token_dim              = 16      # v3: 32
+# steps, 2 transformer blocks, 4 heads, 16 tokens for deforming_plate. Widths for the
+# ~0.5 M parameters of v4 (docs/results/deforming-plate.md#mgn-t-configuration).
+latent_size            = 80
+token_dim              = 48
 num_tokens             = 16      # paper v4
 num_heads              = 4       # paper
 num_transformer_blocks = 2       # paper
-num_pre_mp_steps       = 1       # paper: 2
-num_post_mp_steps      = 1       # paper: 2
+num_pre_mp_steps       = 2       # paper
+num_post_mp_steps      = 2       # paper
 num_mlp_layers         = 2
 aggregation            = "sum"
-pe_frequencies         = 8       # not given in the paper (see models/mgn_t.py)
+pe_frequencies         = 4       # not given in the paper (see models/mgn_t.py)
 ffn_ratio              = 4       # not given in the paper
 transformer_nodes      = "structure"   # paper: global stage without the actuator; "all" = every node
-tau_init               = 0.5     # not given in the paper
+tau_init               = 0.31    # the paper's tau_0 = 1.0 under softplus
 
 [training]
-epochs        = 5
+epochs        = 120
 batch_size    = 2        # paper: 2
 learning_rate = 1e-4     # paper: 1e-4
 weight_decay  = 0.0
@@ -76,11 +79,11 @@ decay_steps = "auto"
 [training.rollout_validation]
 # Roll out the val split every N epochs; its errors become selection criteria.
 enabled          = true
-every_n_epochs   = 1
+every_n_epochs   = 5
 # max_sequences  = 4            # optional: roll out only the first N val sequences
 
 [training.early_stopping]
-# Model selection and early stopping (docs/training.md). At every evaluation the
+# Model selection and early stopping (docs/concepts/training.md). At every evaluation the
 # criteria are recorded; the selected model is the evaluation closest to the
 # best value in all of them at once. Training stops after `patience` evaluations
 # without a new low in any criterion (patience counts evaluations, min_epochs
@@ -88,7 +91,7 @@ every_n_epochs   = 1
 # and adapt them for your own data.
 enabled         = true  # false: train all epochs, the selection still applies
 patience        = 8
-min_epochs      = 12
+min_epochs      = 50
 # val_loss | rollout_mse | rollout_pos_rmse | rollout_pos_rmse_final;
 # one entry = selection by that metric
 criteria        = ["val_loss", "rollout_mse", "rollout_pos_rmse", "rollout_pos_rmse_final"]
@@ -103,7 +106,7 @@ world_noise_std = 3e-3   # paper: 3e-3 m on the positions of the free nodes
 enabled = false          # needs --history 1; not in the paper
 
 [checkpointing]
-checkpoint_dir = "checkpoints/example_run"
-save_every     = 5       # checkpoint_epoch_N.pt every N epochs (best_model.pt always)
+checkpoint_dir = "checkpoints/first_training"
+save_every     = 20      # checkpoint_epoch_N.pt every N epochs (best_model.pt always)
 log_every      = 1
 resume         = ""      # path to a checkpoint to continue training from

@@ -1,0 +1,26 @@
+# ============================================================
+# CrashDefNet — bumper beam against a pole: rollout
+# ============================================================
+# Rolls out the model of examples/bumper_beam/train.toml over the 7 test runs from 10 ms
+# (the frames of its training config), evaluates the run on it and renders an animation of
+# the trajectory at the median of the position error.
+# Walk-through: docs/getting-started/bumper-beam.md
+#
+#   python predict/rollout.py --config examples/bumper_beam/rollout.toml
+#
+# Every key: docs/reference/configuration.md.
+# ============================================================
+
+[rollout]
+checkpoint = "checkpoints/bumper_beam_mgn_t/best_model.pt"
+data_dir   = "data/bumper_beam_remeshed"
+split      = "test"
+device     = "auto"
+export_vtu = true      # one .vtu per step, with the pole; needs pyvista
+one_step   = true      # also the one-step metrics RMSE-1
+
+[evaluation]
+enabled = true
+
+[animation]
+enabled = true

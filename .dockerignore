@@ -2,7 +2,7 @@
 # Python packages, the configs and the entrypoint. Datasets and results are
 # mounted at run time (docker-compose.yml); everything else stays on the host.
 *
-!config.example.toml
+!examples/
 !configs/
 !dataset_preprocessor/
 !models/

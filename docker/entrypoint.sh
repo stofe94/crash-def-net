@@ -9,7 +9,7 @@ set -euo pipefail
 cd /app
 
 DATA_DIR="${DATA_DIR:-/data}"
-CONFIG="${CONFIG:-config.example.toml}"
+CONFIG="${CONFIG:-examples/quick_start/train.toml}"
 # Overrides [training].device of the TOML: "auto" = cuda if visible, else cpu.
 DEVICE="${DEVICE:-auto}"
 

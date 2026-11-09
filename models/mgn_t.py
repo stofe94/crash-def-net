@@ -57,7 +57,10 @@ Assumptions where the paper leaves a gap (chosen here, flagged in the code):
    per graph. The paper batches the snapshots of one trajectory.
 
 Input as in ``models/meshgraphnets.py``, plus ``data.mesh_pos`` (undeformed node
-positions) for the positional encoding.
+positions) for the positional encoding. With run parameters (``global_in_dim > 0``,
+not in the paper) both message passing stages are full GraphNet blocks with global
+latents, as in ``models/meshgraphnets.py`` (Global block); the transformer stage
+leaves the global latents as they are.
 """
 
 from typing import List, Optional
@@ -67,19 +70,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from dataset_preprocessor.graph_features import graph_sizes, structure_node_mask
-from models.meshgraphnets import GraphNetBlock, count_parameters, make_mlp  # noqa: F401
+from models.meshgraphnets import (  # noqa: F401
+    GraphNetBlock,
+    count_parameters,
+    graph_index,
+    make_mlp,
+    run_blocks,
+)
 
 _ACTIVATION = nn.LeakyReLU   # paper: LeakyReLU in every MLP
 # Nodes of the global stage: the simulated structure (paper) or every node (up to v0.2.0).
 TRANSFORMER_NODES = ("structure", "all")
-
-
-def _graph_batch(data, num_nodes: int) -> torch.Tensor:
-    """Node -> graph index; a single (unbatched) graph carries no ``batch``."""
-    batch = getattr(data, "batch", None)
-    if batch is None:
-        return torch.zeros(num_nodes, dtype=torch.long, device=data.x.device)
-    return batch
 
 
 class SinusoidalPositionEncoding(nn.Module):
@@ -204,6 +205,7 @@ class MgnTransformer(nn.Module):
         tau_init: float = 0.5,
         aggregation: str = "sum",
         transformer_nodes: str = "structure",
+        global_in_dim: int = 0,
     ):
         super().__init__()
         if transformer_nodes not in TRANSFORMER_NODES:
@@ -213,6 +215,7 @@ class MgnTransformer(nn.Module):
         self.output_dim = output_dim
         self.world_edge_in_dim = world_edge_in_dim
         self.use_world_edges = world_edge_in_dim > 0
+        self.use_globals = global_in_dim > 0
         num_edge_sets = 2 if self.use_world_edges else 1
         mlp = dict(num_layers=num_mlp_layers, activation=_ACTIVATION)
 
@@ -221,15 +224,18 @@ class MgnTransformer(nn.Module):
         self.world_edge_encoder = (
             make_mlp(world_edge_in_dim, latent_size, latent_size, **mlp)
             if self.use_world_edges else None)
+        self.global_encoder = (make_mlp(global_in_dim, latent_size, latent_size, **mlp)
+                               if self.use_globals else None)
 
-        def mp_stack(num_steps):
+        def mp_stack(num_steps, last):   # the model's last block only reads the globals
             return nn.ModuleList([
                 GraphNetBlock(latent_size, num_mlp_layers, num_edge_sets, aggregation,
-                              activation=_ACTIVATION)
-                for _ in range(num_steps)])
+                              activation=_ACTIVATION, use_globals=self.use_globals,
+                              update_globals=not (last and step == num_steps - 1))
+                for step in range(num_steps)])
 
-        self.pre_processor = mp_stack(num_pre_mp_steps)
-        self.refinement_processor = mp_stack(num_post_mp_steps)
+        self.pre_processor = mp_stack(num_pre_mp_steps, last=num_post_mp_steps == 0)
+        self.refinement_processor = mp_stack(num_post_mp_steps, last=True)
 
         # Node latents + positional encoding -> transformer width (paper Sec. 3.2)
         self.position_encoding = SinusoidalPositionEncoding(pe_frequencies)
@@ -251,12 +257,13 @@ class MgnTransformer(nn.Module):
                 world_index = data.edge_index.new_zeros(2, 0)
                 world_attr = data.edge_attr.new_zeros(0, self.world_edge_in_dim)
             edge_sets.append((self.world_edge_encoder(world_attr), world_index))
+        graph = graph_index(data, nodes.shape[0])
+        globals_ = self.global_encoder(data.u) if self.use_globals else None
 
-        for block in self.pre_processor:
-            nodes, edge_sets = block(nodes, edge_sets)
+        nodes, edge_sets, globals_ = run_blocks(self.pre_processor, nodes, edge_sets,
+                                                globals_, graph)
 
-        batch = _graph_batch(data, nodes.shape[0])
-        latents, mesh_pos = nodes, self._mesh_positions(data)
+        latents, batch, mesh_pos = nodes, graph, self._mesh_positions(data)
         if self.transformer_nodes == "structure":   # without the actuator (paper Sec. 3.3)
             index = structure_node_mask(data.x).nonzero().squeeze(1)
             latents, batch, mesh_pos = nodes[index], batch[index], mesh_pos[index]
@@ -269,8 +276,7 @@ class MgnTransformer(nn.Module):
         nodes = nodes + update if self.transformer_nodes == "all" else \
             nodes.index_add(0, index, update)
 
-        for block in self.refinement_processor:
-            nodes, edge_sets = block(nodes, edge_sets)
+        nodes, _, _ = run_blocks(self.refinement_processor, nodes, edge_sets, globals_, graph)
         return self.decoder(nodes)
 
     @staticmethod

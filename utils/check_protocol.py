@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 check_protocol.py — Check rollouts against a comparison protocol and compare them
-with a reference trajectory by trajectory (docs/comparison-protocol.md).
+with a reference trajectory by trajectory (docs/guides/comparison-protocol.md).
 
 The first rollout folder is the reference (a MeshGraphNets baseline; for a new
 architecture the comparable one with the same world edges), every further one a
@@ -48,13 +48,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 from dataset_preprocessor.dataset import dataset_fingerprint  # noqa: E402
 from train.config import TOML_KEYS, TrainingConfig  # noqa: E402
+from utils.results import current_metric_names  # noqa: E402
 
 DEFAULT_PROTOCOL = _REPO_ROOT / "protocols" / "deforming_plate_s4_t150.toml"
 PROTOCOL_SPLIT = "test"
 # Display names and paired metrics as in compare_paper.py (not imported from there:
 # it loads matplotlib, which this check does not need).
 ARCHITECTURE_NAMES = {"mgn_t": "MGN-T", "meshgraphnets": "MGN", "meshgraphnet": "MGN"}
-PAIRED_METRICS = [  # key in paper_metrics, title, factor to the unit, unit
+PAIRED_METRICS = [  # key in rollout_metrics, title, factor to the unit, unit
     ("q_rmse_all", "q RMSE-all (whole rollout)", 1e3, "mm"),
     ("stress_rmse_all", "σ RMSE-all (whole rollout)", 1e-3, "kPa"),
     ("q_rmse_1", "q RMSE-1 (one step)", 1e3, "mm"),
@@ -97,14 +98,14 @@ def load_rollout(folder: Path) -> Rollout:
     info_path = folder / "rollout_info.json"
     if not info_path.exists():
         raise ValueError(f"no rollout_info.json in {folder}")
-    with open(info_path) as f:
-        info = json.load(f)
+    with open(info_path, encoding="utf-8") as f:
+        info = json.load(f, object_hook=current_metric_names)
     summary_name = (info.get("results") or {}).get(
         "summary_file", f"{info['data']['split']}_rollout_summary.json")
     if info.get("status") != "finished" or not (folder / summary_name).exists():
         raise ValueError(f"rollout not finished ({info.get('status')}): {folder}")
-    with open(folder / summary_name) as f:
-        return Rollout(folder, info, json.load(f))
+    with open(folder / summary_name, encoding="utf-8") as f:
+        return Rollout(folder, info, json.load(f, object_hook=current_metric_names))
 
 
 def number(value: float) -> str:
@@ -170,7 +171,7 @@ def train_samples(rollout: Rollout) -> Optional[int]:
         db, metadata = data_dir / "dataset.db", data_dir / "metadata.json"
         if (db.exists() and metadata.exists()
                 and _local_dataset_id(db, data["dataset_db"]) == dataset_id(data["dataset_db"])):
-            with open(metadata) as f:
+            with open(metadata, encoding="utf-8") as f:
                 return json.load(f).get("sample_counts", {}).get("train")
     return None
 
@@ -183,7 +184,7 @@ def training_history(rollout: Rollout) -> Optional[List[Dict]]:
                             rollout.model["training_run"], name):
         history = path.parent / "history.json"
         if path.exists() and history.exists() and sha256(path) == checkpoint["sha256"]:
-            with open(history) as f:
+            with open(history, encoding="utf-8") as f:
                 return json.load(f)
     return None
 
@@ -268,6 +269,8 @@ def check_data(rollout: Rollout, reference: Rollout, check: Check) -> None:
         check.violations.append(f"split {rollout.split!r} (protocol: {PROTOCOL_SPLIT!r})")
     if data.get("max_sequences") is not None or data.get("max_steps") is not None:
         check.violations.append("rollout limited by --max-sequences / --max-steps")
+    if data.get("start_frame") is not None or data.get("end_frame") is not None:
+        check.violations.append("rollout over part of the frames (--start-frame / --end-frame)")
     if not data.get("matches_training_dataset", True):
         check.violations.append("rolled out on a dataset with other export settings than "
                                 "the training dataset")
@@ -342,8 +345,8 @@ def paired_section(candidate: Rollout, reference: Rollout,
                   "|---|---|---|---|---|"]
         winners = {}
         for sid in sequences:
-            ref = reference.summary["sequences"][sid]["paper_metrics"][key] * factor
-            cand = candidate.summary["sequences"][sid]["paper_metrics"][key] * factor
+            ref = reference.summary["sequences"][sid]["rollout_metrics"][key] * factor
+            cand = candidate.summary["sequences"][sid]["rollout_metrics"][key] * factor
             winners[sid] = lower_error(ref, cand)
             sign = "+" if cand > ref else "−" if cand < ref else "±"
             name = f"{sid} (excluded)" if sid in exclude else sid
@@ -357,17 +360,26 @@ def paired_section(candidate: Rollout, reference: Rollout,
     return lines
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Command line options; the reference in docs/reference/cli.md is generated from them."""
     parser = argparse.ArgumentParser(
         description="Check rollouts against a comparison protocol and compare them "
-                    "with the reference per trajectory (docs/comparison-protocol.md).")
+                    "with the reference per trajectory (docs/guides/comparison-protocol.md).")
     parser.add_argument("reference", type=Path, help="rollout folder of the reference")
     parser.add_argument("candidates", nargs="*", type=Path, help="further rollout folders")
     parser.add_argument("--protocol", type=Path, default=DEFAULT_PROTOCOL,
                         help="protocol training config (default: %(default)s)")
     parser.add_argument("--exclude", nargs="*", default=[],
                         help="trajectories counted separately, e.g. test_traj0149")
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
+    # Windows writes redirected output in its code page, which lacks characters such as
+    # σ, ρ and −: replace them there instead of failing at the end (PYTHONUTF8=1 keeps them).
+    sys.stdout.reconfigure(errors="replace")
 
     try:
         rollouts = [load_rollout(folder) for folder in [args.reference, *args.candidates]]

@@ -2,12 +2,12 @@
 # Comparison protocol deforming_plate_s4_t150 — training config
 # ============================================================
 # Fixed training settings for comparing an architecture with MeshGraphNets
-# on DeepMind's original splits (docs/comparison-protocol.md). As it stands,
+# on DeepMind's original splits (docs/guides/comparison-protocol.md). As it stands,
 # this file trains MeshGraphNets in its paper's configuration, with world
 # edges between all pairs closer than r_W (world_edges = "all", Pfaff et al.
 # 2021, Sec. 3.1). New architectures are compared with the comparable baseline,
 # the same with world_edges = "self_contact_aware"; the published results of the
-# paper are the original reference (docs/comparison-protocol.md, Baselines).
+# paper are the original reference (docs/guides/comparison-protocol.md, Baselines).
 #
 # For a new architecture copy it (e.g. to configs/my_model_s4_t150.toml) and
 # change only
@@ -20,7 +20,7 @@
 #
 # Dataset (~10.6 GB of raw data: train, valid and test.tfrecord; export ~90 s, ~330 MB):
 #   python -m dataset_preprocessor.export --out-dir data/deforming_plate_s4_t150 \
-#       --source-tfrecord train.tfrecord valid.tfrecord test.tfrecord --select-seed 42 \
+#       --sources train.tfrecord valid.tfrecord test.tfrecord --select-seed 42 \
 #       --n-train 100 --n-val 30 --n-test 20 --num-steps 100 --time-stride 4
 #   -> 9,900 / 2,970 / 1,980 samples; one epoch = 1,238 optimizer steps at batch 8.
 # Training:

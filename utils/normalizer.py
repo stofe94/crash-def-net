@@ -5,8 +5,9 @@ Every feature group (``node_features``, ``target``, ``mesh_edge_features``,
 ``world_edge_features`` and, with history, ``target_delta``) stores one mean
 and one standard deviation per column. The exporter fits them once on the
 train split and writes ``normalizer.json`` next to the dataset; training reads
-that file and stores a copy in every checkpoint, which rollout and resumed
-training use — so a model keeps its scale even if the dataset is exported anew.
+that file and stores a copy of the columns it selects in every checkpoint, which
+rollout and resumed training use — so a model keeps its scale even if the dataset
+is exported anew.
 
 File format (unchanged since the first export)::
 
@@ -17,7 +18,7 @@ File format (unchanged since the first export)::
 from __future__ import annotations
 
 import json
-from typing import Dict, Tuple, Union
+from typing import Dict, Sequence, Tuple, Union
 
 import numpy as np
 import torch
@@ -64,6 +65,18 @@ class Normalizer:
         mean, std = self._stats_like(values, group)
         return values * std + mean
 
+    def select(self, columns: Dict[str, Sequence[int]]) -> "Normalizer":
+        """Copy with only these columns of the named groups; a group without columns is
+        left out, groups not named stay as they are."""
+        selected = Normalizer()
+        for group, stats in self.stats.items():
+            kept = columns.get(group)
+            if kept is None:
+                selected.stats[group] = stats
+            elif kept:
+                selected.set_stats(group, stats["mean"][kept], stats["std"][kept])
+        return selected
+
     def to_dict(self) -> Dict:
         """All groups in the file format (plain lists; stored in checkpoints too)."""
         state = {group: {key: value.tolist() for key, value in stats.items()}
@@ -83,13 +96,13 @@ class Normalizer:
 
     def save(self, path: str) -> None:
         """Write all groups to ``path`` (JSON)."""
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(self.to_dict(), f, indent=2)
 
     @classmethod
     def load(cls, path: str) -> "Normalizer":
         """Read a file written by ``save``."""
-        with open(path, "r") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return cls.from_dict(json.load(f), path)
 
     def __eq__(self, other) -> bool:

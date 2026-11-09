@@ -7,11 +7,12 @@
 # Update:   conda env update -f environment.yml --prune
 # Remove:   conda env remove -n crashdefnet
 #
-# conda -> Python, numpy, utilities
-# pip   -> PyTorch, PyG, tfrecord, pyvista, matplotlib (packages with C++
-#          extensions come from one source only; mixing conda and pip builds
-#          causes libstdc++ ABI conflicts on Linux/WSL, e.g. when matplotlib
-#          is imported after torch)
+# conda -> Python, utilities
+# pip   -> numpy, PyTorch, PyG, tfrecord, pyvista, matplotlib (packages with
+#          compiled extensions come from one source only; mixing conda and pip
+#          builds causes libstdc++ ABI conflicts on Linux/WSL, e.g. when matplotlib
+#          is imported after torch, and two OpenMP runtimes on Windows, where the
+#          process stops with "OMP: Error #15")
 # ============================================================
 
 name: crashdefnet
@@ -20,7 +21,6 @@ channels:
 
 dependencies:
   - python=3.12
-  - numpy>=1.24
   - tqdm>=4.60
   - pip>=23.0
   - pip:
@@ -28,8 +28,10 @@ dependencies:
       - --extra-index-url https://download.pytorch.org/whl/cpu
       - torch>=2.6
       - torch-geometric>=2.5
+      - numpy>=1.24
       - tfrecord
       - toml>=0.10
+      - tzdata; sys_platform == "win32"   # time zone of the timestamps on Windows
       # --- optional: .vtu export of the rollout ---
       - pyvista>=0.43
       # --- optional: loss curves and paper comparison ---

@@ -1,0 +1,29 @@
+# ============================================================
+# CrashDefNet — quick start: export
+# ============================================================
+# The small dataset of the quick start: 12 plates of DeepMind's test.tfrecord at every 10th
+# time step, 8 for training, 2 for validation, 2 for the test (~3 s, ~11 MB). These are the
+# defaults of the exporter, so the quick start runs it without options; this file states them.
+# Walk-through: docs/getting-started/installation.md (Quick start on the command line)
+#
+#   python -m dataset_preprocessor.export
+#   python -m dataset_preprocessor.export --config examples/quick_start/export.toml
+#
+# Both give the same samples; the second also records this file in the dataset, so its
+# fingerprint differs.
+#
+# Every key: docs/reference/configuration.md.
+# ============================================================
+
+[raw]
+format  = "tfrecord"
+dir     = "datasets/deforming_plate/raw_dataset"   # with meta.json: contact radius and steps
+sources = ["test.tfrecord"]
+
+[dataset]
+out_dir     = "data/deforming_plate_s10_small"
+n_train     = 8
+n_val       = 2
+n_test      = 2
+num_steps   = 40      # frames per plate
+time_stride = 10      # raw time steps between two of them

@@ -38,7 +38,7 @@ Every written run is read back with ``d3plot_reader.read_run`` and compared
 with the TFRecord: geometry, positions and node types exactly, the stress
 with the element representation.
 
-DeepMind states no license for the datasets (see docs/data.md): keep the
+DeepMind states no license for the datasets (see docs/concepts/graphs.md): keep the
 converted files local.
 
 Usage (without arguments all 100 trajectories of test.tfrecord, ~5 GB)::
@@ -77,7 +77,7 @@ from dataset_preprocessor.graph_features import NODE_TYPE_ACTUATOR, NODE_TYPE_CL
 # Settings used when the module is run without arguments.
 D3PLOT_DEFAULTS = dict(
     raw_dir=EXPORT_DEFAULTS["raw_dir"],
-    source_tfrecord=EXPORT_DEFAULTS["source_tfrecord"],
+    source_tfrecord=EXPORT_DEFAULTS["sources"],
     out_dir=EXPORT_DEFAULTS["raw_dir_d3plot"],
     count=None,                                  # None: every trajectory of the TFRecord
     overwrite=True,
@@ -178,7 +178,7 @@ def write_keyword_file(path: Path, traj: RawTrajectory, source: str) -> None:
         _card(CLAMPED_NODE_SET, 0, 1, 1, 1, 1, 1, 1),
         "*END",
     ]
-    path.write_text("\n".join(lines) + "\n")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -214,7 +214,7 @@ def convert(raw_dir: str, out_dir: str, source_tfrecord: str,
     out = Path(out_dir)
     source_dir = out / Path(source_tfrecord).stem
     source_dir.mkdir(parents=True, exist_ok=True)
-    with open(out / "meta.json", "w") as f:
+    with open(out / "meta.json", "w", encoding="utf-8") as f:
         json.dump({"raw_format": "d3plot",
                    **{key: meta[key] for key in _SIMULATION_META if key in meta}}, f, indent=2)
 
@@ -246,7 +246,7 @@ def convert(raw_dir: str, out_dir: str, source_tfrecord: str,
                    "of the element's nodes"),
         "lasso_python": version("lasso-python"),
     }
-    with open(source_dir / "conversion.json", "w") as f:
+    with open(source_dir / "conversion.json", "w", encoding="utf-8") as f:
         json.dump(conversion, f, indent=2)
     return runs
 
@@ -255,8 +255,8 @@ def convert(raw_dir: str, out_dir: str, source_tfrecord: str,
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main(argv=None) -> None:
-    """Convert a TFRecord; defaults come from ``D3PLOT_DEFAULTS``."""
+def build_parser() -> argparse.ArgumentParser:
+    """Command line options; the reference in docs/reference/cli.md is generated from them."""
     d = D3PLOT_DEFAULTS
     parser = argparse.ArgumentParser(
         description="Convert DeepMind deforming_plate trajectories into LS-DYNA runs "
@@ -274,6 +274,12 @@ def main(argv=None) -> None:
                         help="first N trajectories (default: all)")
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction,
                         default=d["overwrite"], help="replace existing runs")
+    return parser
+
+
+def main(argv=None) -> None:
+    """Convert a TFRecord; defaults come from ``D3PLOT_DEFAULTS``."""
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     try:

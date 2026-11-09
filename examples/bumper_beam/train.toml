@@ -1,0 +1,93 @@
+# ============================================================
+# CrashDefNet — bumper beam against a pole: training (MGN-T)
+# ============================================================
+# MGN-T in the size of the paper (v4, ~0.51 M parameters) on the export of
+# examples/bumper_beam/export.toml, trained with scheduled sampling: from epoch to epoch a
+# growing share of the nodes takes its previous velocity and stress from the model's own
+# prediction of the step before instead of the ground truth, as in the rollout. The settings of
+# the published results (docs/results/bumper-beam.md): 80 epochs, batch 4, ~3 h 20 min on one
+# NVIDIA RTX A4000 (16 GB), GPU memory ~7.3 GB. Walk-through: docs/getting-started/bumper-beam.md
+#
+#   python train/train.py --config examples/bumper_beam/train.toml
+#
+# One sample has 16,152 nodes, 64,400 mesh edges and up to ~44,000 contact edges.
+# 110 runs x 9 samples = 990 samples per epoch. Every key: docs/reference/configuration.md.
+# ============================================================
+
+[data]
+data_dir               = "data/bumper_beam_remeshed"
+num_dataloader_workers = 3       # graphs built in 3 worker processes
+lazy                   = false   # the export (~460 MB) fits in memory
+# From 10 ms: the step from the undeformed state at 0 ms to the first deformed state is left
+# out on purpose (docs/results/bumper-beam.md#setup); the rollouts of this run start at
+# 10 ms as well.
+start_frame            = 1
+# Features of the export this run uses: the shell thickness (with thickness_given, as
+# nodes without a shell have none) and the stress as result field. No run parameters.
+local_features         = ["thickness"]
+global_features        = []
+target_fields          = ["stress"]
+
+[model]
+architecture                = "mgn_t"
+residual_target             = true    # predict the change of velocity and stress (export with history = 1)
+world_edges                 = "self_contact_aware"
+world_edge_exclude_distance = 2.0
+
+[model.mgn_t]
+latent_size            = 80
+token_dim              = 48
+num_tokens             = 16
+num_heads              = 4
+num_transformer_blocks = 2
+num_pre_mp_steps       = 2
+num_post_mp_steps      = 2
+num_mlp_layers         = 2
+aggregation            = "sum"
+transformer_nodes      = "structure"   # the transformer sees the structure, not the pole
+tau_init               = 0.31
+pe_frequencies         = 4
+ffn_ratio              = 4
+
+[training]
+epochs        = 80
+batch_size    = 4
+learning_rate = 2.8e-4
+weight_decay  = 0.0
+max_grad_norm = 1.0
+seed          = 42
+device        = "auto"
+
+[training.scheduler]
+type   = "cosine"
+min_lr = 1e-6
+
+[training.rollout_validation]
+enabled        = true    # select the model by rollouts over whole val trajectories
+every_n_epochs = 4
+max_sequences  = 14
+
+[training.early_stopping]
+enabled  = false
+criteria = ["rollout_mse"]
+
+[loss]
+type = "mse"
+
+[noise]
+# In the units of the data. The velocity in z is only ~0.5 mm per frame, so the position
+# noise stays well below the 3 mm of deforming_plate.
+world_noise_std  = 0.3    # mm
+stress_noise_std = 0.01   # GPa
+
+[scheduled_sampling]
+enabled       = true
+start_ratio   = 1.0     # share of the nodes that keep the ground truth at epoch 0
+end_ratio     = 0.3     # after the warmup
+warmup_epochs = 40      # of 80: the final share is trained for the second half of the cosine schedule
+
+[checkpointing]
+checkpoint_dir = "checkpoints/bumper_beam_mgn_t"
+save_every     = 10
+log_every      = 1
+resume         = ""

@@ -13,15 +13,16 @@ names, and writes a new folder ``evaluations/<YYYYMMDD_HHMMSS>_<run>_evaluation/
                              displacement of the ground truth as the scale of the
                              position error (rollout folder only)
 - ``03_trajectories.png``    every metric over the trajectories as all (one RMSE over
-                             all trajectories together, as the paper metrics), median,
-                             best and worst
+                             all trajectories together, as the rollout metrics; the
+                             relative L2 position error as the mean over the trajectories
+                             and steps), median, best and worst
 - ``evaluation.md``          run, findings, tables, figures
 - ``trajectories.csv``       every trajectory with its metrics
 - ``evaluation.json``        the values of the report
 
 The figures summarize the trajectories instead of showing each one; the tables
 and the CSV list all of them. Without a rollout folder the test results come from
-``test_metrics.json``, the rollout at the end of the training (paper metrics per
+``test_metrics.json``, the rollout at the end of the training (rollout metrics per
 trajectory, no values per step). The displacement and the curves of single
 trajectories need a rollout summary that stores them (``displacement_rms_per_step``
 and the per-step values of every trajectory, written since this script exists).
@@ -61,6 +62,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from dataset_preprocessor.graph_features import VELOCITY_TARGET_NAMES  # noqa: E402
 from train.config import TOML_KEYS  # noqa: E402
 from utils.compare_paper import (  # noqa: E402
     ARCHITECTURE_NAMES,
@@ -70,27 +72,36 @@ from utils.compare_paper import (  # noqa: E402
     _selection_description,
     _significant,
     _style,
+    dataset_metadata,
     display,
     load_rollout,
     markdown_table,
     tint,
 )
 from utils.plot_losses import SURFACE, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY  # noqa: E402
+from utils.results import current_metric_names  # noqa: E402
 from utils.timezone import now  # noqa: E402
+from utils.units import SI_STRESS, si_factors, stress_display  # noqa: E402
 
 EVALUATIONS_DIR = _REPO_ROOT / "evaluations"
 
-# Per-trajectory metrics (key, title): the paper metrics of the rollout and the
-# position error as a share of the ground-truth displacement.
+# Per-trajectory metrics (key, title): the rollout metrics of the rollout, the position
+# error as a share of the ground-truth displacement and the relative L2 position error.
 TO_DISPLACEMENT = "q_to_displacement"
+REL_L2 = "q_rel_l2"
 METRICS = [
     ("q_rmse_1", "Position RMSE-1"),
     ("q_rmse_all", "Position RMSE-all"),
     (TO_DISPLACEMENT, "Position error / displacement"),
+    (REL_L2, "Position rel. L2"),
     ("stress_rmse_1", "Stress RMSE-1"),
     ("stress_rmse_all", "Stress RMSE-all"),
     ("stress_r_rmse_all", "Stress R-RMSE-all"),
 ]
+REL_L2_NOTE = ("Position rel. L2: ||x_pred − x_true|| / ||x_true|| per step over the nodes and "
+               "their coordinates, in place of the pooled value the mean over the trajectories "
+               "and steps (as in Nabian et al., arXiv:2510.15201); it depends on the origin of "
+               "the coordinates.")
 # A trajectory this many times above the median is listed among the findings.
 FAR_ABOVE_MEDIAN = 3.0
 # Range of the selection criterion over this many last evaluations.
@@ -109,15 +120,18 @@ GAP_COLOR = "#6250d6"
 MEAN_COLOR, BEST_COLOR, WORST_COLOR = SERIES_COLORS[0], SERIES_COLORS[2], SERIES_COLORS[1]
 
 
-def unit(key: str) -> Tuple[float, str]:
-    """(factor, unit) of a metric in the report."""
-    return (100.0, "%") if key == TO_DISPLACEMENT else display(key)
+def unit(key: str, stress_unit: str = SI_STRESS) -> Tuple[float, str]:
+    """(factor, unit) of a metric in the report; ``stress_unit``: of the data."""
+    if key == REL_L2:   # as in the tables of the papers that use it
+        return 1e3, "×10⁻³"
+    return (100.0, "%") if key == TO_DISPLACEMENT else display(key, stress_unit)
 
 
-def text(value: Optional[float], key: str, digits: int = 3) -> str:
+def text(value: Optional[float], key: str, digits: int = 3,
+         stress_unit: str = SI_STRESS) -> str:
     if value is None:
         return "–"
-    return _significant(value * unit(key)[0], digits)
+    return _significant(value * unit(key, stress_unit)[0], digits)
 
 
 # ── the run ──────────────────────────────────────────────────────────────────
@@ -141,9 +155,21 @@ class Run:
 
     @property
     def metadata(self) -> Dict:
-        if self.rollout is not None:
-            return self.rollout.info["data"]["metadata"]
-        return (self.checkpoint or {}).get("metadata") or {}
+        if self.rollout is None:
+            return (self.checkpoint or {}).get("metadata") or {}
+        # rollout_info.json keeps the scalar entries only; the splits come from the
+        # dataset's metadata.json or, for the training dataset, from the checkpoint
+        metadata = dict(self.rollout.info["data"]["metadata"])
+        full = dataset_metadata(self.rollout)
+        if full is None and self.rollout.info["data"].get("matches_training_dataset"):
+            full = (self.checkpoint or {}).get("metadata")
+        metadata.setdefault("splits", (full or {}).get("splits"))
+        return metadata
+
+    @property
+    def stress_unit(self) -> str:
+        """Of the data (utils.units); the reports choose the unit of the stress by it."""
+        return self.metadata.get("stress_unit", SI_STRESS)
 
     @property
     def split(self) -> str:
@@ -157,7 +183,7 @@ class Run:
 
     @property
     def results(self) -> Optional[Dict]:
-        """Paper metrics and trajectories: the rollout summary or the test rollout."""
+        """Rollout metrics and trajectories: the rollout summary or the test rollout."""
         if self.rollout is not None:
             return self.rollout.summary
         return (self.test or {}).get("rollout")
@@ -198,7 +224,8 @@ def load_run(folder: Path) -> Run:
 
     def read(name: str):
         path = run_dir / name
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+        return (json.loads(path.read_text(encoding="utf-8"), object_hook=current_metric_names)
+                if path.exists() else None)
 
     # test_metrics.json belongs to the selected model, best_model.pt
     test = read("test_metrics.json") if checkpoint_path.name == "best_model.pt" else None
@@ -226,10 +253,11 @@ def trajectory_values(run: Run) -> Dict[str, Dict[str, Optional[float]]]:
     """The metrics of every trajectory, keys of ``METRICS``."""
     out = {}
     for sid, sequence in run.results["sequences"].items():
-        # rollout summary: dict with paper_metrics; test_metrics.json: the paper metrics
-        values = dict(sequence.get("paper_metrics", sequence))
+        # rollout summary: dict with rollout_metrics; test_metrics.json: the rollout metrics
+        values = dict(sequence.get("rollout_metrics", sequence))
         values[TO_DISPLACEMENT] = to_displacement(sequence.get("position_rmse_per_step"),
                                                   sequence.get("displacement_rms_per_step"))
+        values[REL_L2] = sequence.get("position_rel_l2")
         out[sid] = values
     return out
 
@@ -244,9 +272,10 @@ class Spread:
 
 
 def spreads(run: Run, values: Dict[str, Dict]) -> Dict[str, Spread]:
-    """Every metric pooled over all trajectories (the paper metrics of the summary; the
-    displacement share over all steps of all trajectories) with median, best, worst."""
-    paper = run.results["paper_metrics"]
+    """Every metric pooled over all trajectories (the rollout metrics of the summary; the
+    displacement share over all steps of all trajectories; the relative L2 as the mean
+    over the trajectories and steps) with median, best, worst."""
+    paper = run.results["rollout_metrics"]
     sequences = run.results["sequences"]
     out = {}
     for key, _ in METRICS:
@@ -257,6 +286,8 @@ def spreads(run: Run, values: Dict[str, Dict]) -> Dict[str, Spread]:
                 [d for s in sequences.values() for d in s.get("displacement_rms_per_step", [])]
             ) if len(per) == len(sequences) else None
             se = None
+        elif key == REL_L2:
+            pooled, se = run.results.get("position_rel_l2"), None
         else:
             pooled, se = paper.get(key), paper.get(f"{key}_se")
         if not per:
@@ -327,20 +358,22 @@ def training_findings(run: Run) -> List[str]:
 
 
 def rollout_findings(run: Run, values: Dict[str, Dict], spread: Dict[str, Spread]) -> List[str]:
-    lines = []
+    lines, su = [], run.stress_unit
     for key, title in (("q_rmse_all", "Position RMSE-all"), ("stress_rmse_all", "Stress RMSE-all")):
         s = spread[key]
         if s.median is None:
             continue
-        _, u = unit(key)
+        _, u = unit(key, su)
         far = sorted(((v[key], sid) for sid, v in values.items()
                       if v.get(key) is not None and v[key] > FAR_ABOVE_MEDIAN * s.median),
                      reverse=True)
-        line = (f"{title}: {text(s.pooled, key)} {u} over all trajectories, median "
-                f"{text(s.median, key)} {u} (× {s.pooled / s.median:.1f}).")
+        line = (f"{title}: {text(s.pooled, key, stress_unit=su)} {u} over all trajectories, "
+                f"median {text(s.median, key, stress_unit=su)} {u} "
+                f"(× {s.pooled / s.median:.1f}).")
         if far:
             line += (f" Above {FAR_ABOVE_MEDIAN:g} × the median: "
-                     + ", ".join(f"{sid} ({text(v, key)} {u})" for v, sid in far) + ".")
+                     + ", ".join(f"{sid} ({text(v, key, stress_unit=su)} {u})"
+                                 for v, sid in far) + ".")
         lines.append(line)
     q1, qa = spread["q_rmse_1"].pooled, spread["q_rmse_all"].pooled
     steps = len(run.results.get("position_rmse_per_step", [])) if run.rollout else None
@@ -464,12 +497,21 @@ def plot_steps(run: Run, spread: Dict[str, Spread], path: Path) -> None:
     summary = run.rollout.summary
     sequences = summary["sequences"]
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.6), facecolor=SURFACE)
+    stress_factor, stress_unit = stress_display(run.stress_unit)
     panels = [(axes[0], "q_rmse_all", 1e3, "Position error per step [mm]",
                lambda s: s.get("position_rmse_per_step")),
-              (axes[1], "stress_rmse_all", 1e-3, "Stress RMSE per step [kPa]",
+              (axes[1], "stress_rmse_all", stress_factor,
+               f"Stress RMSE per step [{stress_unit}]",
                lambda s: (s.get("rmse_per_field_per_step") or {}).get("stress"))]
     single = False
+    frames = run.rollout.frames
+    initial = run.rollout.initial_frame
+    first_prediction = frames[min(frames.index(initial) + 1, len(frames) - 1)]
     for ax, key, factor, title, series in panels:
+        # Everything before the first prediction is ground truth, no part of the rollout;
+        # the curves start with the first prediction.
+        ax.axvspan(frames[0], first_prediction, color=tint(TEXT_MUTED, 0.82), linewidth=0,
+                   label="before the first prediction (ground truth)")
         curves = [("mean over the trajectories", series(summary), MEAN_COLOR, 2.4)]
         for name, pick, color in (("best", spread[key].best, BEST_COLOR),
                                   ("worst", spread[key].worst, WORST_COLOR)):
@@ -481,12 +523,17 @@ def plot_steps(run: Run, spread: Dict[str, Spread], path: Path) -> None:
             curves.append(("RMS displacement of the ground truth (mean)",
                            summary["displacement_rms_per_step"], TEXT_MUTED, 1.4))
         for label, values, color, width in curves:
-            steps = range(1, len(values) + 1)
-            ax.plot(steps, [v * factor for v in values], color=color, linewidth=width,
+            x, values = run.rollout.over_frames(values)   # from the first prediction on
+            ax.plot(x, values * factor, color=color, linewidth=width,
                     label=label, linestyle=(0, (4, 3)) if color == TEXT_MUTED else "-",
                     solid_joinstyle="round", solid_capstyle="round")
         ax.set_ylim(bottom=0)
-        ax.set_xlabel("Rollout step", fontsize=10, color=TEXT_SECONDARY)
+        ax.set_xlim(left=frames[0])
+        if len(frames) <= 21:
+            ax.set_xticks(frames)   # every frame, so that the band ends on its tick
+        else:
+            ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.set_xlabel("Frame of the run", fontsize=10, color=TEXT_SECONDARY)
         _title(ax, title)
         _style(ax, "both")
         _legend(ax)
@@ -506,16 +553,21 @@ ROWS = ["All (pooled)", "Median", "Best", "Worst"]
 
 def plot_trajectories(run: Run, spread: Dict[str, Spread], path: Path) -> None:
     """Per metric: all trajectories pooled, median, best and worst."""
-    fig, axes = plt.subplots(2, 3, figsize=(15, 6.6), facecolor=SURFACE, sharey=True)
+    # position metrics in the first row, stress in the second
+    fig, axes = plt.subplots(2, 4, figsize=(19.5, 6.6), facecolor=SURFACE, sharey=True)
+    for ax in axes.flat[len(METRICS):]:
+        ax.set_axis_off()
     positions = list(range(len(ROWS)))[::-1]
+    su = run.stress_unit
+    missing = {TO_DISPLACEMENT: "needs a rollout that stores the displacement",
+               REL_L2: "needs a rollout that stores it"}
     for ax, (key, title) in zip(axes.flat, METRICS):
         s = spread[key]
-        factor, u = unit(key)
+        factor, u = unit(key, su)
         _title(ax, f"{title} [{u}]")
         _style(ax)
         if s.median is None:
-            ax.text(0.02, 0.5, "needs a rollout that stores the displacement" if
-                    key == TO_DISPLACEMENT else "not computed", transform=ax.transAxes,
+            ax.text(0.02, 0.5, missing.get(key, "not computed"), transform=ax.transAxes,
                     fontsize=9.5, color=TEXT_MUTED, va="center")
             ax.set_xticks([])
             ax.spines["left"].set_visible(False)
@@ -532,7 +584,8 @@ def plot_trajectories(run: Run, spread: Dict[str, Spread], path: Path) -> None:
             if se is not None:
                 ax.errorbar(value * factor, y, xerr=se * factor, fmt="none",
                             ecolor=TEXT_SECONDARY, elinewidth=1, capsize=3)
-            label = text(value, key) + (f" ± {text(se, key, 2)}" if se is not None else "")
+            label = text(value, key, stress_unit=su) + (
+                f" ± {text(se, key, 2, su)}" if se is not None else "")
             ax.text((value + (se or 0)) * factor + limit * 0.015, y,
                     label + (f"  {sid}" if sid else ""), va="center", fontsize=9,
                     color=TEXT_PRIMARY)
@@ -547,7 +600,8 @@ def plot_trajectories(run: Run, spread: Dict[str, Spread], path: Path) -> None:
         "root, as in the papers; ± standard error over the trajectories. Median, best and "
         "worst: the RMSE of single trajectories. RMSE-1: one step from the "
         "ground truth; RMSE-all: whole rollout; R-RMSE: divided by the largest |σ| of the "
-        "trajectory; displacement: RMS of the ground-truth motion since step 1 (the last exact positions of the rollout).")
+        "trajectory; displacement: RMS of the ground-truth motion since the initial state (the last exact positions of the rollout). "
+        f"{REL_L2_NOTE}")
     fig.tight_layout(rect=(0, 0, 1, top))
     fig.savefig(path, dpi=180, facecolor=SURFACE)
     plt.close(fig)
@@ -638,37 +692,46 @@ def single_step_rows(run: Run) -> List[List[str]]:
     std = None
     normalizer = (run.checkpoint or {}).get("normalizer")
     if normalizer:
-        std = normalizer["stats"]["target"]["std"]
+        std = normalizer["stats"]["target"]["std"]   # in the units of the data
+    length, stress = si_factors(run.metadata)
     rows = []
     for i, (name, rmse) in enumerate(run.test["rmse_per_field"].items()):
-        factor, u = (1e-3, "kPa") if name == "stress" else (1e3, "mm per frame")
-        rows.append([name, f"{_significant(rmse * factor, 3)} {u}",
-                     f"{_significant(run.test['mae_per_field'][name] * factor, 3)} {u}",
-                     f"{rmse / std[i]:.2f}" if std else "–"])
+        # SI: velocity in m per frame, stress in Pa, other fields in the units of the data
+        si = length if name in VELOCITY_TARGET_NAMES else stress if name == "stress" else 1.0
+        factor, u = {"stress": stress_display(run.stress_unit)}.get(
+            name, (1e3, "mm per frame") if name in VELOCITY_TARGET_NAMES else (1.0, ""))
+        u = f" {u}" if u else ""
+        rows.append([name, f"{_significant(rmse * factor, 3)}{u}",
+                     f"{_significant(run.test['mae_per_field'][name] * factor, 3)}{u}",
+                     f"{rmse / (std[i] * si):.2f}" if std else "–"])
     return rows
 
 
-def spread_rows(spread: Dict[str, Spread]) -> List[List[str]]:
+def spread_rows(spread: Dict[str, Spread], su: str = SI_STRESS) -> List[List[str]]:
+    """``su``: the stress unit of the data."""
     rows = []
     for key, title in METRICS:
         s = spread[key]
-        _, u = unit(key)
+        _, u = unit(key, su)
         rows.append([f"{title} [{u}]",
-                     text(s.pooled, key) + (f" ± {text(s.se, key, 2)}" if s.se else ""),
-                     text(s.median, key),
-                     f"{text(s.best[1], key)} ({s.best[0]})" if s.best else "–",
-                     f"{text(s.worst[1], key)} ({s.worst[0]})" if s.worst else "–"])
+                     text(s.pooled, key, stress_unit=su)
+                     + (f" ± {text(s.se, key, 2, su)}" if s.se else ""),
+                     text(s.median, key, stress_unit=su),
+                     f"{text(s.best[1], key, stress_unit=su)} ({s.best[0]})" if s.best else "–",
+                     f"{text(s.worst[1], key, stress_unit=su)} ({s.worst[0]})" if s.worst
+                     else "–"])
     return rows
 
 
-def trajectory_rows(values: Dict[str, Dict], spread: Dict[str, Spread]) -> List[List[str]]:
-    """Every trajectory, worst position RMSE-all first."""
+def trajectory_rows(values: Dict[str, Dict], spread: Dict[str, Spread],
+                    su: str = SI_STRESS) -> List[List[str]]:
+    """Every trajectory, worst position RMSE-all first; ``su``: the stress unit of the data."""
     order = sorted(values, key=lambda sid: -(values[sid].get("q_rmse_all") or 0))
     rows = []
     for sid in order:
         far = [title for key, title in METRICS if spread[key].median
                and (values[sid].get(key) or 0) > FAR_ABOVE_MEDIAN * spread[key].median]
-        rows.append([sid] + [text(values[sid].get(key), key) for key, _ in METRICS]
+        rows.append([sid] + [text(values[sid].get(key), key, stress_unit=su) for key, _ in METRICS]
                     + [", ".join(far) or ""])
     return rows
 
@@ -683,7 +746,8 @@ def new_output_dir(run: Run) -> Path:
     return path
 
 
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Command line options; the reference in docs/reference/cli.md is generated from them."""
     parser = argparse.ArgumentParser(
         description="Evaluate one training run on its own: training, single step, rollout.")
     parser.add_argument("folder", type=Path,
@@ -691,7 +755,15 @@ def main(argv=None) -> int:
                              "(rollouts/<rollout>)")
     parser.add_argument("--output-dir", type=Path, default=None,
                         help="new or empty folder (default: evaluations/<time>_<run>_evaluation)")
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
     args = parser.parse_args(argv)
+    # Windows writes redirected output in its code page, which lacks characters such as
+    # σ, ρ and −: replace them there instead of failing at the end (PYTHONUTF8=1 keeps them).
+    sys.stdout.reconfigure(errors="replace")
 
     run = load_run(args.folder)
     if args.output_dir is not None:
@@ -714,7 +786,8 @@ def main(argv=None) -> int:
     plot_trajectories(run, spread, out / "03_trajectories.png")
     figures.append("03_trajectories.png")
 
-    trajectory_columns = (["Trajectory"] + [f"{title} [{unit(key)[1]}]" for key, title in METRICS]
+    trajectory_columns = (["Trajectory"] + [f"{title} [{unit(key, run.stress_unit)[1]}]"
+                                            for key, title in METRICS]
                           + [f"> {FAR_ABOVE_MEDIAN:g} × median"])
     report = [
         f"# Evaluation of {run.name} ({now():%Y-%m-%d %H:%M})",
@@ -742,15 +815,15 @@ def main(argv=None) -> int:
                "together: the squared errors of all nodes, steps and trajectories averaged, "
                "then the root, as in the papers (± standard error over the trajectories); a "
                "trajectory with a large error weighs more than in the median. "
-               "Median, best and worst: the RMSE of single trajectories.", "",
+               f"Median, best and worst: the RMSE of single trajectories. {REL_L2_NOTE}", "",
                markdown_table(["Metric", "All (pooled)", "Median", "Best", "Worst"],
-                              spread_rows(spread)), ""]
+                              spread_rows(spread, run.stress_unit)), ""]
     if run.rollout is not None:
         report += ["![error per step](02_error_per_step.png)", ""]
     report += ["![trajectories](03_trajectories.png)", "",
                "### Every trajectory", "",
                "Sorted by position RMSE-all, worst first.", "",
-               markdown_table(trajectory_columns, trajectory_rows(values, spread)), ""]
+               markdown_table(trajectory_columns, trajectory_rows(values, spread, run.stress_unit)), ""]
     (out / "evaluation.md").write_text("\n".join(report), encoding="utf-8")
 
     with open(out / "trajectories.csv", "w", newline="", encoding="utf-8") as f:

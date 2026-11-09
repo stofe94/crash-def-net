@@ -53,7 +53,7 @@ SERIES = [
 
 
 def load_history(run_dir: Path) -> list:
-    with open(run_dir / "history.json", "r") as f:
+    with open(run_dir / "history.json", "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -154,9 +154,14 @@ def _print_table(history: list, present: list) -> None:
         print(f"{record['epoch']:5d}  {values}{'  *' if record.get('is_best') else ''}")
 
 
-if __name__ == "__main__":
+def build_parser() -> argparse.ArgumentParser:
+    """Command line options; the reference in docs/reference/cli.md is generated from them."""
     parser = argparse.ArgumentParser(description="Plot the loss curves of a training run.")
     parser.add_argument("--run-dir", "--base_path", dest="run_dir", type=Path,
                         default=DEFAULT_RUN_DIR,
                         help="checkpoint directory with history.json")
-    plot_loss_curves(parser.parse_args().run_dir)
+    return parser
+
+
+if __name__ == "__main__":
+    plot_loss_curves(build_parser().parse_args().run_dir)

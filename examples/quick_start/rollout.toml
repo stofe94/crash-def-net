@@ -1,0 +1,32 @@
+# ============================================================
+# CrashDefNet — quick start: rollout
+# ============================================================
+# Rolls out a trained model, evaluates the run on the new rollout and renders an animation of
+# one trajectory in the same call. It uses the run of examples/quick_start/train.toml, so that
+# it runs as it is after that training:
+#
+#   python predict/rollout.py --config examples/quick_start/rollout.toml
+#
+# For your own runs copy this file and adapt it. Options on the command line override it,
+# e.g. --split val, --no-evaluate or --no-animate. Every key: docs/reference/configuration.md.
+
+[rollout]
+checkpoint = "checkpoints/example_run/best_model.pt"
+data_dir   = "data/deforming_plate_s10_small"
+split      = "test"    # train | val | test
+device     = "auto"    # auto | cpu | cuda
+export_vtu = true      # one .vtu per step (prediction, ground truth, error); needs pyvista
+one_step   = true      # also the one-step metrics RMSE-1
+# output_dir    = "rollouts/my_rollout"      # new or empty; default: a new folder per call
+# max_sequences = 5                          # default: every trajectory of the split
+# max_steps     = 100                        # default: every step
+# lazy          = true                       # default: as in the training
+
+[evaluation]
+enabled = true         # utils/evaluate_run.py on the new rollout folder, right after the rollout
+# output_dir = "evaluations/my_evaluation"   # new or empty; default: a new folder per call
+
+[animation]
+enabled = true         # utils/animate_rollout.py on the new rollout; needs export_vtu and pyvista
+# trajectory = "test_traj0136"               # default: the one at the median of the position error
+# output_dir = "evaluations/my_animation"    # new or empty; default: a new folder per call

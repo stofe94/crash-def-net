@@ -9,7 +9,7 @@
 # The host folder (with dataset.db, metadata.json, normalizer.json) is set as
 # DATASET_DIR in the .env file next to this file (template: .env.example):
 #   cp .env.example .env   # then adjust DATASET_DIR
-# See docs/docker.md for export and rollout inside the container.
+# See docs/guides/docker.md for export and rollout inside the container.
 # ============================================================
 services:
   train:
@@ -17,7 +17,7 @@ services:
     image: crashdefnet-deforming-plate:latest
     environment:
       DATA_DIR: "/data"
-      CONFIG: "${CONFIG:-config.example.toml}"   # selectable in .env, e.g. configs/my_run.toml
+      CONFIG: "${CONFIG:-examples/quick_start/train.toml}"   # selectable in .env, e.g. configs/my_run.toml
       DEVICE: "auto"         # overrides [training].device of the TOML
       # Against memory fragmentation: the number of contact edges varies per
       # sample, otherwise the reserved VRAM grows towards the worst case.
@@ -31,7 +31,7 @@ services:
       - ./rollouts:/app/rollouts
       # Own configs (folder configs/) can be edited without a rebuild
       - ./configs:/app/configs
-    shm_size: "2gb"          # DataLoader workers need /dev/shm
+    shm_size: "4gb"          # DataLoader workers need /dev/shm
     deploy:
       resources:
         reservations:

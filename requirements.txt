@@ -23,6 +23,7 @@ numpy>=1.24,<3.0
 # ── Configuration / utilities ────────────────────────────────
 toml>=0.10
 tqdm>=4.60
+tzdata; sys_platform == "win32"   # time zone of the timestamps (no system tz database on Windows)
 
 # ── Optional: .vtu export of the rollout (predict/rollout.py) ─
 # Without pyvista the rollout runs but writes no VTU files.

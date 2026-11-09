@@ -1,25 +1,27 @@
 cff-version: 1.2.0
 message: "If you use CrashDefNet, please cite it as below."
-title: "CrashDefNet: Learned Deformation Prediction on Simulation Meshes"
+title: "CrashDefNet: Graph Neural Network Surrogates for Crash Simulation"
 type: software
 authors:
   - family-names: Stocker
     given-names: Felix
     email: felix.stocker@sto-eng.de
-version: 0.4.0
-date-released: "2026-10-26"
-license: Apache-2.0
+version: 1.0.0
+date-released: "2026-11-09"
+license: AGPL-3.0-only
 doi: 10.5281/zenodo.23575635
 repository-code: "https://github.com/stofe94/crash-def-net"
 abstract: >-
-  CrashDefNet is a deep-learning research tool for predicting structural
-  deformation from finite element simulations, designed for scientific purposes.
-  It covers the chain from raw simulation data to the predicted deformation and
-  implements MeshGraphNets and the MeshGraphNet-Transformer (MGN-T) in one
+  CrashDefNet is a complete, lean PyTorch research framework for graph neural
+  network surrogates of crash simulation. It learns from finite element runs and
+  predicts autoregressively, step by step on the mesh, how a structure deforms. It
+  covers the chain from raw simulation data to evaluation against published results
+  and implements MeshGraphNets and the MeshGraphNet-Transformer (MGN-T) in one
   pipeline, evaluated with the metrics of the MGN-T paper on DeepMind's
-  deforming_plate benchmark.
+  deforming_plate benchmark and on OpenRadioss runs of a bumper beam against a pole.
 keywords:
   - graph neural networks
+  - autoregressive prediction
   - MeshGraphNets
   - MeshGraphNet-Transformer
   - crash simulation
@@ -42,7 +44,7 @@ references:
     year: 2021
     url: "https://arxiv.org/abs/2010.03409"
   - type: article
-    title: "MeshGraphNet-Transformer: Scalable Mesh-Based Learned Simulation for Solid Mechanics"
+    title: "MeshGraphNet-Transformer: Scalable Mesh-based Learned Simulation for Solid Mechanics"
     authors:
       - family-names: Iparraguirre
         given-names: M. M.

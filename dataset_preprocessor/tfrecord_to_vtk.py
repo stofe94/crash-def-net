@@ -19,7 +19,7 @@ tetrahedra; point data ``node_type`` (raw types 0 normal, 1 actuator,
 instead of XML ``.vtu`` (zlib-compressed). A state takes ~60 kB as .vtu, ~190 kB as .vtk.
 
 Every written run is read back with ``vtk_reader.read_run`` and compared with
-the TFRecord. DeepMind states no license for the datasets (see docs/data.md):
+the TFRecord. DeepMind states no license for the datasets (see docs/concepts/graphs.md):
 keep the converted files local.
 
 Usage (without arguments all 100 trajectories of test.tfrecord)::
@@ -58,7 +58,7 @@ from dataset_preprocessor.vtk_reader import read_run  # noqa: E402
 FORMATS = ("vtu", "vtk")
 VTK_DEFAULTS = dict(
     raw_dir=EXPORT_DEFAULTS["raw_dir"],
-    source_tfrecord=EXPORT_DEFAULTS["source_tfrecord"],
+    source_tfrecord=EXPORT_DEFAULTS["sources"],
     out_dir=EXPORT_DEFAULTS["raw_dir_vtk"],
     count=None,                                  # None: every trajectory of the TFRecord
     file_format="vtu",
@@ -83,7 +83,7 @@ def write_run(run_dir: Path, traj: RawTrajectory, file_format: str = "vtu") -> N
         name = f"t{frame:04d}.{file_format}"
         grid.save(str(run_dir / name))
         files.append({"name": name, "time": float(frame)})
-    with open(run_dir / f"{run_dir.name}.{file_format}.series", "w") as f:
+    with open(run_dir / f"{run_dir.name}.{file_format}.series", "w", encoding="utf-8") as f:
         json.dump({"file-series-version": "1.0", "files": files}, f, indent=1)
 
 
@@ -110,7 +110,7 @@ def convert(raw_dir: str, out_dir: str, source_tfrecord: str, count: Optional[in
     out = Path(out_dir)
     source_dir = out / Path(source_tfrecord).stem
     source_dir.mkdir(parents=True, exist_ok=True)
-    with open(out / "meta.json", "w") as f:
+    with open(out / "meta.json", "w", encoding="utf-8") as f:
         json.dump({"raw_format": "vtk",
                    **{key: meta[key] for key in _SIMULATION_META if key in meta}}, f, indent=2)
 
@@ -136,13 +136,13 @@ def convert(raw_dir: str, out_dir: str, source_tfrecord: str, count: Optional[in
         "point_data": {"node_type": "raw node type: 0 normal, 1 actuator, 3 clamped",
                        "stress": "von Mises stress per node"},
     }
-    with open(source_dir / "conversion.json", "w") as f:
+    with open(source_dir / "conversion.json", "w", encoding="utf-8") as f:
         json.dump(conversion, f, indent=2)
     return runs
 
 
-def main(argv=None) -> None:
-    """Convert a TFRecord; defaults come from ``VTK_DEFAULTS``."""
+def build_parser() -> argparse.ArgumentParser:
+    """Command line options; the reference in docs/reference/cli.md is generated from them."""
     d = VTK_DEFAULTS
     parser = argparse.ArgumentParser(
         description="Convert DeepMind deforming_plate trajectories into VTK time series "
@@ -162,6 +162,12 @@ def main(argv=None) -> None:
                         default=d["file_format"], help="XML .vtu or legacy .vtk files")
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction,
                         default=d["overwrite"], help="replace existing runs")
+    return parser
+
+
+def main(argv=None) -> None:
+    """Convert a TFRecord; defaults come from ``VTK_DEFAULTS``."""
+    parser = build_parser()
     args = parser.parse_args(argv)
 
     try:

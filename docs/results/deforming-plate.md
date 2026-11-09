@@ -1,21 +1,20 @@
-# First results (v0.4.0, preliminary)
+# Deforming plate
 
 The two architectures in CrashDefNet, **MeshGraphNets (MGN)** and
 **MeshGraphNet-Transformer (MGN-T)**, on DeepMind's `deforming_plate`, next to the values
 of the papers. The runs are deliberately small: a subset of the data, one GPU, a few
 hours. Both models share data, seed, budget and recipe of the
-[comparison protocol](comparison-protocol.md) and the contact edges
+[comparison protocol](../guides/comparison-protocol.md) and the contact edges
 (`self_contact_aware`): MGN-T as in arXiv v4 ([configuration](#mgn-t-configuration)),
-MeshGraphNets in paper size as the [comparable baseline](comparison-protocol.md#baselines).
+MeshGraphNets in paper size as the [comparable baseline](../guides/comparison-protocol.md#baselines).
 The runs show that the pipeline works end to end and how the architectures behave; they
 are **not** a reproduction of the papers' numbers.
 
-![Rollout of an unseen test geometry: ground truth, MGN-T and MeshGraphNets](assets/rollout_test_traj0136.gif)
+![Rollout of an unseen test geometry: ground truth, MGN-T and MeshGraphNets](../assets/rollout_test_traj0136.gif)
 
 *Autoregressive rollout of test trajectory 136, a geometry the models never saw during
-training. Colour: von Mises stress, same scale in all three panels. Grey: the actuator, whose motion is prescribed. Made
-with [`utils/animate_rollout.py`](../utils/animate_rollout.py) (see
-[Reproducing](#reproducing)).*
+training. Colour: von Mises stress, same scale in all three panels. Grey: the actuator, whose
+motion is prescribed.*
 
 ## Setup
 
@@ -32,23 +31,19 @@ with [`utils/animate_rollout.py`](../utils/animate_rollout.py) (see
 | Model selection | rollout MSE on the val split | same |
 | Rollout | 98 autoregressive steps over the whole load case (loading and unloading), 20 unseen test geometries | same |
 
-MeshGraphNets uses the contact edges of MGN-T instead of those of its paper (all pairs
-within the contact radius), which do not scale to crash meshes: both models see the same
-graph, so a difference comes from the architecture. The MeshGraphNets paper's own
-results, with its edges, appear as reference rows below.
+Both models see the same graph, so a difference comes from the architecture
+([baselines](../guides/comparison-protocol.md#baselines)). The MeshGraphNets paper's own results,
+with its edges, appear as reference rows below.
 
 ## MGN-T configuration
 
 MGN-T is trained in the configuration of its paper (Iparraguirre et al., arXiv v4,
-Sec. 3 and 5.1): local message passing (2 steps), a global transformer stage
-(2 blocks, 4 heads, 16 physics tokens), local message passing again (2 steps), two-layer
-MLPs, contact edges for collision and self-contact (`world_edges =
-"self_contact_aware"`) and a global stage over the simulated structure only
-(`transformer_nodes = "structure"`). The actuator thus acts on the plate through
-contact, and the plate passes the load on through its material.
+Sec. 3 and 5.1; every key in [compare architectures](../guides/compare-architectures.md#3-configs)),
+with a global stage over the simulated structure only. The actuator thus acts on the plate
+through contact, and the plate passes the load on through its material.
 
 Values the paper leaves open are set as follows; the implementation's general
-assumptions are listed in [models](models.md#assumptions-where-the-paper-leaves-gaps):
+assumptions are listed in [models](../concepts/models.md#assumptions-where-the-paper-leaves-gaps):
 
 | Setting | Value | Why |
 |---|---|---|
@@ -57,21 +52,14 @@ assumptions are listed in [models](models.md#assumptions-where-the-paper-leaves-
 | Positional encoding | 4 frequencies (`pe_frequencies`) | not given in the paper |
 | Feed-forward width | 4 × token width (`ffn_ratio`) | standard value; not given in the paper |
 
-The training recipe is the protocol's: batch 8, 60 epochs (74,280 optimizer steps).
-
-## Metrics
-
-The metrics follow the MGN-T paper (arXiv v4, App. A on p. 12)
-([metrics](rollout-and-evaluation.md#paper-metrics)).
-
-- **q**: node position (m), **σ**: von Mises stress (Pa); **RMSE-all**: whole rollout;
-  **RMSE-1**: one step from the ground-truth state
-- **20 test traj. (pooled)**: one RMSE over all test trajectories together, as in the
-  papers (squared errors averaged over all nodes, steps and trajectories, then the root);
-  **median trajectory**: the median of the RMSEs of the single trajectories
-- **±**: standard error over the test trajectories
-
 ## Results
+
+Metrics as in the MGN-T paper (arXiv v4, App. A on p. 12;
+[metrics](../concepts/metrics.md#rollout-metrics)): **q** node position (m), **σ** von Mises
+stress (Pa); **RMSE-all** over the whole rollout, **RMSE-1** one step from the ground-truth
+state; **20 test traj. (pooled)** one RMSE over all test trajectories together, as in the
+papers, **median trajectory** the median of the RMSEs of the single trajectories; **±**
+standard error over the test trajectories.
 
 | Model | Params | q RMSE-all [mm] | σ RMSE-all [kPa] | q RMSE-1 [mm] | σ RMSE-1 [kPa] |
 |---|---|---|---|---|---|
@@ -85,19 +73,24 @@ The metrics follow the MGN-T paper (arXiv v4, App. A on p. 12)
 Reference rows: MGN-T from Iparraguirre et al. (arXiv v4, Tab. 3), MGN from Pfaff et al.
 (ICLR 2021, Tab. 1; parameter count from the MGN-T paper, Tab. 2).
 
-![Error over the test trajectories](assets/error_per_trajectory.png)
+![Error over the test trajectories](../assets/error_per_trajectory.png)
 
-### Pooled and median
+All metrics next to the paper's values (whiskers: standard error):
 
-The pooled values lie well above the median because a few test geometries have much
-larger errors. The 100 training trajectories are drawn from DeepMind's 1,200, and the
-test split contains geometries that deform more than most of them: trajectory 149 by up
-to 597 mm, more than any training trajectory (maximum 445 mm, median 77 mm). Squared
-before averaging, their errors dominate the pooled values. For the typical geometry the
-median is the better guide; only the pooled values compare with the paper.
+![Absolute errors compared with the MGN-T paper](../assets/absolute_errors.png)
+
+Error over the rollout, averaged over the 20 test trajectories. The drop at the end is
+the unloading phase, where the plate springs back:
+
+![Error over the rollout](../assets/error_per_step.png)
 
 ### What the numbers show
 
+- **Pooled and median.** The pooled values lie well above the median because a few test
+  geometries deform more than any training trajectory: trajectory 149 by up to 597 mm
+  (training: maximum 445 mm, median 77 mm). Squared before averaging, their errors dominate
+  the pooled values; for the typical geometry the median is the better guide, only the pooled
+  values compare with the paper.
 - **Efficiency.** MGN-T has **7.5× fewer parameters** than MeshGraphNets, needs
   **2.6× less training time** (2 h 54 min instead of 7 h 34 min) and about a quarter of
   the GPU memory (~2 instead of ~8 GB).
@@ -112,17 +105,6 @@ median is the better guide; only the pooled values compare with the paper.
   geometries: position on 16 of 20, stress on 19 of 20.
 - **Large deformations.** Trajectories 149, 146 and 147 have the largest errors of both
   models and deform most (597, 380 and 276 mm).
-
-### Further figures
-
-All metrics next to the paper's values (whiskers: standard error):
-
-![Absolute errors compared with the MGN-T paper](assets/absolute_errors.png)
-
-Error over the rollout, averaged over the 20 test trajectories. The drop at the end is
-the unloading phase, where the plate springs back:
-
-![Error over the rollout](assets/error_per_step.png)
 
 ### Why the numbers are not comparable with the paper
 
@@ -153,73 +135,8 @@ strongly, and at stride 4 it has few time steps, as real crash data often do.
 A scientific evaluation of the results is planned for later releases of CrashDefNet and
 will be published separately, as a paper or in another form.
 
-## Next steps
-
-- Train on the full training split (`train.tfrecord`, 1,200 trajectories) at stride 1,
-  as in the paper, using lazy loading (`[data] lazy = true`)
-- Train each architecture with several seeds
-
-## Reproducing
-
-```bash
-# 1) Dataset (needs train, valid and test.tfrecord, see docs/installation.md)
-python -m dataset_preprocessor.export --out-dir data/deforming_plate_s4_t150 \
-    --source-tfrecord train.tfrecord valid.tfrecord test.tfrecord --select-seed 42 \
-    --n-train 100 --n-val 30 --n-test 20 --num-steps 100 --time-stride 4
-
-# 2) Training (GPU): copies of the protocol config with the settings below
-python train/train.py --config configs/<mgn run>.toml
-python train/train.py --config configs/<mgn_t run>.toml
-
-# 3) Rollouts of the selected models on the test split
-python predict/rollout.py --checkpoint checkpoints/<mgn_t run>/best_model.pt \
-    --data-dir data/deforming_plate_s4_t150 --split test
-python predict/rollout.py --checkpoint checkpoints/<mgn run>/best_model.pt \
-    --data-dir data/deforming_plate_s4_t150 --split test
-
-# 4) Protocol check, evaluation of each run, comparison with the paper (in evaluations/)
-python utils/check_protocol.py rollouts/<mgn rollout> rollouts/<mgn_t rollout>
-python utils/evaluate_run.py rollouts/<mgn_t rollout>
-python utils/evaluate_run.py rollouts/<mgn rollout>
-python utils/compare_paper.py rollouts/<mgn_t rollout> rollouts/<mgn rollout>
-
-# 5) Animation of test trajectory 136 (the GIF at the top, ~20 s on a CPU)
-python utils/animate_rollout.py rollouts/<mgn_t rollout> rollouts/<mgn rollout> \
-    --trajectory test_traj0136
-```
-
-Both configs differ from the protocol config
-([`protocols/deforming_plate_s4_t150.toml`](../protocols/deforming_plate_s4_t150.toml))
-only in the declared variations and machine settings. Both set the contact edges
-
-```toml
-[model]
-world_edges                 = "self_contact_aware"
-world_edge_exclude_distance = 2.0
-```
-
-and train without micro-batches (`micro_batch_size` unset), which these edges allow on a
-16 GB GPU. The MGN-T config also sets the architecture:
-
-```toml
-[model]
-architecture = "mgn_t"
-
-[model.mgn_t]
-latent_size            = 80
-token_dim              = 48
-num_tokens             = 16
-num_heads              = 4
-num_transformer_blocks = 2
-num_pre_mp_steps       = 2
-num_post_mp_steps      = 2
-num_mlp_layers         = 2
-aggregation            = "sum"
-transformer_nodes      = "structure"
-tau_init               = 0.31
-pe_frequencies         = 4
-ffn_ratio              = 4
-```
-
-Every number is traceable through `rollout_info.json` of its rollout: checkpoint
-SHA-256, dataset fingerprint, training config, command line and git commit.
+Made with release [v0.4.0](https://github.com/stofe94/crash-def-net/tree/v0.4.0). The rollout
+of the current version predicts every frame after the initial state, one step more than
+v0.4.0, so RMSE-all differs by a few percent (MGN-T: 12.1 instead of 12.2 mm over all 20 test
+trajectories, 5.76 instead of 5.62 mm on the median trajectory); RMSE-1 is the same. How to
+run it: [compare architectures](../guides/compare-architectures.md).

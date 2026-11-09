@@ -7,18 +7,22 @@ evaluations/
 test/
 archive/
 
+
 # Papers are kept locally next to the docs, but not redistributed
 docs/*.pdf
+
+# Documentation website, built locally (zensical build)
+site/
+.cache/
 
 # Python
 *.pyc
 __pycache__/
 .ruff_cache/
 .pytest_cache/
+*.egg-info/
 
 # Editor and misc
-.vscode/
-*x_*.txt
 *.tar.gz
 
 # Machine-specific docker compose settings (template: .env.example)

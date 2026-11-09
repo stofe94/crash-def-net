@@ -10,8 +10,8 @@ Per batch (in this order):
    the current positions of the free nodes; velocity target, ``velocity_prev``
    and all edges are adjusted consistently.
 3. **Stress noise** (optional, needs history) on ``stress_prev``.
-4. Loss on the normalized targets of the nodes in ``loss_mask``, gradient
-   clipping, optimizer step; the exponential LR schedule steps per batch.
+4. Loss on the normalized targets of the nodes in ``loss_mask``, without targets a
+   node does not have (``target_given``), gradient clipping, optimizer step; the exponential LR schedule steps per batch.
 
 After every epoch the single-step validation loss is computed; with rollout
 validation every N epochs also the autoregressive rollout error on the val
@@ -37,7 +37,6 @@ import logging
 import math
 import os
 import re
-import resource
 import shutil
 import sys
 import time
@@ -55,13 +54,17 @@ from torch_geometric.data import Batch
 from tqdm import tqdm
 
 from dataset_preprocessor import (
-    DeformingPlateDataset,
     PredecessorPairDataset,
+    TrajectoryDataset,
     collate_with_predecessor,
 )
+from dataset_preprocessor.dataset import load_statistics
 from dataset_preprocessor.graph_features import (
+    ALL_FEATURES,
     PREV_STRESS_NAMES,
     PREV_VELOCITY_NAMES,
+    VELOCITY_TARGET_NAMES,
+    FeatureSelection,
     add_world_edges,
     displace_nodes,
     free_node_mask,
@@ -72,6 +75,7 @@ from train.config import TrainingConfig
 from train.early_stopping import ROLLOUT_CRITERIA, EarlyStopping
 from utils.normalizer import Normalizer
 from utils.timezone import Formatter, now
+from utils.units import SI_LENGTH, SI_STRESS, si_factors
 
 logger = logging.getLogger("train")
 
@@ -118,14 +122,16 @@ def create_dataloaders(config: TrainingConfig, normalizer: Normalizer
     loading = dict(lazy=config.lazy_loading, cache_frames=config.cache_frames,
                    static_cache_mb=config.static_cache_mb, world_edges=config.world_edges,
                    world_edge_exclude_distance=config.world_edge_exclude_distance,
-                   world_edge_exclude_hops=config.world_edge_exclude_hops)
+                   world_edge_exclude_hops=config.world_edge_exclude_hops,
+                   features=config.features, start_frame=config.start_frame,
+                   end_frame=config.end_frame)
     # With position noise every train batch gets its world edges anew on the
     # device (displace_nodes): the contact search in the loader would be wasted.
     world_edges_in_loader = config.world_noise_std <= 0
-    train_set = DeformingPlateDataset(db_path, "train", normalizer,
+    train_set = TrajectoryDataset(db_path, "train", normalizer,
                                       build_world_edges=world_edges_in_loader, **loading)
-    val_set = DeformingPlateDataset(db_path, "val", normalizer, **loading)
-    test_set = DeformingPlateDataset(db_path, "test", normalizer, **loading)
+    val_set = TrajectoryDataset(db_path, "val", normalizer, **loading)
+    test_set = TrajectoryDataset(db_path, "test", normalizer, **loading)
     mode = (f"lazy, cache {config.cache_frames} frames and {config.static_cache_mb:g} MB "
             "of static data per worker" if config.lazy_loading else "in memory")
     world = config.world_edges
@@ -138,6 +144,12 @@ def create_dataloaders(config: TrainingConfig, normalizer: Normalizer
     logger.info(f"Data: {db_path} — train {len(train_set)}, val {len(val_set)}, "
                 f"test {len(test_set)} samples (history {train_set.history}, {mode}, "
                 f"{config.num_dataloader_workers} workers, world edges: {world})")
+    if config.features != ALL_FEATURES:
+        logger.info(f"Features of the export in use: local {train_set.static_names}, "
+                    f"global {train_set.global_names}, result fields {train_set.field_names}")
+        if train_set.unused_features:
+            logger.warning(f"Features of the export that [data] of the config leaves out: "
+                           f"{train_set.unused_features}")
 
     train_collate = Batch.from_data_list
     if config.scheduled_sampling:
@@ -167,7 +179,8 @@ def create_dataloaders(config: TrainingConfig, normalizer: Normalizer
 
 def create_model(config: TrainingConfig, metadata: Dict,
                  normalizer: Optional[Normalizer] = None) -> nn.Module:
-    """Model of ``config.architecture``, sized from the dataset's ``metadata.json``.
+    """Model of ``config.architecture``, sized from ``metadata``: the dataset's
+    ``metadata.json`` with the selected features (``select_metadata``).
 
     With ``residual_target`` the network is wrapped in ``ResidualTargetModel``;
     its statistics come from ``normalizer`` when training and from the
@@ -179,6 +192,8 @@ def create_model(config: TrainingConfig, metadata: Dict,
         world_edge_in_dim=metadata.get("world_edge_feature_dims", 0),
         output_dim=metadata["target_dim"],
     )
+    if metadata.get("global_feature_dims"):   # run parameters as their own input
+        dims["global_in_dim"] = metadata["global_feature_dims"]
     if config.architecture == "mgn_t":
         from models.mgn_t import MgnTransformer
         model = MgnTransformer(
@@ -227,19 +242,21 @@ class TrainedModel:
     normalizer_source: str = "checkpoint"   # or the normalizer.json it was read from
 
 
-def checkpoint_normalizer(checkpoint: Dict, data_dir, source: str = "checkpoint"
+def checkpoint_normalizer(checkpoint: Dict, data_dir, source: str = "checkpoint",
+                          features: FeatureSelection = ALL_FEATURES, windowed: bool = False
                           ) -> Tuple[Normalizer, str]:
     """Statistics a model was trained with, and where they come from.
 
-    Checkpoints store them; older ones fall back to ``<data_dir>/normalizer.json``.
-    If that file differs from the stored statistics (dataset exported anew or
-    grown), the stored ones win and a warning is logged.
+    Checkpoints store them, for the selected ``features``; older ones fall back to
+    ``<data_dir>/normalizer.json``. If that file differs from the stored statistics
+    (dataset exported anew or grown), the stored ones win and a warning is logged; not
+    for a run on part of the frames (``windowed``), whose statistics differ anyway.
     """
     path = Path(data_dir) / "normalizer.json"
     if checkpoint.get("normalizer") is None:
         return Normalizer.load(str(path)), str(path)
     normalizer = Normalizer.from_dict(checkpoint["normalizer"], source)
-    if path.exists() and Normalizer.load(str(path)) != normalizer:
+    if not windowed and path.exists() and load_statistics(data_dir, features) != normalizer:
         logger.warning(f"{path} differs from the statistics the model was trained with — "
                        f"using those of {source}")
     return normalizer, "checkpoint"
@@ -260,8 +277,9 @@ def load_trained_model(checkpoint_path: str, device: str = "auto",
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = TrainingConfig.from_dict(checkpoint["config"])
     metadata = checkpoint["metadata"]
-    normalizer, source = checkpoint_normalizer(checkpoint, data_dir or config.data_dir,
-                                               str(checkpoint_path))
+    normalizer, source = checkpoint_normalizer(
+        checkpoint, data_dir or config.data_dir, str(checkpoint_path), config.features,
+        windowed=config.start_frame is not None or config.end_frame is not None)
 
     model = create_model(config, metadata)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -298,13 +316,13 @@ def peak_memory(device: torch.device) -> Dict[str, float]:
     allocated by tensors and reserved by PyTorch's allocator (nvidia-smi shows the
     reserved memory plus the CUDA context). No read from the GPU."""
     gib = 2 ** 30
-    peak = {"ram_main": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 / gib}
+    peak = {"ram_main": _peak_rss() / gib}
     workers = []
-    for stat in Path("/proc").glob("[0-9]*/stat"):
+    for stat in Path("/proc").glob("[0-9]*/stat"):   # Linux; elsewhere no worker figure
         try:   # parent pid: the 2nd field after the command name in parentheses
-            if int(stat.read_text().rsplit(")", 1)[1].split()[1]) == os.getpid():
-                hwm = re.search(r"^VmHWM:\s+(\d+) kB", (stat.parent / "status").read_text(),
-                                re.M)
+            if int(stat.read_text(encoding="utf-8").rsplit(")", 1)[1].split()[1]) == os.getpid():
+                status = (stat.parent / "status").read_text(encoding="utf-8")
+                hwm = re.search(r"^VmHWM:\s+(\d+) kB", status, re.M)
                 workers.append(int(hwm.group(1)) * 1024 / gib)
         except (OSError, IndexError, ValueError, AttributeError):
             continue   # ended meanwhile, or not readable
@@ -314,6 +332,33 @@ def peak_memory(device: torch.device) -> Dict[str, float]:
         peak["gpu_allocated"] = torch.cuda.max_memory_allocated(device) / gib
         peak["gpu_reserved"] = torch.cuda.max_memory_reserved(device) / gib
     return {key: round(value, 2) for key, value in peak.items()}
+
+
+def _peak_rss() -> int:
+    """Peak resident memory of this process in bytes; on Windows the peak working set
+    (the module ``resource`` exists on Unix only)."""
+    if sys.platform != "win32":
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024   # KiB on Linux
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):   # PROCESS_MEMORY_COUNTERS
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+            (name, ctypes.c_size_t) for name in (
+                "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                "PagefileUsage", "PeakPagefileUsage")]
+
+    kernel32, psapi = ctypes.WinDLL("kernel32"), ctypes.WinDLL("psapi")
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters),
+                                           wintypes.DWORD]
+    counters = Counters(cb=ctypes.sizeof(Counters))
+    if not psapi.GetProcessMemoryInfo(kernel32.GetCurrentProcess(), ctypes.byref(counters),
+                                      counters.cb):
+        return 0
+    return counters.PeakWorkingSetSize
 
 
 def format_memory(peak: Dict[str, float]) -> str:
@@ -328,7 +373,7 @@ def format_memory(peak: Dict[str, float]) -> str:
 
 def _read(path: str) -> str:
     try:
-        return Path(path).read_text()
+        return Path(path).read_text(encoding="utf-8")
     except OSError:
         return ""
 
@@ -372,7 +417,7 @@ class Trainer:
         self.device = torch.device(config.device)
         self.model = model.to(self.device)
 
-        # Feature layout of the dataset (fixed at export time).
+        # Feature layout of the dataset (the export and the feature selection of the config).
         self.node_names: List[str] = metadata["node_feature_names"]
         self.target_names: List[str] = metadata["target_feature_names"]
         self.prev_to_target = prev_to_target_columns(self.node_names, self.target_names)
@@ -419,7 +464,8 @@ class Trainer:
                              world_edges=self.config.world_edges,
                              world_edge_exclude_distance=self.config.world_edge_exclude_distance,
                              world_edge_exclude_hops=self.config.world_edge_exclude_hops,
-                             static_cache_mb=self.config.static_cache_mb)
+                             static_cache_mb=self.config.static_cache_mb,
+                             features=self.config.features)
 
     def _check_history_options(self) -> None:
         """Options that need the history layout (``*_prev`` inputs)."""
@@ -492,8 +538,11 @@ class Trainer:
         velocity_columns = self.velocity_prev_columns or []
 
         x = x_before.clone()
+        given = getattr(batch, "target_given", None)
         for column, target_column in self.prev_to_target.items():
             rows = use_prediction & free if column in velocity_columns else use_prediction
+            if given is not None:
+                rows = rows & given[:, target_column]
             x[rows, column] = ((prediction[rows, target_column] - node_mean[column])
                                / node_std[column])
         batch.x = x
@@ -522,6 +571,9 @@ class Trainer:
         column_std = float(self.normalizer.stats["node_features"]["std"][column])
         noise = torch.randn(batch.x.shape[0], device=batch.x.device) \
             * (self.config.stress_noise_std / column_std)
+        given = getattr(batch, "target_given", None)
+        if given is not None:
+            noise = noise * given[:, self.target_names.index("stress")]
         x = batch.x.clone()
         x[:, column] = x[:, column] + noise * batch.loss_mask
         batch.x = x
@@ -530,12 +582,18 @@ class Trainer:
     # ── epochs ──────────────────────────────────────────────────────────────
 
     def _loss_sum(self, batch, prediction: torch.Tensor) -> torch.Tensor:
-        """Loss summed over the targets of the nodes in ``loss_mask``; the mask
-        multiplies instead of indexing, which would wait for the GPU."""
-        return (self.loss_fn(prediction, batch.y) * batch.loss_mask[:, None]).sum()
+        """Loss summed over the targets of the nodes in ``loss_mask``, without targets a node
+        does not have (``target_given``); the masks multiply instead of indexing, which
+        would wait for the GPU."""
+        terms = self.loss_fn(prediction, batch.y) * batch.loss_mask[:, None]
+        given = getattr(batch, "target_given", None)
+        return (terms if given is None else terms * given).sum()
 
     def _num_loss_terms(self, batch) -> torch.Tensor:
-        return batch.loss_mask.sum() * batch.y.shape[-1]
+        given = getattr(batch, "target_given", None)
+        if given is None:
+            return batch.loss_mask.sum() * batch.y.shape[-1]
+        return (batch.loss_mask[:, None] & given).sum()
 
     def train_epoch(self, loader: DataLoader, epoch: int) -> float:
         """One pass over the train split; returns the mean loss per graph.
@@ -624,7 +682,8 @@ class Trainer:
         try:
             summary = self.rollout_runner.run(
                 split="val", max_sequences=self.config.rollout_validation_max_sequences,
-                export_vtu=False, verbose=False)
+                export_vtu=False, verbose=False, start_frame=self.config.start_frame,
+                end_frame=self.config.end_frame)
         finally:
             self.model.train(was_training)
         position_rmse = summary["position_rmse_per_step"]
@@ -684,7 +743,7 @@ class Trainer:
                     f"({architecture}, residual_target={cfg.residual_target})")
         self._log_training_options()
         config_path = self.checkpoint_dir / f"{self.run_name}_config.json"
-        with open(config_path, "w") as f:
+        with open(config_path, "w", encoding="utf-8") as f:
             json.dump(cfg.to_dict(), f, indent=2)
         history_path = self.checkpoint_dir / "history.json"
 
@@ -753,7 +812,7 @@ class Trainer:
             self.history.append(record)
             if evaluated:
                 self._mark_selection()
-            with open(history_path, "w") as f:
+            with open(history_path, "w", encoding="utf-8") as f:
                 json.dump(self.history, f, indent=2)
 
             if selected is not None:
@@ -776,7 +835,7 @@ class Trainer:
                                        else "epochs")
             if self.selection.should_stop:
                 self.history[-1]["stop_reason"] = self.selection.stop_reason()
-            with open(history_path, "w") as f:
+            with open(history_path, "w", encoding="utf-8") as f:
                 json.dump(self.history, f, indent=2)
         if last_epoch > start_epoch and last_epoch % cfg.save_every != 0:
             # Final state, so the run can be resumed.
@@ -811,7 +870,8 @@ class Trainer:
                         ", gradients accumulated)" if cfg.accumulation_steps > 1 else "")
         logger.info(f"Batch: {cfg.batch_size} graphs per optimizer step{accumulation}")
         stress_noise = cfg.stress_noise_std if self.stress_prev_column is not None else 0.0
-        logger.info(f"Noise: position {cfg.world_noise_std}, stress_prev {stress_noise}")
+        logger.info(f"Noise: position {cfg.world_noise_std} "
+                    f"{self.metadata.get('length_unit', SI_LENGTH)}, stress_prev {stress_noise}")
         if cfg.scheduled_sampling:
             logger.info(f"Scheduled sampling: teacher forcing {cfg.scheduled_sampling_start_ratio}"
                         f" -> {cfg.scheduled_sampling_end_ratio} over "
@@ -852,7 +912,7 @@ class Trainer:
                   f"elapsed {format_duration(time.time() - start_time)}, "
                   f"remaining ~{format_duration(remaining)} "
                   f"(finish ~{finish:%d.%m. %H:%M})")
-        timing += f" | {self.selection.status()} | {format_memory(record['peak_memory'])}"
+        timing += f" | {self.selection.status()}"
         logger.info(timing)
 
     # ── checkpoints ─────────────────────────────────────────────────────────
@@ -930,34 +990,40 @@ class Trainer:
     def evaluate(self, loader: DataLoader) -> Dict:
         """Single-step test metrics on the nodes in ``loss_mask``.
 
-        Normalized MSE/MAE over all targets, plus RMSE/MAE per target field in
-        raw units (velocity in m per selected frame, stress in Pa). The errors
-        are summed per batch (float64), so memory does not grow with the split.
+        Normalized MSE/MAE over all targets, plus RMSE/MAE per target field in SI
+        (velocity in m per selected frame, stress in Pa; other result fields in the
+        units of the data, ``utils.units``). The errors are summed per batch
+        (float64), so memory does not grow with the split.
         """
         self.model.eval()
         sums = torch.zeros(4, len(self.target_names), dtype=torch.float64)
-        rows = 0
+        rows = torch.zeros(len(self.target_names), dtype=torch.float64)   # values per target
         for batch in self._prepared(loader):
             mask = batch.loss_mask
             prediction, target = self.model(batch)[mask], batch.y[mask]
+            given = getattr(batch, "target_given", None)
+            given = torch.ones_like(target, dtype=torch.bool) if given is None else given[mask]
             raw_error = (self.normalizer.denormalize(prediction, "target")
-                         - self.normalizer.denormalize(target, "target"))
-            error = prediction - target
+                         - self.normalizer.denormalize(target, "target")) * given
+            error = (prediction - target) * given
             sums += torch.stack((error.pow(2).sum(0), error.abs().sum(0),
                                  raw_error.pow(2).sum(0), raw_error.abs().sum(0))).double().cpu()
-            rows += int(mask.sum())
-        squared, absolute, raw_squared, raw_absolute = sums / max(rows, 1)
+            rows += given.sum(0).double().cpu()
+        squared, absolute, raw_squared, raw_absolute = sums / rows.clamp_min(1)
+        length, stress = si_factors(self.metadata)
+        si = [length if name in VELOCITY_TARGET_NAMES else stress if name == "stress" else 1.0
+              for name in self.target_names]
         return {
             "mse_normalized": squared.mean().item(),
             "mae_normalized": absolute.mean().item(),
-            "rmse_per_field": {name: math.sqrt(raw_squared[i].item())
+            "rmse_per_field": {name: math.sqrt(raw_squared[i].item()) * si[i]
                                for i, name in enumerate(self.target_names)},
-            "mae_per_field": {name: raw_absolute[i].item()
+            "mae_per_field": {name: raw_absolute[i].item() * si[i]
                               for i, name in enumerate(self.target_names)},
         }
 
     def evaluate_rollout(self, split: str = "test", dataset=None) -> Dict:
-        """Full rollout of every trajectory of ``split`` with the paper metrics
+        """Full rollout of every trajectory of ``split`` with the rollout metrics
         (RMSE-1, RMSE-all, R-RMSE of position and stress, see predict/rollout.py);
         ``dataset`` (that split, e.g. of the test loader) is used instead of a new one."""
         runner = self.rollout_runner or self._new_rollout_runner()
@@ -965,17 +1031,19 @@ class Trainer:
             runner.share_dataset(split, dataset)
         was_training = self.model.training
         try:
-            summary = runner.run(split=split, export_vtu=False, verbose=False, one_step=True)
+            summary = runner.run(split=split, export_vtu=False, verbose=False, one_step=True,
+                                 start_frame=self.config.start_frame,
+                                 end_frame=self.config.end_frame)
         finally:
             self.model.train(was_training)
         position_rmse = summary["position_rmse_per_step"]
         return {
-            "paper_metrics": summary["paper_metrics"],
+            "rollout_metrics": summary["rollout_metrics"],
             "mean_mse_normalized": summary["mean_mse_normalized"],
             "position_rmse": float(np.mean(position_rmse)) if position_rmse else None,
             "position_rmse_final": position_rmse[-1] if position_rmse else None,
             "rmse_per_field": summary["rmse_per_field"],
-            "sequences": {sequence_id: result["paper_metrics"]
+            "sequences": {sequence_id: result["rollout_metrics"]
                           for sequence_id, result in summary["sequences"].items()},
         }
 
@@ -991,14 +1059,15 @@ class Trainer:
         for name in self.target_names:
             logger.info(f"    {name:12s} RMSE {metrics['rmse_per_field'][name]:.4e}  "
                         f"MAE {metrics['mae_per_field'][name]:.4e}")
-        from predict.rollout import format_paper_metrics
+        from predict.rollout import format_rollout_metrics
         metrics["rollout"] = self.evaluate_rollout("test", loader.dataset)
         logger.info(f"Test (full rollout, {len(metrics['rollout']['sequences'])} trajectories), "
-                    "paper metrics (± = standard error over trajectories):")
-        for line in format_paper_metrics(metrics["rollout"]["paper_metrics"]):
+                    "rollout metrics (± = standard error over trajectories):")
+        for line in format_rollout_metrics(metrics["rollout"]["rollout_metrics"],
+                                         self.metadata.get("stress_unit", SI_STRESS)):
             logger.info(line)
         path = self.checkpoint_dir / "test_metrics.json"
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
         logger.info(f"Test metrics: {path}")
         return metrics

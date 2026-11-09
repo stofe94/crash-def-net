@@ -25,7 +25,7 @@ of the rollout is switched off in the container (see below).
 ## Train
 
 The dataset folder (with `dataset.db`, `metadata.json`, `normalizer.json`) is created
-with the exporter (see [data.md](data.md)) and set in `.env` next to
+with the exporter (see [export a dataset](export.md)) and set in `.env` next to
 `docker-compose.yml` (not versioned, template `.env.example`):
 
 ```bash
@@ -36,8 +36,8 @@ cp .env.example .env
 docker compose up
 ```
 
-Without `.env`, `./data/deforming_plate_s10_small` and `config.example.toml` are used.
-A one-off override also works from the shell:
+Without `.env`, `./data/deforming_plate_s10_small` and `examples/quick_start/train.toml` are used. Other
+data need a config adapted to their [features](training.md#choose-the-features). A one-off override also works from the shell:
 `DATASET_DIR=/path CONFIG=configs/... docker compose up`.
 
 What the container does:
@@ -64,13 +64,13 @@ rebuild.
 ## Export inside the container
 
 With the raw data under `datasets/deforming_plate/raw_dataset/` (see
-[installation.md](installation.md)):
+[installation](../getting-started/installation.md#raw-data)):
 
 ```bash
 docker run --rm -v $PWD/datasets:/app/datasets -v $PWD/data:/app/data \
   --entrypoint python crashdefnet-deforming-plate:latest -m dataset_preprocessor.export \
   --out-dir data/deforming_plate_s4_t150 \
-  --source-tfrecord train.tfrecord valid.tfrecord test.tfrecord --select-seed 42 \
+  --sources train.tfrecord valid.tfrecord test.tfrecord --select-seed 42 \
   --n-train 100 --n-val 30 --n-test 20 --num-steps 100 --time-stride 4
 ```
 
@@ -99,15 +99,16 @@ Copy the dataset folder separately. Alternatively copy the repository and run
 
 ## Memory hints
 
-- **VRAM:** the model of `config.example.toml` fits into 4 GB at batch 2. The runs of the
-  [results](results.md) needed ~2 GB (MGN-T) and ~8 GB (MeshGraphNets in paper size) at
+- **VRAM:** the model of `examples/quick_start/train.toml` fits into 4 GB at batch 2. The runs of the
+  [results](../results/deforming-plate.md) needed ~2 GB (MGN-T) and ~8 GB (MeshGraphNets in paper size) at
   batch 8 with `self_contact_aware`; with `world_edges = "all"` MeshGraphNets needs
-  micro-batches on a 16 GB GPU ([protocol](comparison-protocol.md#training)). The trainer
+  micro-batches on a 16 GB GPU ([protocol](../guides/comparison-protocol.md#training)). The trainer
   records the peak memory in `history.json`. `PYTORCH_CUDA_ALLOC_CONF` in
   `docker-compose.yml` counters fragmentation caused by the varying number of contact
   edges.
-- **RAM:** the dataset is held once in shared memory (`shm_size` 2 GB); each DataLoader
-  worker costs ~0.3 GB. On 4 vCPU / 8 GB RAM, 3 workers fit. For splits that do not fit
+- **RAM:** the dataset is held once in shared memory (`shm_size` 2 GB). With the
+  `deforming_plate` protocol dataset each DataLoader worker costs ~0.3 GB, and on 4 vCPU /
+  8 GB RAM 3 workers fit. For splits that do not fit
   into RAM or `/dev/shm`: `[data] lazy = true`.
 
 ## Other CUDA versions

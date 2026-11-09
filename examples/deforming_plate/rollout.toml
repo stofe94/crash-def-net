@@ -1,0 +1,25 @@
+# ============================================================
+# CrashDefNet — deforming_plate: rollout of the first training
+# ============================================================
+# Predicts the 4 test plates with the model of examples/deforming_plate/train.toml,
+# evaluates the run on it and renders the plate at the median of the position error, in
+# one go. Walk-through: docs/getting-started/first-training.md
+#
+#   python predict/rollout.py --config examples/deforming_plate/rollout.toml
+#
+# Every key: docs/reference/configuration.md.
+# ============================================================
+
+[rollout]
+checkpoint = "checkpoints/first_training/best_model.pt"
+data_dir   = "data/deforming_plate_s8_t40"
+split      = "test"
+device     = "auto"
+export_vtu = true      # one .vtu per step; needs pyvista
+one_step   = true      # also the one-step metrics RMSE-1
+
+[evaluation]
+enabled = true
+
+[animation]
+enabled = true

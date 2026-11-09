@@ -1,0 +1,115 @@
+# Documentation website: built from docs/ with Zensical by .github/workflows/docs.yml.
+# Local preview: pip install -e ".[docs]" && zensical serve -o  (http://localhost:8000)
+# The same file builds with MkDocs Material (pip install mkdocs-material; mkdocs serve).
+site_name: CrashDefNet
+site_description: >-
+  Graph neural network surrogates for crash simulation: dataset export, training,
+  autoregressive rollout and evaluation on finite element meshes.
+site_author: Felix Stocker
+site_url: https://stofe94.github.io/crash-def-net/
+repo_url: https://github.com/stofe94/crash-def-net
+repo_name: stofe94/crash-def-net
+edit_uri: ""
+copyright: Copyright 2026 Felix Stocker · GNU AGPL-3.0
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.tabs.link
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Light mode
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path: ["."]
+      check_paths: true
+  - utils.docs_links      # website links of README and CHANGELOG -> pages of this build
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Quick start: getting-started/quick-start.md
+      - Installation: getting-started/installation.md
+      - "Tutorial: first training": getting-started/first-training.md
+      - "Tutorial: bumper beam": getting-started/bumper-beam.md
+  - Guides:
+      - Export a dataset: guides/export.md
+      - Train a model: guides/training.md
+      - Roll out a model: guides/rollout.md
+      - Evaluate and compare: guides/evaluation.md
+      - Explore a dataset: guides/explore-data.md
+      - OpenRadioss runs: guides/openradioss.md
+      - LS-DYNA runs: guides/ls-dyna.md
+      - VTK time series: guides/vtk.md
+      - The CrashDefNet app: guides/app.md
+      - Docker: guides/docker.md
+      - Add an architecture: guides/adding-an-architecture.md
+      - Compare architectures: guides/compare-architectures.md
+      - Comparison protocol: guides/comparison-protocol.md
+  - Concepts:
+      - How CrashDefNet works: concepts/overview.md
+      - Data and graphs: concepts/graphs.md
+      - Models: concepts/models.md
+      - Training: concepts/training.md
+      - Rollout and metrics: concepts/metrics.md
+      - Scaling: concepts/scaling.md
+  - Reference:
+      - Command line: reference/cli.md
+      - Configuration: reference/configuration.md
+      - File formats: reference/file-formats.md
+      - Project structure: reference/project-structure.md
+      - Glossary: reference/glossary.md
+  - Results:
+      - Deforming plate: results/deforming-plate.md
+      - Bumper beam: results/bumper-beam.md
+  - Purpose: purpose.md
+  - About:
+      - About CrashDefNet: about/index.md
+      - Roadmap: about/roadmap.md
+      - Changelog: about/changelog.md
+      - Contributing: about/contributing.md

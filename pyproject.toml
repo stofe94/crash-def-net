@@ -1,5 +1,5 @@
 # ============================================================
-# CrashDefNet — graph neural networks for structural deformation prediction
+# CrashDefNet — graph neural network surrogates for crash simulation
 # ============================================================
 #
 # Installation:
@@ -19,10 +19,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crashdefnet"
-version = "0.4.0"
-description = "Graph neural networks (MeshGraphNets, MeshGraphNet-Transformer) that predict structural deformation from simulation data"
+version = "1.0.0"
+description = "Graph neural network surrogates for crash simulation (MeshGraphNets, MeshGraphNet-Transformer), from raw simulation data to evaluation against published results"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = {text = "AGPL-3.0-only"}
 requires-python = ">=3.10,<3.13"
 
 authors = [
@@ -32,13 +32,13 @@ authors = [
 keywords = [
     "graph-neural-network", "meshgraphnets", "transformer", "mgn-t",
     "deforming-plate", "deformation-prediction", "crash-simulation", "cae",
-    "pytorch-geometric", "finite-element",
+    "pytorch-geometric", "finite-element", "surrogate-model",
 ]
 
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Physics",
     "Programming Language :: Python :: 3.10",
@@ -55,11 +55,12 @@ dependencies = [
     "tfrecord",
     "toml>=0.10",
     "tqdm>=4.60",
+    "tzdata; sys_platform == 'win32'",   # time zone of the timestamps on Windows
 ]
 
 [project.urls]
 Repository = "https://github.com/stofe94/crash-def-net"
-Documentation = "https://github.com/stofe94/crash-def-net/tree/main/docs"
+Documentation = "https://stofe94.github.io/crash-def-net/"
 
 # ── Optional Dependencies ────────────────────────────────────
 [project.optional-dependencies]
@@ -76,6 +77,10 @@ viz = [
 # LS-DYNA runs as second raw format (tfrecord_to_d3plot.py, d3plot_reader.py)
 d3plot = [
     "lasso-python>=2.0",
+]
+# Documentation website (mkdocs.yml): zensical serve -o / zensical build
+docs = [
+    "zensical==0.0.73",
 ]
 # Development / testing
 dev = [
