@@ -6,6 +6,14 @@ This product is licensed under the GNU Affero General Public License, Version 3
 
 Third-party material
 
+The documentation website ships two fonts, both licensed under the SIL Open Font License,
+Version 1.1 (licence texts next to the font files):
+
+  docs/assets/fonts/inter-*.woff2: Inter, Copyright 2020 The Inter Project Authors
+  (https://github.com/rsms/inter)
+  docs/assets/fonts/jetbrains-mono-*.woff2: JetBrains Mono, Copyright 2020 The JetBrains
+  Mono Project Authors (https://github.com/JetBrains/JetBrainsMono)
+
 The images and figures below are derived from simulation data of third parties: they show
 the simulation results of a dataset, or evaluate models trained on it against them. They
 were made by CrashDefNet from the runs of these datasets. The datasets themselves are not

@@ -10,10 +10,16 @@ site_url: https://stofe94.github.io/crash-def-net/
 repo_url: https://github.com/stofe94/crash-def-net
 repo_name: stofe94/crash-def-net
 edit_uri: ""
-copyright: Copyright 2026 Felix Stocker · GNU AGPL-3.0
+# Footer: legal notice and privacy policy are shared with the skill profile site.
+copyright: >-
+  Copyright 2026 Felix Stocker · GNU AGPL-3.0 ·
+  <a href="https://stofe94.github.io/skill-profile/impressum.html">Legal notice</a> ·
+  <a href="https://stofe94.github.io/skill-profile/privacy.html">Privacy</a>
 
 theme:
   name: material
+  # Fonts are self-hosted (docs/stylesheets/fonts.css), so browsers do not contact Google Fonts.
+  font: false
   features:
     - navigation.tabs
     - navigation.sections
@@ -40,6 +46,7 @@ theme:
         name: Light mode
 
 extra_css:
+  - stylesheets/fonts.css
   - stylesheets/extra.css
 
 markdown_extensions:
