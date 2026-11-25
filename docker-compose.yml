@@ -14,7 +14,7 @@
 services:
   train:
     build: .
-    image: crashdefnet-deforming-plate:latest
+    image: crashdefnet:latest
     environment:
       DATA_DIR: "/data"
       CONFIG: "${CONFIG:-examples/quick_start/train.toml}"   # selectable in .env, e.g. configs/my_run.toml
@@ -31,7 +31,9 @@ services:
       - ./rollouts:/app/rollouts
       # Own configs (folder configs/) can be edited without a rebuild
       - ./configs:/app/configs
-    shm_size: "4gb"          # DataLoader workers need /dev/shm
+    # The DataLoader workers share the dataset held in memory through /dev/shm: a limit,
+    # not a reservation. SHM_SIZE in .env raises it for larger datasets.
+    shm_size: "${SHM_SIZE:-8gb}"
     deploy:
       resources:
         reservations:

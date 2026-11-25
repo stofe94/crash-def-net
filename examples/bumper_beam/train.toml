@@ -3,10 +3,11 @@
 # ============================================================
 # MGN-T in the size of the paper (v4, ~0.51 M parameters) on the export of
 # examples/bumper_beam/export.toml, trained with scheduled sampling: from epoch to epoch a
-# growing share of the nodes takes its previous velocity and stress from the model's own
-# prediction of the step before instead of the ground truth, as in the rollout. The settings of
-# the published results (docs/results/bumper-beam.md): 80 epochs, batch 4, ~3 h 20 min on one
-# NVIDIA RTX A4000 (16 GB), GPU memory ~7.3 GB. Walk-through: docs/getting-started/bumper-beam.md
+# growing share of the nodes takes its previous velocity and result fields from the model's
+# own prediction of the step before instead of the ground truth, as in the rollout. The
+# settings of the published results (docs/results/bumper-beam.md): 80 epochs, batch 4,
+# ~3 h 20 min on one NVIDIA RTX A4000 (16 GB), GPU memory ~7.3 GB.
+# Walk-through: docs/getting-started/bumper-beam.md
 #
 #   python train/train.py --config examples/bumper_beam/train.toml
 #
@@ -17,20 +18,20 @@
 [data]
 data_dir               = "data/bumper_beam_remeshed"
 num_dataloader_workers = 3       # graphs built in 3 worker processes
-lazy                   = false   # the export (~460 MB) fits in memory
+lazy                   = false   # the export (~920 MB) fits in memory
 # From 10 ms: the step from the undeformed state at 0 ms to the first deformed state is left
 # out on purpose (docs/results/bumper-beam.md#setup); the rollouts of this run start at
 # 10 ms as well.
 start_frame            = 1
-# Features of the export this run uses: the shell thickness (with thickness_given, as
-# nodes without a shell have none) and the stress as result field. No run parameters.
-local_features         = ["thickness"]
+# Features of the export this run uses: shell thickness and yield stress (each with its
+# marker *_given, as not every node has them) and every result field. No run parameters.
+local_features         = ["thickness", "yield_stress"]
 global_features        = []
-target_fields          = ["stress"]
+target_fields          = ["stress", "plastic_strain", "mean_stress", "bending_stress"]
 
 [model]
 architecture                = "mgn_t"
-residual_target             = true    # predict the change of velocity and stress (export with history = 1)
+residual_target             = true    # predict the change of velocity and of every result field (export with history = 1)
 world_edges                 = "self_contact_aware"
 world_edge_exclude_distance = 2.0
 
@@ -65,14 +66,18 @@ min_lr = 1e-6
 [training.rollout_validation]
 enabled        = true    # select the model by rollouts over whole val trajectories
 every_n_epochs = 4
-max_sequences  = 14
+max_sequences  = 14      # all of val
 
 [training.early_stopping]
-enabled  = false
-criteria = ["rollout_mse"]
+enabled    = true
+min_epochs = 41          # not before the end of the scheduled-sampling warmup
+patience   = 5           # evaluations, every 4 epochs: 20 epochs without a new low
+criteria   = ["rollout_pos_rmse", "rollout_pos_rmse_final"]
 
 [loss]
-type = "mse"
+type                = "mse"
+edge_stretch_weight = 1.0   # length change of the mesh edges in a step, against the ground truth
+rigid_body_weight   = 1.0   # mean velocity of the rigid body: few nodes, most of the mass
 
 [noise]
 # In the units of the data. The velocity in z is only ~0.5 mm per frame, so the position
@@ -88,6 +93,6 @@ warmup_epochs = 40      # of 80: the final share is trained for the second half 
 
 [checkpointing]
 checkpoint_dir = "checkpoints/bumper_beam_mgn_t"
-save_every     = 10
+save_every     = 4        # with every evaluation
 log_every      = 1
 resume         = ""

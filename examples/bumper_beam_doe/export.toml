@@ -1,0 +1,54 @@
+# ============================================================
+# CrashDefNet — bumper beam DoE (135 runs): export
+# ============================================================
+# The OpenRadioss runs of OpenRadioss-BumperBeam-DoE135 (Hugging Face), with the pole
+# inserted as a mesh by utils/remesh_pole.py at the position of each run, so that it acts
+# through contact edges. Settings of the published results: docs/results/bumper-beam-doe.md
+#
+#   hf download stofe94/OpenRadioss-BumperBeam-DoE135 --repo-type dataset \
+#       --local-dir datasets/OpenRadioss-BumperBeam-DoE135
+#   python -c "import pathlib, shutil; [(shutil.unpack_archive(z, z.parent), z.unlink()) for z in pathlib.Path('datasets/OpenRadioss-BumperBeam-DoE135/RAW_DATA').glob('*/run*.zip')]"
+#   python utils/remesh_pole.py --raw-dir datasets/OpenRadioss-BumperBeam-DoE135/RAW_DATA \
+#       --sources TRAIN VAL TEST --half-height 300 --contact-radius 20 \
+#       --out-dir datasets/OpenRadioss-BumperBeam-DoE135_remeshed/RAW_DATA
+#   python -m dataset_preprocessor.export --config examples/bumper_beam_doe/export.toml
+#
+# --half-height 300: the pole reaches beyond the structure next to it in every run, up to
+# |z| = 173.5 mm with the geometry scaled by 2 in z, plus the contact radius.
+# Every key: docs/reference/configuration.md.
+# ============================================================
+
+[raw]
+format  = "d3plot"     # d3plot converted from OpenRadioss, with the starter deck next to it
+dir     = "datasets/OpenRadioss-BumperBeam-DoE135_remeshed/RAW_DATA"
+sources = ["TRAIN", "VAL", "TEST"]   # the split of the dataset, one folder each
+
+[dataset]
+out_dir     = "data/bumper_beam_doe"
+n_train     = 108
+n_val       = 13
+n_test      = 14
+num_steps   = 51      # every state: 0 to 100 ms at 2 ms
+time_stride = 1
+history     = 1       # previous velocity and result fields as inputs: the motion comes from inertia
+
+[units]               # of the decks: kg, mm, ms
+length = "mm"
+stress = "GPa"
+
+[components]
+"crash_box_*"          = "deformable"
+"BumperBeam_*"         = "deformable"
+"CONNECTION_SPOTWELD*" = "deformable"
+"Body_in_White"        = "free_rigid"   # rigid body of 500 kg: its motion results from the crash
+"RWALL"                = "actuator"     # the inserted pole, standing still
+
+[contact]
+radius         = 20       # mm; a node approaches the pole by at most 14 mm per state
+use_deck_walls = true     # the cylinder of the deck as node features, next to the contact edges to the inserted pole
+gap            = true     # on every contact edge: distance to the shell surface and clearance
+
+[features]
+local   = ["thickness", "yield_stress"]   # from the starter deck: /PROP/SHELL, /MAT/PLAS_JOHNS (a)
+targets = ["plastic_strain", "mean_stress", "bending_stress"]   # result fields after the von Mises stress
+edges   = ["thickness", "yield_stress"]   # of the elements next to every mesh edge

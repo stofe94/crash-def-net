@@ -713,7 +713,7 @@ def main(argv=None) -> int:
     split_note = (f"own values: {args.split} split, one RMSE over all trajectories together "
                   "as in the papers; ± = standard error over the trajectories")
 
-    plot_bar_panels(entries, ABSOLUTE, "Absolute errors compared with the MGN-T paper",
+    plot_bar_panels(entries, ABSOLUTE, "Absolute errors compared with the papers",
                     f"{PAPER_SOURCE}; {split_note}. Paper: 400 steps, stride 1 — "
                     "own rollouts: see the conditions table.",
                     out / "01_absolute_errors.png")

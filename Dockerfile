@@ -24,10 +24,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Python needs the tz database from the tzdata package for that. TZ puts shell
 # commands in the container (date, ls -l) into the same zone.
 
-# System packages: Python and tzdata (no vtk/pyvista in the image — the .vtu
-# export of the rollout runs locally, training does not need it)
+# System packages: Python, tzdata, and the two libraries VTK loads on import
+# (libgl1, libxrender1), so that a rollout in the container writes .vtu files.
+# Nothing is rendered in the container: animations are made outside it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-venv python3-dev tzdata \
+      python3 python3-venv python3-dev tzdata libgl1 libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Isolated venv (avoids PEP 668 "externally-managed-environment")
@@ -41,10 +42,11 @@ WORKDIR /app
 RUN pip install --index-url https://download.pytorch.org/whl/cu124 \
       "torch>=2.4,<3.0"
 
-# Remaining dependencies (as in requirements.txt, without the optional pyvista)
+# Remaining dependencies (as in requirements.txt); pyvista for the .vtu export of
+# the rollout (it brings matplotlib along)
 RUN pip install \
       "torch-geometric>=2.5,<3.0" tfrecord \
-      "numpy>=1.24,<3.0" "toml>=0.10" "tqdm>=4.60"
+      "numpy>=1.24,<3.0" "toml>=0.10" "tqdm>=4.60" "pyvista>=0.43,<1.0"
 
 # Project code only — datasets are mounted as volumes at run time (see .dockerignore)
 COPY . /app

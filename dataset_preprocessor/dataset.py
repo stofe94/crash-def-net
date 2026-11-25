@@ -44,7 +44,7 @@ from typing import Callable, Dict, Hashable, List, Optional, Tuple
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from torch_geometric.data import Batch, Data
 
 from utils.normalizer import Normalizer
@@ -69,6 +69,7 @@ from .graph_features import (
     one_hot_node_type,
     relative_features,
     select_statistics,
+    shell_faces,
     target_feature_names,
     trajectory_features,
     wall_features,
@@ -118,8 +119,10 @@ CREATE TABLE trajectories (
     walls       BLOB,            -- float32 (W, 6) rigid walls: point, unit normal
     sha256      TEXT NOT NULL,   -- of the static data and all frames (info: fingerprint)
     components  BLOB,            -- uint32  (N)    component of every node (info: component_names)
-    start_velocity BLOB          -- float32 (N, 3) history: motion over one frame interval
+    start_velocity BLOB,         -- float32 (N, 3) history: motion over one frame interval
                                  --                before frame 0, the velocity input of frame 0
+    edge_static BLOB             -- float32 (E, K) element properties on the mesh edges, in the
+                                 --                order of meshes.mesh_edges (info: edge_static_names)
 );
 CREATE TABLE frames (
     trajectory_id INTEGER NOT NULL REFERENCES trajectories(id),
@@ -218,6 +221,7 @@ class _Mesh:
     cells: Optional[torch.Tensor] = None       # (C, 4) or (C, W) padded; with_cells only
     cell_types: Optional[torch.Tensor] = None  # (C,) VTK types; None: tetrahedra
     rest_pos: Optional[torch.Tensor] = None    # (N, 3) rest positions of world_selection
+    face: Optional[torch.Tensor] = None        # (3, F) shell triangles; contact gap only
 
 
 @dataclass
@@ -233,6 +237,8 @@ class _Trajectory:
     walls: Optional[torch.Tensor] = None       # (W_max, wall_columns) walls, zero rows padded
     component: Optional[torch.Tensor] = None   # (N,) into the dataset's component_names
     start_velocity: Optional[torch.Tensor] = None   # (N, 3) velocity input of frame 0
+    contact_thickness: Optional[torch.Tensor] = None   # (N,) raw, 0: none; contact gap only
+    edge_static: Optional[torch.Tensor] = None  # (E_M, K) raw element properties on the edges
     world_pos: Optional[torch.Tensor] = None   # (T, N, 3); None when lazy
     stress: Optional[torch.Tensor] = None      # (T, N, F) result fields; None when lazy
     rest_key: Optional[Hashable] = None   # of a world edge selection other than the mesh's
@@ -381,6 +387,8 @@ class TrajectoryDataset(Dataset):
         # Layout fixed at export time (DBs from before --history: paper layout).
         self.history = int(info.get("history", 0))
         self.prev_stress = info.get("prev_stress", "1") == "1"
+        # Prediction data (export.InitialState): frames after the first are placeholders.
+        self.ground_truth = info.get("ground_truth", "1") == "1"
         self.target_feature_names = target_feature_names(self.field_names)
         # Factors from the units of the data to m and Pa (utils.units), for the metrics.
         self.si_factors = si_factors(info)
@@ -477,10 +485,11 @@ class TrajectoryDataset(Dataset):
             world_pos, stress, traj.actuator_mask, self.history, self.prev_stress)
         dynamic_inputs, targets, world_pos = dynamic_inputs[0], targets[0], current_pos[0]
 
+        gap = dict(face=mesh.face, contact_thickness=traj.contact_thickness)
         if world_edges:
             mesh_edge_attr, world_edge_index, world_edge_attr = edge_features(
                 mesh.edge_index, traj.mesh_space_features, world_pos, self.contact_radius,
-                **selection)
+                **gap, **selection)
         else:
             mesh_edge_attr = mesh_edge_features(mesh.edge_index, traj.mesh_space_features,
                                                 world_pos)
@@ -504,7 +513,7 @@ class TrajectoryDataset(Dataset):
             x=torch.cat(columns, dim=-1),
             y=torch.nan_to_num((targets - self._target_mean) / self._target_std, nan=0.0),
             edge_index=mesh.edge_index,
-            edge_attr=(mesh_edge_attr - self._mesh_mean) / self._mesh_std,
+            edge_attr=self._mesh_edge_attr(mesh_edge_attr, traj.edge_static),
             loss_mask=~traj.actuator_mask,
             world_pos=world_pos,
             mesh_pos=traj.mesh_pos,       # undeformed; mgn_t's positional encoding
@@ -519,6 +528,8 @@ class TrajectoryDataset(Dataset):
             data.u = run_parameters[None]   # (1, G); a batch stacks them to (B, G)
         if self.max_walls:
             data.wall_planes = traj.walls   # (W_max, wall_columns), read back by rebuild_edges
+        if self.contact_gap:   # read back by add_world_edges / rebuild_edges; PyG shifts face
+            data.face, data.contact_thickness = gap["face"], gap["contact_thickness"]
         if self.rigid_bodies:
             data.rigid_body = self._body_of_component[traj.component]   # (N,), -1: none
         if self.with_cells:
@@ -526,6 +537,18 @@ class TrajectoryDataset(Dataset):
             if mesh.cell_types is not None:
                 data.cell_types = mesh.cell_types
         return data
+
+    def _mesh_edge_attr(self, mesh_edge_attr: torch.Tensor,
+                        edge_static: Optional[torch.Tensor]) -> torch.Tensor:
+        """Normalized mesh edge features: the geometric columns, then the element properties
+        of the edge (NaN, a property the edge lacks: neutral, its _given column tells)."""
+        geometric = mesh_edge_attr.shape[1]
+        attr = (mesh_edge_attr - self._mesh_mean[:geometric]) / self._mesh_std[:geometric]
+        if edge_static is None:
+            return attr
+        return torch.cat((attr, torch.nan_to_num(
+            (edge_static - self._mesh_mean[geometric:]) / self._mesh_std[geometric:],
+            nan=0.0)), dim=-1)
 
     def __getstate__(self):
         """Pickling for spawned DataLoader workers: every worker opens its own
@@ -655,12 +678,19 @@ class TrajectoryDataset(Dataset):
 
     def _read_trajectory(self, conn: sqlite3.Connection, info: _TrajectoryInfo,
                          mesh: _Mesh) -> _Trajectory:
-        node_type, mesh_pos, global_values, node_static, walls, component, start = conn.execute(
+        (node_type, mesh_pos, global_values, node_static, walls, component, start,
+         edge_static) = conn.execute(
             f"SELECT node_type, mesh_pos, {self._optional_columns} FROM trajectories "
             "WHERE id = ?", (info.db_id,)).fetchone()
         num_nodes = info.num_nodes
         raw_node_type = _tensor(node_type, np.uint8, (num_nodes,))
         mesh_pos = _tensor(mesh_pos, np.float32, (num_nodes, 3))
+        contact_thickness = None
+        if self.contact_gap:   # whatever [data] local_features selects
+            contact_thickness = torch.zeros(num_nodes)
+            if node_static is not None and self._thickness_column is not None:
+                contact_thickness = torch.nan_to_num(_tensor(
+                    node_static, np.float32, (num_nodes, -1))[:, self._thickness_column])
         return _Trajectory(
             mesh_pos=mesh_pos,
             node_one_hot=one_hot_node_type(raw_node_type),
@@ -677,6 +707,10 @@ class TrajectoryDataset(Dataset):
                        else _tensor(component, np.uint32, (num_nodes,)).long()),
             start_velocity=(None if start is None or not self._with_start
                             else _tensor(start, np.float32, (num_nodes, 3))),
+            contact_thickness=contact_thickness,
+            edge_static=(None if edge_static is None or not self.edge_static_names
+                         else _tensor(edge_static, np.float32,
+                                      (-1, len(self.edge_static_names)))),
             rest_key=(("world_selection", info.mesh_key,
                        hashlib.sha256(mesh_pos.numpy().tobytes()).hexdigest())
                       if self._world_selection_by_rest
@@ -687,8 +721,9 @@ class TrajectoryDataset(Dataset):
     def _read_mesh(self, conn: sqlite3.Connection, info: _TrajectoryInfo) -> _Mesh:
         """Mesh edges stored by the exporter (v4), or computed from the cells (older)."""
         kind, key = info.mesh_key
+        read_cells = self.with_cells or self.contact_gap
         if kind == "mesh":
-            cells = "cells, cell_types" if self.with_cells else "NULL, NULL"
+            cells = "cells, cell_types" if read_cells else "NULL, NULL"
             num_cells, cells, cell_types, edges = conn.execute(
                 f"SELECT num_cells, {cells}, mesh_edges FROM meshes WHERE id = ?",
                 (key,)).fetchone()
@@ -723,6 +758,7 @@ class TrajectoryDataset(Dataset):
             cell_types=(None if cell_types is None or not self.with_cells
                         else torch.from_numpy(cell_types.copy())),
             rest_pos=rest_pos,
+            face=shell_faces(cells, cell_types) if self.contact_gap else None,
         )
 
     # ── loading ─────────────────────────────────────────────────────────────
@@ -744,6 +780,14 @@ class TrajectoryDataset(Dataset):
             self.wall_columns = int(info.get("wall_columns", PLANAR_WALL_COLUMNS))   # as well
             self.field_gaps = "field_gaps" in info   # result fields that some nodes lack
             self.contact_radius = float(info["contact_radius"])   # and by _world_selection
+            # Contact gap on the world edges (export --contact-gap): shell faces and the
+            # thickness column of the stored static features, whatever the selection keeps.
+            self.contact_gap = info.get("contact_gap") == "1"
+            # Element properties on the mesh edges (export --edge-fields), after the 8 columns.
+            self.edge_static_names = json.loads(info.get("edge_static_names", "[]"))
+            stored_static = json.loads(info.get("static_names", "[]"))
+            self._thickness_column = (stored_static.index("thickness")
+                                      if "thickness" in stored_static else None)
             # Current frame of the first sample: frame 0, the undeformed state; with history
             # up to v0.4.0 frame 1, as frame 0 had no velocity input then (no start velocity).
             self.first_frame = int(info.get("first_frame", info.get("history", 0)))
@@ -778,7 +822,7 @@ class TrajectoryDataset(Dataset):
             self._optional_columns = ", ".join(
                 name if name in self._trajectory_columns else f"NULL AS {name}"
                 for name in ("globals", "node_static", "walls", "components",
-                             "start_velocity"))
+                             "start_velocity", "edge_static"))
             mesh = "mesh_id" if db_format == DB_FORMAT else "NULL"
             rows = conn.execute(
                 f"SELECT id, sequence_id, num_nodes, num_frames, {mesh} FROM trajectories "
@@ -846,37 +890,107 @@ DeformingPlateDataset = TrajectoryDataset   # its name up to v0.4.0
 
 
 class PredecessorPairDataset(Dataset):
-    """``(sample_t, sample_{t-1}, has_predecessor)`` items for scheduled sampling.
+    """``(sample_t, [sample_{t-1}, ..., sample_{t-steps}], [has_predecessor, ...])`` items
+    for scheduled sampling and rollout training.
 
-    The trainer predicts step t from the predecessor sample and feeds that
-    prediction into the ``*_prev`` inputs of sample t. The first step of a
-    trajectory has no predecessor; it is paired with itself and flagged False.
+    The trainer rolls out from the oldest predecessor and feeds the prediction of each
+    step into the ``*_prev`` inputs of the next, up to sample t. A predecessor that does
+    not exist (start of a trajectory) is replaced by the oldest one that does, or by
+    sample t itself, and flagged False. An item ``(idx, length)`` instead of ``idx``
+    (``RolloutWindowSampler``) is the window of ``length`` samples ending at ``idx``: its
+    predecessors beyond the window are flagged False as well.
     """
 
-    def __init__(self, base: TrajectoryDataset):
+    def __init__(self, base: TrajectoryDataset, steps: int = 1):
+        if steps < 0:
+            raise ValueError(f"steps must be >= 0, got {steps}")
         self.base = base
+        self.steps = steps
 
     def __len__(self) -> int:
         return len(self.base)
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, item):
+        idx, length = item if isinstance(item, tuple) else (item, self.steps + 1)
         current = self.base[idx]
-        prev_idx = self.base.predecessor(idx)
-        if prev_idx is None:
-            return current, current, False
-        return current, self.base[prev_idx], True
+        previous, valid = [], []
+        last, last_sample = idx, current
+        for depth in range(self.steps):
+            prev_idx = (self.base.predecessor(last)
+                        if last is not None and depth < length - 1 else None)
+            if prev_idx is not None:
+                last, last_sample = prev_idx, self.base[prev_idx]
+            else:
+                last = None
+            previous.append(last_sample)
+            valid.append(prev_idx is not None)
+        return current, previous, valid
 
 
-def collate_with_predecessor(items) -> Tuple[Batch, Batch]:
-    """Collate ``PredecessorPairDataset`` items into ``(batch, prev_batch)``.
+class RolloutWindowSampler(Sampler):
+    """Windows of up to ``steps`` consecutive samples of one trajectory for rollout
+    training, as ``(index of the last sample, length)`` items of a
+    ``PredecessorPairDataset`` with ``steps - 1`` predecessors.
 
-    ``batch.has_predecessor`` (N,) marks the nodes whose ``*_prev`` inputs may
-    be replaced by a prediction. A module-level function, so it pickles into
-    spawned DataLoader workers.
+    Every epoch each trajectory is cut into windows at a random phase, so that every
+    sample lies in exactly one window per epoch and, over the epochs, at every position
+    in it; the windows come in random order. ``len`` is the largest number of windows a
+    phase can give (the progress of an epoch never passes 100 %).
     """
+
+    def __init__(self, dataset: TrajectoryDataset, steps: int):
+        if steps < 1:
+            raise ValueError(f"steps must be >= 1, got {steps}")
+        self.steps = steps
+        # Consecutive samples of one trajectory: (index of the first, number of samples).
+        self.runs: List[Tuple[int, int]] = []
+        start = 0
+        for idx in range(1, len(dataset) + 1):
+            if idx == len(dataset) or dataset.predecessor(idx) is None:
+                self.runs.append((start, idx - start))
+                start = idx
+        self._len = sum(max(len(self._cuts(count, phase)) + 1 for phase in range(steps))
+                        for _, count in self.runs)
+
+    def _cuts(self, count: int, phase: int) -> range:
+        """Positions in a run of ``count`` samples where a new window begins."""
+        return range(phase or self.steps, count, self.steps)
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __iter__(self):
+        generator = torch.Generator()   # seeded from the global generator, as RandomSampler
+        generator.manual_seed(int(torch.empty((), dtype=torch.int64).random_().item()))
+        phases = torch.randint(self.steps, (len(self.runs),), generator=generator).tolist()
+        windows = []
+        for (start, count), phase in zip(self.runs, phases):
+            bounds = [0, *self._cuts(count, phase), count]
+            windows += [(start + end - 1, end - begin)
+                        for begin, end in zip(bounds[:-1], bounds[1:])]
+        order = torch.randperm(len(windows), generator=generator).tolist()
+        return iter([windows[i] for i in order])
+
+
+def collate_with_predecessor(items) -> Tuple[Batch, List[Batch]]:
+    """Collate ``PredecessorPairDataset`` items into ``(batch, [prev_batch_1, ...])``,
+    ``prev_batch_k`` holding the samples k steps back.
+
+    ``has_predecessor`` (N,) of ``batch`` marks the nodes whose ``*_prev`` inputs may be
+    replaced by a prediction from ``prev_batch_1``; that of ``prev_batch_k`` the nodes
+    with a valid sample k + 1 steps back (none for the last). A module-level function,
+    so it pickles into spawned DataLoader workers.
+    """
+    def flags(depth: int) -> torch.Tensor:
+        return torch.cat([torch.full((current.num_nodes,),
+                                     depth < len(valid) and valid[depth], dtype=torch.bool)
+                          for current, _, valid in items])
+
     batch = Batch.from_data_list([current for current, _, _ in items])
-    prev_batch = Batch.from_data_list([prev for _, prev, _ in items])
-    batch.has_predecessor = torch.cat([
-        torch.full((current.num_nodes,), valid, dtype=torch.bool)
-        for current, _, valid in items])
-    return batch, prev_batch
+    batch.has_predecessor = flags(0)
+    prev_batches = []
+    for depth in range(len(items[0][1])):
+        prev_batch = Batch.from_data_list([previous[depth] for _, previous, _ in items])
+        prev_batch.has_predecessor = flags(depth + 1)
+        prev_batches.append(prev_batch)
+    return batch, prev_batches

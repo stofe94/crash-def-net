@@ -6,8 +6,8 @@ hide:
 # Models
 
 Both architectures take the same graph (nodes, mesh edges, world edges; see
-[data and graphs](graphs.md)) and return the same output: the normalized velocity and stress per
-node for the next time step. With run parameters, both get a
+[data and graphs](graphs.md)) and return the same output: the normalized velocity and result
+fields per node for the next time step. With run parameters, both get a
 [global block](#global-block-run-parameters). A new architecture plugs into the same
 pipeline ([add an architecture](../guides/adding-an-architecture.md)). The architecture is
 selected in the config:
@@ -184,7 +184,7 @@ passing steps, 2 transformer blocks, 4 heads, **16 tokens**, ~0.5 M parameters,
 size of 0.51 M. Every key: [`[model.mgn_t]`](../reference/configuration.md#modelmgn_t);
 `transformer_nodes = "all"` runs the global stage over every node.
 
-### Assumptions where the paper leaves gaps
+### Assumptions where the MGN-T paper leaves gaps
 
 No code has been published for MGN-T. Where the paper does not specify a detail, the
 following choices were made. Each one is marked in the code:
@@ -210,8 +210,9 @@ following choices were made. Each one is marked in the code:
 
 ## Global block (run parameters)
 
-Not in either paper. When a dataset has [run parameters](graphs.md#general-meshes-and-run-parameters)
-(e.g. the impact velocity of a run), both architectures take them as the global input `u`
+When a dataset has [run parameters](graphs.md#general-meshes-and-run-parameters)
+(e.g. the impact velocity of a run), CrashDefNet extends both architectures: they take them
+as the global input `u`
 of each graph and use full GraphNet blocks (Battaglia et al., 2018, Sec. 3.2) in their
 message passing stages:
 
@@ -226,7 +227,7 @@ message passing stages:
 
 The means over the whole graph are a non-physical path: within one block they carry
 information across the structure, regardless of the distance through the material.
-Without run parameters there is no global block, and the models are those of the papers.
+Without run parameters there is no global block, and both models are as published.
 
 The block widens every edge and node function by one latent. At the default sizes, on the
 inputs of `deforming_plate` with two run parameters: MeshGraphNets 3.85 M → 6.01 M parameters, MGN-T 0.32 M → 0.46 M;
@@ -237,6 +238,6 @@ a forward pass over 8 small synthetic graphs on the CPU took 9 % (MeshGraphNets)
 
 [`models/residual.py`](https://github.com/stofe94/crash-def-net/blob/main/models/residual.py) wraps either architecture. The network
 then predicts the normalized *change* of every target that has a matching `*_prev`
-input, instead of its absolute value. This needs an export with `--history 1` (not in
-the paper). A freshly initialized network then starts at the "copy the previous value"
-baseline.
+input, instead of its absolute value. This needs an export with `--history 1`
+([optional history](graphs.md#optional-history-history-1)). A freshly initialized network
+then starts at the "copy the previous value" baseline.

@@ -84,6 +84,9 @@ stress_noise_std = 0.0
 [scheduled_sampling]
 enabled = false
 
+[rollout_training]
+enabled = false
+
 [checkpointing]
 checkpoint_dir = "checkpoints/protocol_s4_t150_meshgraphnets"   # machine setting
 save_every     = 10

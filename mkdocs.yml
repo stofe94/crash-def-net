@@ -7,9 +7,9 @@ site_description: >-
   autoregressive rollout and evaluation on finite element meshes.
 site_author: Felix Stocker
 site_url: https://stofe94.github.io/crash-def-net/
-repo_url: https://github.com/stofe94/crash-def-net
-repo_name: stofe94/crash-def-net
-edit_uri: ""
+# No repo_url: with it, the theme's script queries api.github.com for stars, forks and the
+# latest release and caches them in sessionStorage. The repository is linked in the footer
+# (extra.social) instead, as a plain link.
 # Footer: legal notice and privacy policy are shared with the skill profile site.
 copyright: >-
   Copyright 2026 Felix Stocker · GNU AGPL-3.0 ·
@@ -44,6 +44,12 @@ theme:
       toggle:
         icon: material/weather-sunny
         name: Light mode
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/stofe94/crash-def-net
+      name: CrashDefNet on GitHub
 
 extra_css:
   - stylesheets/fonts.css
@@ -88,6 +94,7 @@ nav:
       - Export a dataset: guides/export.md
       - Train a model: guides/training.md
       - Roll out a model: guides/rollout.md
+      - Predict new runs: guides/prediction.md
       - Evaluate and compare: guides/evaluation.md
       - Explore a dataset: guides/explore-data.md
       - OpenRadioss runs: guides/openradioss.md
@@ -112,8 +119,9 @@ nav:
       - Project structure: reference/project-structure.md
       - Glossary: reference/glossary.md
   - Results:
-      - Deforming plate: results/deforming-plate.md
+      - Bumper beam DoE: results/bumper-beam-doe.md
       - Bumper beam: results/bumper-beam.md
+      - Deforming plate: results/deforming-plate.md
   - Purpose: purpose.md
   - About:
       - About CrashDefNet: about/index.md

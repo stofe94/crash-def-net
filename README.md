@@ -1,106 +1,51 @@
-# CrashDefNet
-
 <div align="center">
+
+# CrashDefNet
 
 [![Documentation](https://img.shields.io/badge/docs-website-blue.svg)](https://stofe94.github.io/crash-def-net/)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 ![Python 3.10–3.12](https://img.shields.io/badge/python-3.10%E2%80%933.12-blue.svg)
 ![PyTorch + PyG](https://img.shields.io/badge/PyTorch-PyG-ee4c2c.svg)
-![Version 1.0.0](https://img.shields.io/badge/version-1.0.0-lightgrey.svg)
+![Version 1.1.0](https://img.shields.io/badge/version-1.1.0-lightgrey.svg)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23575635.svg)](https://doi.org/10.5281/zenodo.23575635)
 
-</div>
+<!-- --8<-- [start:what-is] -->
+CrashDefNet (**Crash Deformation Network**) is a research tool that learns from crash
+simulations how a structure deforms. A graph neural network is trained on the finite element
+mesh of simulated runs and then predicts new runs step by step, each step starting from its
+own previous prediction. CrashDefNet covers the whole way from the raw simulation data to
+the evaluation and makes it quick to add and compare new network architectures.
+<!-- --8<-- [end:what-is] -->
 
-**Graph neural network surrogates for crash simulation.** CrashDefNet learns from finite
-element runs and predicts autoregressively, step by step on the mesh, how a structure
-deforms. A complete, lean PyTorch research framework, from raw simulation data to
-evaluation against published results, in which new architectures plug in quickly and are
-compared under identical conditions.
+![Rollout of an unseen test run of a bumper beam against a pole: simulation and MGN-T](docs/assets/bumper_beam_doe_test_traj0127.gif)
+
+*Autoregressive rollout of a bumper beam against a pole, 50 steps from the undeformed state
+to 100 ms, for a test run whose combination of geometry, impact velocity, shell thickness and
+pole position was not part of training. Left: OpenRadioss simulation from
+OpenRadioss-BumperBeam-DoE135 (CC BY-NC 4.0); right: MGN-T
+([results](https://stofe94.github.io/crash-def-net/results/bumper-beam-doe/)). Colour: von
+Mises stress.*
+
+</div>
 
 | Try it in the app | Try it on Google Colab | Documentation |
 |:---:|:---:|:---:|
 | [![Open the quick start](https://img.shields.io/badge/Open%20the-quick%20start-blue.svg)](https://stofe94.github.io/crash-def-net/getting-started/quick-start/)<br>After the [installation](https://stofe94.github.io/crash-def-net/getting-started/installation/), `python utils/app.py` opens a graphical interface in your browser, on your own machine, that leads through a first run without typing commands. | [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/stofe94/crash-def-net/blob/main/examples/quick_start/crashdefnet-quickstart.ipynb)<br>Without installation: a notebook runs export, training and rollout on Colab's free GPU and shows the prediction as an animation, in under 10 minutes. | [![Read the documentation](https://img.shields.io/badge/Read%20the-documentation-blue.svg)](https://stofe94.github.io/crash-def-net/)<br>The website holds the installation with requirements, GPU setup and raw data, the quick start, tutorials, guides, concepts and the full reference. |
 
-<div align="center">
-
-![Rollout of an unseen test run of a bumper beam against a pole: simulation and MGN-T](docs/assets/bumper_beam_test_traj0128.gif)
-
-*Autoregressive rollout of a bumper beam against a pole, a test run whose beam thickness and
-pole position were not part of training, from 10 to 100 ms. Left: OpenRadioss simulation from
-BumperBeamCrashExample (CC BY-NC 4.0); right: MGN-T
-([results](https://stofe94.github.io/crash-def-net/results/bumper-beam/)). Colour: von Mises
-stress.*
-
-</div>
-
----
-
-<!-- --8<-- [start:what-is] -->
-## What is CrashDefNet?
-
-CrashDefNet (**Crash Deformation Network**) is a deep-learning research tool for
-**predicting structural deformation**: how each node of the simulation mesh moves and which
-stress it carries. The application it is built for is **crash deformation**, and it is
-developed specifically for **autoregressive prediction**: a model predicts one time step
-from the current state, and each prediction becomes the input of the next, through the
-whole load case. Contact is found anew in the predicted geometry at every step. This is the
-foundation on which CrashDefNet is developed further
-([why autoregressive](https://stofe94.github.io/crash-def-net/concepts/overview/#why-autoregressive)).
-
-Beyond that, two things define it: it covers the **complete workflow** that an application
-needs, and it stays **lean enough** that new model architectures can be integrated and
-compared quickly.
-
-This release (v1.0.0) is developed and evaluated on two datasets: DeepMind's open
-**`deforming_plate`**, in which an actuator deforms plates of varying geometry, and
-OpenRadioss runs of a **bumper beam hitting a pole**, a first real crash case
-([deforming plate](https://stofe94.github.io/crash-def-net/results/deforming-plate/),
-[bumper beam](https://stofe94.github.io/crash-def-net/results/bumper-beam/)). Reading
-LS-DYNA and OpenRadioss runs and VTK time series, like the general data structures for crash
-runs, is at an early stage of development
-([verification status](https://stofe94.github.io/crash-def-net/concepts/graphs/#general-meshes-and-run-parameters)).
-The release comes with two graph neural network architectures that run through the same
-pipeline and can be compared directly:
-
-- **MeshGraphNets (MGN)**: the original architecture for mesh-based simulation
-  (Pfaff et al., ICLR 2021)
-- **MeshGraphNet-Transformer (MGN-T)**: the current state of research (Iparraguirre
-  et al., 2026). It combines local message passing with a physics-attention
-  transformer as a global processor and targets the setting of crash: impact dynamics
-  with self-contact and plasticity on large meshes
-<!-- --8<-- [end:what-is] -->
-
 ## Highlights
 
-- **Autoregressive by design.** Training, model selection and metrics are built for one task:
-  carrying a whole load case on the model's own predictions, step by step
+- **Autoregressive by design.** The model carries a whole load case on its own predictions,
+  with contact found anew in the predicted geometry at every step; training, model selection
+  and metrics are built for it
   ([why autoregressive](https://stofe94.github.io/crash-def-net/concepts/overview/#why-autoregressive)).
 - **Complete workflow.** From raw simulation data through training and rollout to evaluation
   against published results ([overview](https://stofe94.github.io/crash-def-net/concepts/overview/)).
-- **Quick to try, with a graphical app.** A browser page leads through a first run without
-  typing commands; at an early stage and to be developed further, it can already train with
-  any configuration ([the app](https://stofe94.github.io/crash-def-net/guides/app/)).
-- **New architectures, compared fairly.** One file and a few lines of config, under a fixed
-  protocol next to MeshGraphNets and the published numbers
-  ([adding an architecture](https://stofe94.github.io/crash-def-net/guides/adding-an-architecture/),
-  [deforming plate results](https://stofe94.github.io/crash-def-net/results/deforming-plate/)).
-- **Physics in the graph.** Contact and self-contact are rebuilt from the predicted geometry
-  at every step, only where bodies touch ([data and graphs](https://stofe94.github.io/crash-def-net/concepts/graphs/)).
-- **MeshGraphNets and MGN-T.** Two architectures in one pipeline; MGN-T is implemented from
-  the paper, with every assumption documented
-  ([models](https://stofe94.github.io/crash-def-net/concepts/models/)).
-- **OpenRadioss runs (early stage).** Read with their starter decks and verified on a real
-  crash example, a bumper beam against a pole
-  ([results](https://stofe94.github.io/crash-def-net/results/bumper-beam/),
-  [tutorial](https://stofe94.github.io/crash-def-net/getting-started/bumper-beam/)); LS-DYNA runs and VTK time
-  series are read too.
-- **Built for large data.** Memory stays independent of the dataset size, up to a few hundred
-  GB ([scaling](https://stofe94.github.io/crash-def-net/concepts/scaling/)).
-- **Fully documented.** A website with tutorials, guides, concepts and a reference generated
-  from the code ([documentation](https://stofe94.github.io/crash-def-net/)).
-- **Lean, open and local.** Plain PyTorch and PyTorch Geometric, with a core of
-  about 5,600 lines of Python, under AGPL-3.0; runs on your own machines, also on a CPU
-  ([installation](https://stofe94.github.io/crash-def-net/getting-started/installation/#requirements)).
+- **New architectures, compared fairly.** In a lean core of about 6,100 lines of Python, a new
+  architecture is one file and a few lines of config, compared under a fixed protocol with
+  the included MeshGraphNets and MGN-T
+  ([adding an architecture](https://stofe94.github.io/crash-def-net/guides/adding-an-architecture/)).
+
+All highlights, with details: [purpose and highlights](https://stofe94.github.io/crash-def-net/purpose/#highlights).
 
 <!-- --8<-- [start:citation] -->
 ## Citation
@@ -114,7 +59,7 @@ DOI of every single release.
   author  = {Stocker, Felix},
   title   = {CrashDefNet: Graph Neural Network Surrogates for Crash Simulation},
   year    = {2026},
-  version = {1.0.0},
+  version = {1.1.0},
   doi     = {10.5281/zenodo.23575635},
   url     = {https://github.com/stofe94/crash-def-net}
 }

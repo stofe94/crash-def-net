@@ -1,0 +1,26 @@
+# ============================================================
+# CrashDefNet — bumper beam DoE (135 runs): rollout
+# ============================================================
+# Rolls out the model of examples/bumper_beam_doe/train.toml over the 14 test runs from the
+# undeformed state, 50 steps to 100 ms, evaluates the run on it and renders an animation of
+# the trajectory at the median of the position error.
+# Results: docs/results/bumper-beam-doe.md
+#
+#   python predict/rollout.py --config examples/bumper_beam_doe/rollout.toml
+#
+# Every key: docs/reference/configuration.md.
+# ============================================================
+
+[rollout]
+checkpoint = "checkpoints/bumper_beam_doe_mgn_t/best_model.pt"
+data_dir   = "data/bumper_beam_doe"
+split      = "test"
+device     = "auto"
+export_vtu = true      # one .vtu per step, with the pole; needs pyvista
+one_step   = true      # also the one-step metrics RMSE-1
+
+[evaluation]
+enabled = true
+
+[animation]
+enabled = true

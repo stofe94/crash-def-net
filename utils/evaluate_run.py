@@ -81,7 +81,7 @@ from utils.compare_paper import (  # noqa: E402
 from utils.plot_losses import SURFACE, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY  # noqa: E402
 from utils.results import current_metric_names  # noqa: E402
 from utils.timezone import now  # noqa: E402
-from utils.units import SI_STRESS, si_factors, stress_display  # noqa: E402
+from utils.units import SI_STRESS, STRESS_FIELDS, si_factors, stress_display  # noqa: E402
 
 EVALUATIONS_DIR = _REPO_ROOT / "evaluations"
 
@@ -209,12 +209,21 @@ def model_line(run_dir: Path) -> Optional[str]:
     return None
 
 
+def checkpoint_file(record: Dict) -> Path:
+    """The checkpoint a rollout names: at its recorded absolute path, else at its recorded
+    path relative to the repository, e.g. after a rollout in the Docker container, which
+    records the paths inside it (``/app/...``)."""
+    absolute = Path(record["absolute_path"])
+    relative = _REPO_ROOT / record.get("path", "")
+    return relative if not absolute.exists() and relative.is_file() else absolute
+
+
 def load_run(folder: Path) -> Run:
     rollout = load_rollout(folder)
     if rollout is not None:
         if rollout.status != "finished":
             raise SystemExit(f"{folder}: rollout not finished ({rollout.status})")
-        checkpoint_path = Path(rollout.model["checkpoint"]["absolute_path"])
+        checkpoint_path = checkpoint_file(rollout.model["checkpoint"])
     elif (folder / "history.json").exists():
         checkpoint_path = folder / "best_model.pt"
     else:
@@ -696,10 +705,10 @@ def single_step_rows(run: Run) -> List[List[str]]:
     length, stress = si_factors(run.metadata)
     rows = []
     for i, (name, rmse) in enumerate(run.test["rmse_per_field"].items()):
-        # SI: velocity in m per frame, stress in Pa, other fields in the units of the data
-        si = length if name in VELOCITY_TARGET_NAMES else stress if name == "stress" else 1.0
-        factor, u = {"stress": stress_display(run.stress_unit)}.get(
-            name, (1e3, "mm per frame") if name in VELOCITY_TARGET_NAMES else (1.0, ""))
+        # SI: velocity in m per frame, the stresses in Pa, other fields in the units of the data
+        si = length if name in VELOCITY_TARGET_NAMES else stress if name in STRESS_FIELDS else 1.0
+        factor, u = (stress_display(run.stress_unit) if name in STRESS_FIELDS else
+                     (1e3, "mm per frame") if name in VELOCITY_TARGET_NAMES else (1.0, ""))
         u = f" {u}" if u else ""
         rows.append([name, f"{_significant(rmse * factor, 3)}{u}",
                      f"{_significant(run.test['mae_per_field'][name] * factor, 3)}{u}",

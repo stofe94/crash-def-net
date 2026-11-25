@@ -45,12 +45,21 @@ python -m dataset_preprocessor.export --raw-format d3plot --raw-dir side_impact 
   a model in mm, t, s. The values stay as they are; the reports convert to SI
   ([units](export.md#units)).
 - `--fields` adds result fields to the von Mises stress as targets: `plastic_strain`
-  (effective plastic strain) and `thickness` (shell thickness, which changes as a shell
-  thins). `--static-fields` chooses the static node features: `thickness`,
-  `initial_velocity` and the material properties `density`, `youngs_modulus`,
-  `poisson_ratio`, `yield_stress` (default: thickness and initial velocity, where the
-  runs have them). A training can then use a part of them
+  (effective plastic strain), `thickness` (shell thickness, which changes as a shell
+  thins), `mean_stress` and `bending_stress`. The last two come from the stress tensor at the
+  integration points: the mean stress of the membrane part, positive in tension, and the von
+  Mises stress of the bending part, half the difference of the two surfaces (shells with two
+  or more points through the thickness; solids have none). Unlike the von Mises stress they
+  tell tension from compression and bending from stretching; neither depends on the frame or
+  on the orientation of the shell normal. `--static-fields` chooses the static node features:
+  `thickness`, `initial_velocity` and the material properties `density`, `youngs_modulus`,
+  `poisson_ratio`, `yield_stress` (default: thickness and initial velocity, where the runs
+  have them). A training can then use a part of them
   ([choose the features](training.md#choose-the-features)).
+- `--edge-fields` puts the thickness and material properties of the elements next to every
+  mesh edge onto the edge, which keeps parts apart that share nodes, e.g. at a joint;
+  `--contact-gap` adds the gap between the shell surfaces to every contact edge
+  ([element properties and contact gap](../concepts/graphs.md#general-meshes-and-run-parameters)).
 - The parts become [components](../concepts/graphs.md#components-and-contact-rules),
   named by their titles; `--contact-pairs` sets which of them can touch.
 - Rigid parts are actuators: their motion is taken from the run. A rigid part whose
@@ -74,15 +83,16 @@ result fields:
 | Elements | shells (quadrilaterals, triangles n1 n2 n3 n3), solids (hexahedra, pentahedra, tetrahedra n1 n2 n3 n4 n4 n4 n4 n4), thick shells, beams (end nodes); mixed models |
 | IDs | user node and part IDs of the d3plot; the deck refers to them |
 | States | all or selected states (`frames`) with their times; only the arrays needed are loaded |
-| Results | von Mises stress (from the full tensor), effective plastic strain, shell thickness; reduced over the integration points (`layer_reduction`: `mean` or `max`) and averaged at the nodes. Rigid shells, for which LS-DYNA writes no state data, are left out. Targets: the stress, plus `--fields` |
+| Results | von Mises stress (from the full tensor), effective plastic strain, shell thickness, the mean stress of the membrane part and the von Mises stress of the bending part (from the stress at the integration points through the thickness); reduced over the integration points (`layer_reduction`: `mean` or `max`) and averaged at the nodes. Rigid shells, for which LS-DYNA writes no state data, are left out. Targets: the stress, plus `--fields` |
 | Parts | every part is a component, named by its title (part titles of the d3plot, else the heading of `*PART` in the deck), else by its part ID; parts that share a title get their ID appended (`title (ID)`). A node of several parts (e.g. a weld) belongs to the first part of the d3plot, nodes outside every element to the component `(no element)` |
+| Element properties | for `--edge-fields`, per node pair of an element edge the mean over the elements next to it of their thickness and material properties; the export maps them onto the mesh edges |
 | Material properties | from the first card of the first material of every `*MAT` keyword (also `_TITLE`, by name or number) of the types `*MAT_ELASTIC` (001), `_PLASTIC_KINEMATIC` (003), `_RIGID` (020), `_PIECEWISE_LINEAR_PLASTICITY` (024), `_PLASTICITY_WITH_DAMAGE` (081), `_SPOTWELD` (100), `_MODIFIED_PIECEWISE_LINEAR_PLASTICITY` (123): density RO, Young's modulus E, Poisson's ratio PR, and the yield stress SIGY (not for 001 and 020). Per node the mean over the elements around it whose material has the property; [no value](../concepts/graphs.md#general-meshes-and-run-parameters) at nodes without such elements (warning for parts with other material types) |
 | Node types | actuator = nodes of rigid parts (`*MAT_RIGID` / `*MAT_020` in the deck, or material type 20 in the d3plot) and nodes with prescribed motion (`*BOUNDARY_PRESCRIBED_MOTION_NODE` / `_SET` / `_RIGID`, option `_ID`); clamped = nodes fixed in x, y and z by `*BOUNDARY_SPC_SET` / `*BOUNDARY_SPC_NODE`; partially constrained nodes stay normal. Rigid parts named in `--free-rigid-parts` are normal instead ([free rigid parts](../concepts/graphs.md#free-rigid-parts)) |
 | Initial velocity | `*INITIAL_VELOCITY` (all nodes or a node set), `*INITIAL_VELOCITY_GENERATION` (part, part set or node set), `*INITIAL_VELOCITY_RIGID_BODY`, `*INITIAL_VELOCITY_NODE`, applied in this order (the more specific wins); rotations are ignored |
 | Rigid walls | `*RIGIDWALL_PLANAR` with `_ID`, `_FINITE` (treated as infinite), `_ORTHO`, `_FORCES`; the normal points from tail to head |
 | Keyword deck | fixed, long (`*KEYWORD LONG=Y`, trailing `+`) and free (comma) format; `*INCLUDE`; node and part sets `*SET_NODE` / `*SET_PART` (`_LIST`, `_GENERATE`, `_ADD`); options `_TITLE`, `_ID`, `_BIRTH_DEATH`; `*PART` with `_CONTACT`, `_PRINT`, `_ATTACHMENT_NODES` |
 
-Checked on the OpenRadioss runs of a [bumper beam against a pole](../results/bumper-beam.md), on
+Checked on the OpenRadioss runs of a [bumper beam against a pole](../results/bumper-beam-doe.md), on
 the [converted runs](#test-with-converted-runs), on LS-DYNA files from the test data of lasso-python
 (shells with user IDs, mixed shells and hexahedra, beams, a d3plot family) and on a
 synthetic car side against a rigid pole (shell panels, beams, hexahedra welded to a
@@ -124,5 +134,5 @@ values at the nodes, as post-processors do and as is usual for real LS-DYNA runs
 The stress thus passes node → element mean → node mean and is smoothed: 14 % relative RMS
 difference on the small export, up to 6 % in the normalizer statistics of the target. A model
 trained on one of the two exports is therefore not comparable in stress with one trained on
-the other, nor with the stress metrics of the papers; `metadata.json` records `raw_format`, and
-the rollout warns when it differs from the training data.
+the other, nor with the published stress metrics of MGN-T; `metadata.json` records
+`raw_format`, and the rollout warns when it differs from the training data.

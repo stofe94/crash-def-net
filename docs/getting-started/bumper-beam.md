@@ -6,7 +6,7 @@ prediction of runs the model has never seen. It reproduces the
 [bumper beam results](../results/bumper-beam.md).
 
 Needs the [installation](installation.md) with `lasso-python` and `pyvista`, and
-`huggingface_hub` for the download (`pip install huggingface_hub`); about 9 GB of disk space
+`huggingface_hub` for the download (`pip install huggingface_hub`); about 10 GB of disk space
 and a GPU. The GPU times on this page were measured on an NVIDIA RTX A4000 (16 GB).
 
 !!! warning "Early stage of development"
@@ -85,21 +85,29 @@ The other settings:
 
 - **Splits:** 110 runs of `TRAINING_DATA` for training, the next 14 for validation, the 7 runs
   of `VALIDATION_DATA` for the test.
-- **States:** all 11, with the previous velocity and stress as inputs (`history = 1`); at the
-  first state the previous velocity comes from the initial velocity of the deck (`/INIVEL`).
+- **States:** all 11, with the previous velocity and result fields as inputs (`history = 1`);
+  at the first state the previous velocity comes from the initial velocity of the deck
+  (`/INIVEL`).
 - **Units:** mm and GPa, as in the decks.
-- **Contact:** a radius of 30 mm; the wall of the deck does not enter as node features, as the
-  meshed pole takes its place.
-- **Static node feature:** the shell thickness from the starter deck.
+- **Result fields:** besides the von Mises stress the effective plastic strain and the
+  membrane mean stress and bending stress of the shells
+  ([LS-DYNA runs](../guides/ls-dyna.md#the-d3plot-reader)).
+- **Contact:** a radius of 30 mm; every contact edge also carries the distance from the shell
+  surface of the sender and the clearance between the shell surfaces (`gap`). Next to the
+  contact edges to the meshed pole, the cylinder of the deck gives every node its distance to
+  the pole as a node feature (`use_deck_walls`).
+- **Static features:** shell thickness and yield stress from the starter deck at the nodes,
+  and the same of the elements next to every mesh edge (`edges`).
 
 ```bash
 python -m dataset_preprocessor.export --config examples/bumper_beam/export.toml
 ```
 
-The export (~3 min, ~460 MB) writes `data/bumper_beam_remeshed/` with 16,152 nodes per run.
+The export (~4 min, ~920 MB) writes `data/bumper_beam_remeshed/` with 16,152 nodes per run.
 Nodes without a shell, the ends of the spot welds and the main node of the rigid body, have no
-thickness, and the pole has no stress: such a value is [missing, not 0](../concepts/graphs.md#general-meshes-and-run-parameters),
-and the missing stress counts in neither loss nor metrics.
+thickness or yield stress, and the pole has no result fields: such a value is
+[missing, not 0](../concepts/graphs.md#general-meshes-and-run-parameters), and a missing
+result counts in neither loss nor metrics.
 
 ## 4. Train
 
@@ -116,17 +124,22 @@ trains MGN-T in the size of its paper (0.51 M parameters) for 80 epochs at batch
   ([why](../results/bumper-beam.md#setup)); the statistics of the inputs and targets are
   fitted on the frames it uses ([choose the frames](../guides/training.md#choose-the-frames)).
 - **The change, not the state** (`residual_target`): the beam moves mainly by inertia, so the
-  model predicts how velocity and stress change from one state to the next.
+  model predicts how velocity and result fields change from one state to the next.
 - **Contact edges** (`self_contact_aware`): between the structure and the pole and where the
   structure folds onto itself, rebuilt from the predicted geometry at every step; the
   transformer of MGN-T works on the structure only (`transformer_nodes = "structure"`).
 - **Noise in mm:** 0.3 mm on the positions and 0.01 GPa on the stress. The motion across the
   beam is only about 0.5 mm per state, so the 3 mm of `deforming_plate` would cover it.
-- **Scheduled sampling:** a growing share of the nodes takes its previous velocity and stress
-  from the model's own prediction of the step before, as in the rollout, up to 70 % after 40
-  of the 80 epochs ([training](../concepts/training.md#loss-and-optimizer-step)).
-- **Model selection:** every 4 epochs the model rolls out the 14 validation runs; the best
-  rollout gives `best_model.pt` ([model selection](../concepts/training.md#model-selection-and-early-stopping)).
+- **Loss terms on the structure:** besides the targets, the length change of the mesh edges
+  in a step and the velocity of the rigid body, each against the simulation
+  ([loss](../concepts/training.md#loss-and-optimizer-step)).
+- **Scheduled sampling:** a growing share of the nodes takes its previous velocity and result
+  fields from the model's own prediction of the step before, as in the rollout, up to 70 %
+  after 40 of the 80 epochs ([training](../concepts/training.md#one-step-training)).
+- **Model selection:** every 4 epochs the model rolls out the 14 validation runs; the lowest
+  position error over the rollout and at its last step gives `best_model.pt`. From epoch 41
+  on, the training stops after 5 evaluations without a new low
+  ([model selection](../concepts/training.md#model-selection-and-early-stopping)).
 
 ## 5. Predict and evaluate
 

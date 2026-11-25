@@ -5,6 +5,118 @@ All notable changes to this project are documented here. The format follows
 [semantic versioning](https://semver.org/) as a guideline
 ([versioning](https://stofe94.github.io/crash-def-net/about/#versioning)).
 
+## [1.1.0] — 2026-11-24
+
+Version 1.1.0 predicts new designs from their initial state and deck, after checking whether
+a trained model applies to them, adds rollout training, and carries more of the crash physics
+into the graph: the contact gap, membrane and bending stress, element and material
+properties, loss terms on mesh and rigid bodies. New results on a bumper beam design of
+experiments of 135 OpenRadioss runs, published as a dataset, stand next to those of Akhare
+et al.
+
+### Added
+
+- **Prediction of new runs:** `predict/prepare.py` takes new runs that hold only their
+  initial state and the deck, checks whether a trained model applies to them, compared with
+  its train runs (rigid bodies, actuator, features, initial velocity; ranges of size, mesh,
+  speed, direction, static features and impactor position; rigid-body masses and elastic
+  constants of the deck; left-out and unknown parts), and writes them as prediction data.
+  `predict/rollout.py` predicts them without ground truth: summary and `.vtu` files hold the
+  prediction only
+  ([predict new runs](https://stofe94.github.io/crash-def-net/guides/prediction/)).
+  The OpenRadioss deck reader also reads the mass of every `/RBODY`.
+- **Rollout training:** `[rollout_training]` trains on windows of up to `steps` consecutive
+  samples that the model rolls out on its own predictions, with the loss on every step and
+  the gradients through the whole window, as a training method instead of scheduled
+  sampling. Every sample is trained once per epoch; activation checkpointing keeps the memory
+  near that of one step. `history.json` records the loss over the windows as
+  `train_rollout_loss`. The two training methods have a section of their own in the docs
+  ([training methods](https://stofe94.github.io/crash-def-net/concepts/training/#training-methods)).
+- **Results on a bumper beam design of experiments:** MGN-T on 135 OpenRadioss runs with
+  geometry, velocity, thickness and pole position varied, rolled out from the undeformed
+  state, next to the results of Akhare et al. on the same design. The runs are published as
+  the dataset OpenRadioss-BumperBeam-DoE135 on Hugging Face, the configs to reproduce the
+  results in `examples/bumper_beam_doe/`
+  ([bumper beam DoE](https://stofe94.github.io/crash-def-net/results/bumper-beam-doe/)).
+- **Contact gap on the world edges:** `--contact-gap` (`[contact] gap`) adds the distance of
+  the receiver from the sender's shell surface along its normal and the clearance between
+  the shell surfaces after the shell thicknesses
+  ([graphs](https://stofe94.github.io/crash-def-net/concepts/graphs/#general-meshes-and-run-parameters)).
+- **Membrane and bending stress as result fields:** `--fields mean_stress bending_stress`
+  (LS-DYNA, OpenRadioss) adds the mean stress of the membrane part, positive in tension, and
+  the von Mises stress of the bending part of the shell stress, from the integration points
+  through the thickness; both are independent of the frame and of the orientation of the
+  shell normal ([LS-DYNA runs](https://stofe94.github.io/crash-def-net/guides/ls-dyna/#the-d3plot-reader)).
+  Their errors in the rollout summary and the test metrics are in Pa, like those of the von
+  Mises stress ([units](https://stofe94.github.io/crash-def-net/guides/export/#units)).
+- **Element properties on the mesh edges:** `--edge-fields` (`[features] edges`) adds the
+  shell thickness and material properties of the elements next to every mesh edge, which
+  keeps parts apart that share nodes; stored per trajectory (`edge_static`)
+  ([graphs](https://stofe94.github.io/crash-def-net/concepts/graphs/#general-meshes-and-run-parameters)).
+- **Material properties from the OpenRadioss starter deck:** `/MAT/ELAST` and
+  `/MAT/PLAS_JOHNS` of every `/PART` give density, Young's modulus, Poisson's ratio and the
+  yield stress as static node features
+  ([OpenRadioss runs](https://stofe94.github.io/crash-def-net/guides/openradioss/#the-starter-deck)).
+- **Loss terms on the structure:** `[loss] edge_stretch_weight` adds the length change of the
+  mesh edges in a step, prediction against ground truth: rotations of an edge, as in folding,
+  stay free, stretching of the predicted mesh does not. `[loss] rigid_body_weight` adds the
+  mean velocity of every free rigid body, which holds few nodes but may carry much of the mass.
+  Both off by default; the terms are recorded in `history.json`
+  ([training](https://stofe94.github.io/crash-def-net/concepts/training/#loss-and-optimizer-step)).
+- **Scheduled sampling over several steps:** `[scheduled_sampling] steps` rolls out from that
+  many samples back, so that the inputs carry the drift of a short rollout, and a share of
+  the samples takes that state on all nodes; 1 (the default) is the scheduled sampling as
+  before, on a share of the nodes.
+- **Rollout measures of the structure:** the rollout summary holds the length error of the
+  mesh edges per step and, with free rigid bodies, their position and velocity errors; the
+  rollout validation records them in `history.json` as well
+  ([file formats](https://stofe94.github.io/crash-def-net/reference/file-formats/#historyjson)).
+- **Time schemes in the documentation:** autoregressive, one-shot and time-conditional
+  prediction, and the ways to train an autoregressive model for its rollout, with the
+  choices CrashDefNet makes
+  ([why autoregressive](https://stofe94.github.io/crash-def-net/concepts/overview/#why-autoregressive)).
+- **`.vtu` export in the Docker image:** the image contains pyvista, so a rollout in the
+  container writes the `.vtu` files as well; evaluation and animation run outside it
+  ([Docker](https://stofe94.github.io/crash-def-net/guides/docker/#rollout-inside-the-container)).
+- **Shared memory of the Docker container:** 8 GB by default instead of 4 GB, set with
+  `SHM_SIZE` in `.env`; the DataLoader workers share the dataset held in memory through it
+  ([Docker](https://stofe94.github.io/crash-def-net/guides/docker/)).
+- **Parts without material, reported once:** parts that have no material the reader evaluates
+  (e.g. rigid parts) get no material properties; the export names them once at its end and in
+  `metadata.json` (`parts_without_material`) instead of a warning per run.
+
+### Changed
+
+- **Bumper beam results with the extended modelling:** the results of the bumper beam come
+  from a new run on an export with plastic strain, membrane and bending stress, yield stress,
+  the contact gap, the distance to the pole of the deck and element properties on the mesh
+  edges, trained with the loss terms on the structure and selected by the position error.
+  `examples/bumper_beam/` holds its settings, and the tutorial walks through them
+  ([bumper beam](https://stofe94.github.io/crash-def-net/results/bumper-beam/),
+  [tutorial](https://stofe94.github.io/crash-def-net/getting-started/bumper-beam/)).
+- **README and home page:** a short description of CrashDefNet and the three most important
+  highlights; all of them, with links, are on the purpose page
+  ([purpose and highlights](https://stofe94.github.io/crash-def-net/purpose/#highlights)).
+  Both show the rollout of the bumper beam design of experiments, and the results start with
+  it; the deforming plate results, made with v0.4.0, say so at the top of their page.
+- **Documentation around crash data:** the export guide and the page on data and graphs start
+  with crash data, the `deforming_plate` benchmark follows as the dataset CrashDefNet was
+  built up on; every method and value names its source, and the glossary has the terms of
+  the new features
+  ([data and graphs](https://stofe94.github.io/crash-def-net/concepts/graphs/)).
+- **Docker image name:** `crashdefnet:latest` instead of `crashdefnet-deforming-plate:latest`,
+  as it trains any data; an image built before is built again with `docker compose build`
+  ([Docker](https://stofe94.github.io/crash-def-net/guides/docker/)).
+- **Website without requests to third parties:** the fonts are served by the website itself
+  instead of Google Fonts, and the header no longer asks GitHub for the statistics of the
+  repository; the footer links to the legal notice and the privacy policy.
+
+### Fixed
+
+- **Evaluation of a rollout made in the Docker container:** `utils/evaluate_run.py` finds the
+  checkpoint folder through the path relative to the repository when the recorded absolute
+  path is one inside the container, so the report includes the training.
+
 ## [1.0.0] — 2026-11-09
 
 Version 1.0.0: the whole chain from raw simulation data to evaluated predictions is in
@@ -178,7 +290,7 @@ runs.
   two frames, of which the second can already be deformed. The database stores it per run
   (`start_velocity`, `info.first_frame`). Exports without history stay as they were; history
   exports up to v0.4.0 load and roll out as before, from the first two frames
-  ([optional history](https://stofe94.github.io/crash-def-net/concepts/graphs/#optional-history-history-1-not-in-the-paper)).
+  ([optional history](https://stofe94.github.io/crash-def-net/concepts/graphs/#optional-history-history-1)).
 - **Results from the first frame of the run, named by raw frame:** the `.vtu` files of a
   rollout are named by their raw frame of the run and begin with the first frame of the
   dataset, the given frames up to the initial state with error 0. The error curves of
@@ -571,7 +683,8 @@ benchmark.
   for the results: they are predictions of learned models, no substitute for validated
   crash simulation or physical testing, and the software comes without warranty.
 
-[Unreleased]: https://github.com/stofe94/crash-def-net/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/stofe94/crash-def-net/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/stofe94/crash-def-net/releases/tag/v1.1.0
 [1.0.0]: https://github.com/stofe94/crash-def-net/releases/tag/v1.0.0
 [0.4.0]: https://github.com/stofe94/crash-def-net/releases/tag/v0.4.0
 [0.3.0]: https://github.com/stofe94/crash-def-net/releases/tag/v0.3.0

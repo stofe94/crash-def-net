@@ -5,7 +5,7 @@ of DeepMind's original `deforming_plate` splits: same dataset, budget, recipe an
 evaluation; only the model and a few declared variations change, checked with
 [`utils/check_protocol.py`](https://github.com/stofe94/crash-def-net/blob/main/utils/check_protocol.py). The subset is small on purpose,
 so that a run takes hours on one GPU; the numbers compare with each other, not with the
-papers ([results](../results/deforming-plate.md#why-the-numbers-are-not-comparable-with-the-paper)). A
+papers ([results](../results/deforming-plate.md#why-the-numbers-are-not-comparable-with-the-papers)). A
 walk-through with both architectures: [compare architectures](compare-architectures.md).
 
 ## Baselines
@@ -14,7 +14,7 @@ Results are related to MeshGraphNets in two ways:
 
 | Reference | What it is | Role |
 |---|---|---|
-| Original | the published results of the MeshGraphNets paper, with world edges between all node pairs closer than r_W that are not mesh neighbours (`world_edges = "all"`; Pfaff et al. 2021, Sec. 3.1 on p. 4); taken from the paper, not reproduced here | relates results to the literature ([`compare_paper.py`](../guides/evaluation.md#compare-with-the-papers)) |
+| Original | the published results of the MeshGraphNets paper, with world edges between all node pairs closer than r_W that are not mesh neighbours (`world_edges = "all"`; Pfaff et al. 2021, Sec. 3.1 on p. 4); taken from the paper, not reproduced here | relates results to the literature ([`compare_paper.py`](../guides/evaluation.md#compare-with-published-results)) |
 | Comparable baseline | MeshGraphNets in paper size, trained under this protocol with `world_edges = "self_contact_aware"` (declared variation) | the reference for new architectures, with the contact edges they use (`check_protocol.py`) |
 
 New architectures are compared with the comparable baseline. The reason is scalability:
@@ -46,7 +46,7 @@ python predict/rollout.py --checkpoint checkpoints/<run>/best_model.pt \
 # 4) Protocol check and paired comparison (first folder: the comparable baseline)
 python utils/check_protocol.py rollouts/<baseline rollout> rollouts/<new rollout>
 
-# 5) Evaluation of the new run on its own, and comparison with the paper
+# 5) Evaluation of the new run on its own, and comparison with MeshGraphNets and MGN-T
 python utils/evaluate_run.py rollouts/<new rollout>
 python utils/compare_paper.py rollouts/<new rollout> rollouts/<baseline rollout>
 ```
@@ -78,7 +78,7 @@ holds the fixed settings:
 | Gradient clipping | norm 1.0 |
 | Loss | MSE on the normalized targets of all nodes except the actuator |
 | Noise | position noise σ = 3·10⁻³ m on the normal nodes, targets corrected; no stress noise |
-| Inputs | history 0, no residual target, no scheduled sampling |
+| Inputs | history 0, no residual target, no scheduled sampling, no rollout training |
 | Validation | rollout of all 30 val trajectories every 4 epochs, as one batch of graphs |
 | Model selection | `criteria = ["rollout_mse"]`: the evaluation with the lowest rollout MSE on the val split |
 | Early stopping | off (`enabled = false`): every model trains all 60 epochs |

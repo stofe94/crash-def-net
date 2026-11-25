@@ -72,7 +72,7 @@ the CPU. A GPU under Windows is not tested.
 | `toml`, `tqdm` | configs, progress bars |
 | `tzdata` (Windows only) | time zone of the timestamps; Linux has it built in |
 | `pyvista` (optional) | `.vtu` export of the rollout for ParaView, rollout animation; third raw format: VTK time series ([guide](../guides/vtk.md)) |
-| `matplotlib` (optional) | loss curves, comparison with the paper, rollout animation |
+| `matplotlib` (optional) | loss curves, comparison with published results, rollout animation |
 | `lasso-python` (optional) | d3plot raw format: [OpenRadioss runs](../guides/openradioss.md) and [LS-DYNA runs](../guides/ls-dyna.md) |
 | `zensical` (optional) | building the documentation website locally: `pip install -e ".[docs]"`, then `zensical serve -o` |
 
@@ -84,11 +84,16 @@ holds CUDA, PyTorch and PyG, so the machine itself needs only the NVIDIA driver 
 
 ## Raw data
 
-CrashDefNet uses DeepMind's `deforming_plate` dataset from the
-[MeshGraphNets release](https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets).
-It is not part of the repository and comes under DeepMind's terms, not CrashDefNet's
-license ([details](../concepts/graphs.md#the-benchmark)). The example config and the quick start
-need only [`meta.json`](https://storage.googleapis.com/dm-meshgraphnets/deforming_plate/meta.json) and [`test.tfrecord`](https://storage.googleapis.com/dm-meshgraphnets/deforming_plate/test.tfrecord)
+The quick start, the [first training](first-training.md) and the
+[comparison protocol](../guides/comparison-protocol.md) use DeepMind's `deforming_plate`
+dataset from the
+[MeshGraphNets release](https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets),
+the benchmark on which CrashDefNet was built up. It is not part of the repository and comes
+under DeepMind's terms, not CrashDefNet's license ([details](../concepts/graphs.md#the-benchmark)).
+The crash datasets are downloaded in the steps of their pages
+([bumper beam tutorial](bumper-beam.md#1-raw-data),
+[bumper beam DoE](../results/bumper-beam-doe.md#reproducing)). The example config and the
+quick start need only [`meta.json`](https://storage.googleapis.com/dm-meshgraphnets/deforming_plate/meta.json) and [`test.tfrecord`](https://storage.googleapis.com/dm-meshgraphnets/deforming_plate/test.tfrecord)
 (~0.8 GB, 100 trajectories); the exporter splits its trajectories into separate train,
 validation and test sets. The folder address itself cannot be browsed; only the links to
 the files work.
@@ -135,7 +140,7 @@ python utils/plot_losses.py --run-dir checkpoints/example_run
 # 5) Evaluate the run on its own -> evaluations/<time>_example_run_evaluation/
 python utils/evaluate_run.py checkpoints/example_run
 
-# 6) Compare all finished rollouts with the papers -> evaluations/<time>_paper_comparison/
+# 6) Compare all finished rollouts with MeshGraphNets and MGN-T -> evaluations/<time>_paper_comparison/
 python utils/compare_paper.py
 ```
 
@@ -147,7 +152,7 @@ python utils/compare_paper.py
 | 2 | The training follows `examples/quick_start/train.toml`: MGN-T with ~50 k parameters, position noise, a validation rollout after every epoch, model selection on four criteria. It ends with the test metrics of the selected model. | [train a model](../guides/training.md), [training](../concepts/training.md) |
 | 3 | The rollout predicts the 2 test plates from the first frame on, every step from its own previous prediction, and writes the errors and one `.vtu` file per step for ParaView. | [roll out a model](../guides/rollout.md) |
 | 4–5 | Loss curves and the evaluation of the run: training, error over the rollout, spread over the test plates. | [evaluate and compare](../guides/evaluation.md#evaluate-a-run) |
-| 6 | The comparison of every finished rollout with the values of the papers. With this minimal setup the errors are far above them. | [compare with the papers](../guides/evaluation.md#compare-with-the-papers) |
+| 6 | The comparison of every finished rollout with the published values of MeshGraphNets and MGN-T. With this minimal setup the errors are far above them. | [compare with published results](../guides/evaluation.md#compare-with-published-results) |
 
 ## Next steps
 

@@ -16,11 +16,11 @@ mounted as a volume; results are written back to the host.
 ## Build
 
 ```bash
-docker compose build          # image crashdefnet-deforming-plate:latest (~6 GB: CUDA + torch)
+docker compose build          # image crashdefnet:latest (~6 GB: CUDA + torch)
 ```
 
-The image contains no vtk / pyvista. Training does not need them, and the `.vtu` export
-of the rollout is switched off in the container (see below).
+The image contains pyvista, so a rollout in the container writes the `.vtu` files as well
+(see below). Nothing is rendered in the container: animations are made outside it.
 
 ## Train
 
@@ -68,7 +68,7 @@ With the raw data under `datasets/deforming_plate/raw_dataset/` (see
 
 ```bash
 docker run --rm -v $PWD/datasets:/app/datasets -v $PWD/data:/app/data \
-  --entrypoint python crashdefnet-deforming-plate:latest -m dataset_preprocessor.export \
+  --entrypoint python crashdefnet:latest -m dataset_preprocessor.export \
   --out-dir data/deforming_plate_s4_t150 \
   --sources train.tfrecord valid.tfrecord test.tfrecord --select-seed 42 \
   --n-train 100 --n-val 30 --n-test 20 --num-steps 100 --time-stride 4
@@ -78,20 +78,21 @@ docker run --rm -v $PWD/datasets:/app/datasets -v $PWD/data:/app/data \
 
 ```bash
 docker compose run --rm --entrypoint python train predict/rollout.py \
-  --checkpoint checkpoints/<run>/best_model.pt --data-dir /data --split test --no-export-vtu
+  --checkpoint checkpoints/<run>/best_model.pt --data-dir /data --split test
 ```
 
-The rollout folder appears under `./rollouts/` on the host. For `.vtu` files for
-ParaView, run the rollout locally with pyvista installed.
+The rollout folder, with the `.vtu` files for ParaView, appears under `./rollouts/` on the
+host. The evaluation and the animation of a rollout
+([evaluate a run](evaluation.md#evaluate-a-run)) run outside the container, on that folder.
 
 ## Moving the image to another machine
 
 Build here, run there:
 
 ```bash
-docker save crashdefnet-deforming-plate | gzip > crashdefnet-dp.tar.gz
+docker save crashdefnet | gzip > crashdefnet.tar.gz
 # copy the file to the GPU machine, then:
-docker load < crashdefnet-dp.tar.gz
+docker load < crashdefnet.tar.gz
 ```
 
 Copy the dataset folder separately. Alternatively copy the repository and run
@@ -106,10 +107,12 @@ Copy the dataset folder separately. Alternatively copy the repository and run
   records the peak memory in `history.json`. `PYTORCH_CUDA_ALLOC_CONF` in
   `docker-compose.yml` counters fragmentation caused by the varying number of contact
   edges.
-- **RAM:** the dataset is held once in shared memory (`shm_size` 2 GB). With the
-  `deforming_plate` protocol dataset each DataLoader worker costs ~0.3 GB, and on 4 vCPU /
-  8 GB RAM 3 workers fit. For splits that do not fit
-  into RAM or `/dev/shm`: `[data] lazy = true`.
+- **RAM:** the dataset is held once in shared memory, which the DataLoader workers share
+  (`shm_size`, 8 GB by default; `SHM_SIZE` in `.env` changes it). It is a limit, not a
+  reservation. With the `deforming_plate` protocol dataset each DataLoader worker costs
+  ~0.3 GB, and on 4 vCPU / 8 GB RAM 3 workers fit. A dataset larger than the limit stops
+  the workers with a bus error; for splits that do not fit into RAM or `/dev/shm`:
+  `[data] lazy = true`.
 
 ## Other CUDA versions
 

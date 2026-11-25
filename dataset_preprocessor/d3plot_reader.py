@@ -50,6 +50,20 @@ What a run provides
   over the elements around it; NaN (no value) at nodes without such elements, e.g. at
   beams. Rigid shells carry no state data and do not contribute. Targets: the von Mises stress (``stress``), then ``fields``
   (``RESULT_FIELDS``).
+* ``mean_stress``, ``bending_stress``: from the stress tensor at the integration points
+  (``membrane_and_bending``): the mean stress of the membrane part (signed: tension
+  positive) and the von Mises stress of the bending part (shells with at least two points
+  through the thickness; no value at solids). Both are independent of the frame and of
+  the orientation of the shell normal, so they tell tension from compression and bending
+  from stretching, which the von Mises stress does not.
+* ``edge_pairs``, ``edge_static``: with ``edge_fields`` (``EDGE_FIELDS``) the element
+  properties next to every node pair that an element edge joins: the mean over those
+  elements that have the property (``_edge_properties``), the shell thickness of the deck
+  and the material properties. Unlike the nodal mean of ``static_fields`` it keeps parts
+  apart that share nodes, e.g. sheets of different thickness or steel at a joint.
+* ``parts_without_material``: with material properties (``static_fields``,
+  ``edge_fields``) the parts that have no material of the types read, e.g. rigid parts;
+  they get no material properties. Collected per run, reported by the export at its end.
 * ``component``: the part of every node, named by its title (d3plot, else deck),
   else by its part ID; titles that several parts share get the ID appended. The
   parts are in the order of the d3plot; a node of several parts belongs to the first,
@@ -70,7 +84,8 @@ so ``radioss_deck.py`` reads it from the starter deck. Parts titled like a ``/RW
 or ``/RBODY`` are rigid parts; ``/BCS`` gives clamped nodes; ``/RWALL/CYL`` the walls
 as (W, 7), with the radius as last column; ``/PROP/SHELL`` the static thickness where
 the d3plot holds only zeros; ``/INTER/TYPE2`` a mesh edge from every tied node to the
-nearest node of its surface (``ties``); ``/INIVEL/TRA`` the initial velocity. The conversion may give several parts the same
+nearest node of its surface (``ties``); ``/INIVEL/TRA`` the initial velocity; ``/MAT`` with
+``/PART`` the material properties of ``static_fields``. The conversion may give several parts the same
 ID (``_distinct_part_ids``) and writes display models of walls and sections as shells.
 These stay in the mesh unless ``exclude_parts`` names them, except shells without area,
 which are left out (warning).
@@ -105,6 +120,7 @@ from dataset_preprocessor.export_config import (
     component_roles,
 )
 from dataset_preprocessor.graph_features import (
+    CELL_EDGES,
     CELL_HEXAHEDRON,
     CELL_LINE,
     CELL_NUM_NODES,
@@ -143,7 +159,9 @@ _ELEMENT_ARRAYS = {
 _STATE_ARRAYS = ["node_displacement", "timesteps"] + [
     name for arrays in _ELEMENT_ARRAYS.values() for name in arrays[2:] if name]
 # Result fields a run can add to the von Mises stress as targets (``fields``).
-RESULT_FIELDS = ("plastic_strain", "thickness")
+RESULT_FIELDS = ("plastic_strain", "thickness", "mean_stress", "bending_stress")
+# Nodal fields of the states, all derived from the arrays in _ELEMENT_ARRAYS.
+STATE_FIELDS = ("von_mises", "plastic_strain", "thickness", "mean_stress", "bending_stress")
 # Material types whose first card is MID, RO, E, PR, by keyword name and number; the
 # types in _YIELD_STRESS_TYPES have the yield stress SIGY as its fifth field.
 MATERIAL_TYPES = {"ELASTIC": 1, "PLASTIC_KINEMATIC": 3, "RIGID": 20,
@@ -154,6 +172,13 @@ MATERIAL_PROPERTIES = ("density", "youngs_modulus", "poisson_ratio", "yield_stre
 # Static node features a run can provide (``static_fields``); initial_velocity gives
 # initial_velocity_x/y/z.
 STATIC_FIELDS = ("thickness", "initial_velocity") + MATERIAL_PROPERTIES
+# Element properties a run can give its mesh edges (``edge_fields``, see _edge_properties).
+EDGE_FIELDS = ("thickness",) + MATERIAL_PROPERTIES
+# Local node pairs of the element edges per lasso element type; shells with repeated
+# nodes (triangles n1 n2 n3 n3) and degenerate solids give pairs of one node, left out.
+_ELEMENT_EDGE_PAIRS = {"beam": [(0, 1)], "shell": [(0, 1), (1, 2), (2, 3), (3, 0)],
+                       "solid": CELL_EDGES[CELL_HEXAHEDRON],
+                       "tshell": CELL_EDGES[CELL_HEXAHEDRON]}
 NO_ELEMENT = "(no element)"   # component of nodes outside every element
 TIE_SEARCH_CHUNK = 256        # tied nodes per distance matrix (memory of large surfaces)
 
@@ -481,6 +506,19 @@ def von_mises(stress: np.ndarray) -> np.ndarray:
                    + 3.0 * (xy ** 2 + yz ** 2 + zx ** 2))
 
 
+def membrane_and_bending(stress: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """(..., L, 6) Voigt stress at the L integration points of elements (through the
+    thickness of shells, the first and the last on the two surfaces) -> the mean stress of
+    the membrane part, a third of the trace of the mean over the points (tension positive),
+    and the von Mises stress of the bending part, half the difference of the last and the
+    first point; None with one point. Swapping the surfaces (the orientation of the shell
+    normal) or rotating the frame changes neither."""
+    mean_stress = stress.mean(axis=-2)[..., :3].sum(-1) / 3.0
+    if stress.shape[-2] < 2:
+        return mean_stress, None
+    return mean_stress, von_mises(0.5 * (stress[..., -1, :] - stress[..., 0, :]))
+
+
 def distinct_corners(nodes: np.ndarray) -> np.ndarray:
     """(E, k) bool: corner holds a node not already listed before it in the element."""
     distinct = np.ones(nodes.shape, dtype=bool)
@@ -549,6 +587,8 @@ class D3plotRun:
     von_mises: Optional[np.ndarray] = None       # (T, N)
     plastic_strain: Optional[np.ndarray] = None  # (T, N)
     thickness: Optional[np.ndarray] = None       # (T, N) shells only
+    mean_stress: Optional[np.ndarray] = None     # (T, N) of the membrane part
+    bending_stress: Optional[np.ndarray] = None  # (T, N) shells with two or more points
     globals: Optional[Dict[str, float]] = None   # from globals.json
     node_static: Dict[str, np.ndarray] = field(default_factory=dict)   # name -> (N,)
     walls: Optional[np.ndarray] = None           # (W, 6) point + unit normal; (W, 7) cylinders
@@ -564,6 +604,10 @@ class D3plotRun:
     # (N, 3) motion over one frame interval before the first selected frame, at the initial
     # velocity: the velocity input of the first frame (export with --history 1)
     start_velocity: Optional[np.ndarray] = None
+    edge_pairs: Optional[np.ndarray] = None      # (P, 2) node pairs (i < j) of element edges
+    edge_static: Optional[Dict[str, np.ndarray]] = None   # edge_fields: name -> (P,)
+    # with material properties: the parts that have none (no material of the types read)
+    parts_without_material: Optional[List[str]] = None
 
 
 def keyword_files(run_dir: Path) -> List[Path]:
@@ -594,6 +638,8 @@ class StateBlock:
     von_mises: Optional[np.ndarray] = None       # (t, N)
     plastic_strain: Optional[np.ndarray] = None  # (t, N)
     thickness: Optional[np.ndarray] = None       # (t, N) shells only
+    mean_stress: Optional[np.ndarray] = None     # (t, N) of the membrane part
+    bending_stress: Optional[np.ndarray] = None  # (t, N) shells with two or more points
 
 
 def read_run(run_dir, frames: Optional[Sequence[int]] = None,
@@ -602,7 +648,8 @@ def read_run(run_dir, frames: Optional[Sequence[int]] = None,
              free_rigid_parts: Sequence[str] = (),
              exclude_parts: Sequence[str] = (),
              components: Optional[Dict[str, str]] = None,
-             no_deck_walls: bool = False) -> D3plotRun:
+             no_deck_walls: bool = False,
+             edge_fields: Optional[Sequence[str]] = None) -> D3plotRun:
     """One LS-DYNA run with all its states in memory; ``frames`` selects states
     (default: all).
 
@@ -618,7 +665,7 @@ def read_run(run_dir, frames: Optional[Sequence[int]] = None,
                                   static_fields=static_fields,
                                   free_rigid_parts=free_rigid_parts,
                                   exclude_parts=exclude_parts, components=components,
-                                  no_deck_walls=no_deck_walls)
+                                  no_deck_walls=no_deck_walls, edge_fields=edge_fields)
     states = list(blocks)
 
     def joined(name):
@@ -628,8 +675,8 @@ def read_run(run_dir, frames: Optional[Sequence[int]] = None,
         return parts[0] if len(parts) == 1 else np.concatenate(parts)
 
     run.times, run.world_pos = joined("times"), joined("world_pos")
-    run.von_mises, run.plastic_strain = joined("von_mises"), joined("plastic_strain")
-    run.thickness = joined("thickness")
+    for name in STATE_FIELDS:
+        setattr(run, name, joined(name))
     return run
 
 
@@ -639,7 +686,8 @@ def read_run_blocks(run_dir, frames: Optional[Sequence[int]] = None,
                     free_rigid_parts: Sequence[str] = (),
                     exclude_parts: Sequence[str] = (),
                     components: Optional[Dict[str, str]] = None,
-                    no_deck_walls: bool = False
+                    no_deck_walls: bool = False,
+                    edge_fields: Optional[Sequence[str]] = None
                     ) -> Tuple[D3plotRun, Iterator[StateBlock]]:
     """The static data of a run plus an iterator over its selected states in blocks.
 
@@ -649,7 +697,8 @@ def read_run_blocks(run_dir, frames: Optional[Sequence[int]] = None,
     None: one block), so a large run need not fit into memory. The first
     block is read here: the node types need the geometry, the static
     thickness the first state. ``static_fields``, ``free_rigid_parts``, ``exclude_parts``,
-    ``components`` and ``no_deck_walls`` as in ``read_run``.
+    ``components`` and ``no_deck_walls`` as in ``read_run``; ``edge_fields`` the element
+    properties on the edges (``EDGE_FIELDS``, module docstring).
     """
     if layer_reduction not in LAYER_REDUCTIONS:
         raise ValueError(f"layer_reduction must be one of {LAYER_REDUCTIONS}")
@@ -657,6 +706,10 @@ def read_run_blocks(run_dir, frames: Optional[Sequence[int]] = None,
     if unknown:
         raise ValueError(f"static fields {unknown} are not read from LS-DYNA runs; "
                          f"available: {list(STATIC_FIELDS)}")
+    unknown = sorted(set(edge_fields or ()) - set(EDGE_FIELDS))
+    if unknown:
+        raise ValueError(f"edge fields {unknown} are not read from LS-DYNA runs; "
+                         f"available: {list(EDGE_FIELDS)}")
     reduce = np.mean if layer_reduction == "mean" else np.max
     run_dir = Path(run_dir)
     if frames is None and not max_block_bytes:
@@ -669,7 +722,7 @@ def read_run_blocks(run_dir, frames: Optional[Sequence[int]] = None,
         chunks = [selected[i:i + size] for i in range(0, len(selected), size)]
     arrays = _read_states(run_dir, chunks[0])
     run = _static_run(run_dir, arrays, static_fields, free_rigid_parts, exclude_parts,
-                      components, no_deck_walls)
+                      components, no_deck_walls, edge_fields)
     held = [_state_block(arrays, run, reduce)]   # handed out once, then released
     del arrays
     thickness = held[0].thickness   # shell thickness at the first state
@@ -744,14 +797,20 @@ def _state_block(arrays, run: D3plotRun, reduce) -> StateBlock:
     if run.kept_nodes is not None:
         world_pos = world_pos[:, run.kept_nodes]
     num_states, num_nodes = world_pos.shape[:2]
-    fields = {name: NodalAverage(num_states, num_nodes)
-              for name in ("von_mises", "plastic_strain", "thickness")}
+    fields = {name: NodalAverage(num_states, num_nodes) for name in STATE_FIELDS}
     for element_type, (_, parts_name, stress_name, strain_name, thickness_name) \
             in _ELEMENT_ARRAYS.items():
         if element_type not in run.elements:
             continue
         nodes, kept = run.elements[element_type].nodes, run.elements[element_type].kept
         part_index = arrays[parts_name]
+
+        def add(name, values):   # (T, E_state) element values
+            rows = _state_rows(arrays, element_type, part_index, values)
+            if kept is not None:
+                values, rows = values[:, kept[rows]], rows[kept]
+            fields[name].add(values, nodes[rows])
+
         for name, array_name, per_layer in (("von_mises", stress_name, True),
                                             ("plastic_strain", strain_name, True),
                                             ("thickness", thickness_name, False)):
@@ -762,15 +821,17 @@ def _state_block(arrays, run: D3plotRun, reduce) -> StateBlock:
                 values = von_mises(values)
             if per_layer and values.ndim == 3:
                 values = reduce(values, axis=2)                      # (T, E_state)
-            rows = _state_rows(arrays, element_type, part_index, values)
-            if kept is not None:
-                values, rows = values[:, kept[rows]], rows[kept]
-            fields[name].add(values, nodes[rows])
+            add(name, values)
+        stress = arrays.get(stress_name) if stress_name else None
+        if stress is not None:   # (T, E, L, 6), or (T, E, 6) with one point
+            mean_stress, bending = membrane_and_bending(
+                stress if stress.ndim == 4 else stress[:, :, None, :])
+            add("mean_stress", mean_stress)
+            if bending is not None:
+                add("bending_stress", bending)
     return StateBlock(times=np.asarray(arrays.get("timesteps", np.arange(num_states))),
                       world_pos=world_pos.astype(np.float32),
-                      von_mises=fields["von_mises"].result(),
-                      plastic_strain=fields["plastic_strain"].result(),
-                      thickness=fields["thickness"].result())
+                      **{name: fields[name].result() for name in STATE_FIELDS})
 
 
 def _distinct_part_ids(arrays) -> None:
@@ -848,7 +909,8 @@ def _static_run(run_dir: Path, arrays, static_fields: Optional[Sequence[str]] = 
                 free_rigid_parts: Sequence[str] = (),
                 exclude_parts: Sequence[str] = (),
                 components: Optional[Dict[str, str]] = None,
-                no_deck_walls: bool = False) -> D3plotRun:
+                no_deck_walls: bool = False,
+                edge_fields: Optional[Sequence[str]] = None) -> D3plotRun:
     """Geometry, elements, node types, components, static node features (but the
     thickness, which needs the first state), walls and run parameters of a run (decks
     and d3plot geometry), without states."""
@@ -947,11 +1009,11 @@ def _static_run(run_dir: Path, arrays, static_fields: Optional[Sequence[str]] = 
     run.node_type[node_indexes(clamped_node_ids(blocks) | radioss.clamped)] = NODE_TYPE_CLAMPED
     run.node_type[nodes_of_parts(fixed_parts)] = NODE_TYPE_CLAMPED
 
+    part_thickness = {**section_thickness(blocks), **radioss.shell_thickness}
     shells = run.elements.get("shell")
     if shells is not None:
         run.ties = _tie_edges(mesh_pos, shells, [(node_indexes(sorted(nodes)), surface)
                                                  for nodes, surface in radioss.ties])
-        part_thickness = {**section_thickness(blocks), **radioss.shell_thickness}
         known = np.isin(shells.part_ids, list(part_thickness))
         if known.any():
             thickness = [part_thickness[i] for i in shells.part_ids[known].tolist()]
@@ -983,9 +1045,40 @@ def _static_run(run_dir: Path, arrays, static_fields: Optional[Sequence[str]] = 
         for axis, name in enumerate("xyz"):
             run.node_static[f"initial_velocity_{name}"] = velocity[:, axis]
     wanted = [name for name in MATERIAL_PROPERTIES if name in (static_fields or ())]
+    if wanted or edge_fields:
+        if radioss.part_materials:   # OpenRadioss: the materials by part ID
+            material_parts = {part_id: ("", part_id) for part_id in radioss.part_materials}
+            materials = radioss.part_materials
+        else:
+            material_parts, materials = parts, material_properties(blocks)
+        # Parts without a material that is read (e.g. rigid parts, spot welds of another
+        # material type) have no material properties; the export reports them once.
+        names_of = dict(zip(component_ids, run.component_names))
+        run.parts_without_material = [
+            names_of.get(part_id, str(part_id)) for part_id in sorted(
+                {part_id for block in run.elements.values()
+                 for part_id in np.unique(block.part_ids).tolist()
+                 if materials.get(material_parts.get(part_id, ("", None))[1]) is None})]
     if wanted:
-        run.node_static.update(_material_fields(run, parts, material_properties(blocks),
-                                                wanted, str(run_dir)))
+        run.node_static.update(_material_fields(run, material_parts, materials, wanted,
+                                                str(run_dir)))
+    if edge_fields:
+        state_thickness = _first_shell_thickness(arrays, shells)
+
+        def element_values(name: str, element_type: str, block: ElementBlock) -> np.ndarray:
+            if name == "thickness":   # shells: the deck's, else that of the first state
+                if element_type != "shell":
+                    return np.full(block.part_ids.shape[0], np.nan)
+                deck = np.array([part_thickness.get(i, np.nan) for i in block.part_ids.tolist()])
+                return deck if state_thickness is None else np.where(
+                    np.isnan(deck), state_thickness, deck)
+            per_part = {part_id: (materials.get(material_parts.get(part_id, ("", None))[1])
+                                  or {}).get(name, np.nan)
+                        for part_id in np.unique(block.part_ids).tolist()}
+            return np.array([per_part[i] for i in block.part_ids.tolist()], dtype=np.float64)
+
+        run.edge_pairs, run.edge_static = _edge_properties(run, edge_fields, element_values,
+                                                           str(run_dir))
     walls = radioss.walls if len(radioss.walls) else rigid_walls(blocks)
     run.walls = walls if len(walls) and not no_deck_walls else None
 
@@ -993,6 +1086,55 @@ def _static_run(run_dir: Path, arrays, static_fields: Optional[Sequence[str]] = 
         with open(run_dir / GLOBALS_FILE, encoding="utf-8") as f:
             run.globals = {str(k): float(v) for k, v in json.load(f).items()}
     return run
+
+
+def _first_shell_thickness(arrays, shells: Optional[ElementBlock]) -> Optional[np.ndarray]:
+    """(E,) thickness of the shells of ``shells`` at the first state, NaN where 0 or none
+    (rigid shells have no state data); None without thickness output."""
+    values = arrays.get("element_shell_thickness")
+    if shells is None or values is None:
+        return None
+    rows = _state_rows(arrays, "shell", arrays["element_shell_part_indexes"], values)
+    full = np.full(rows.shape[0], np.nan)
+    full[rows] = values[0]
+    if shells.kept is not None:
+        full = full[shells.kept]
+    return np.where(full > 0, full, np.nan)
+
+
+def _edge_properties(run: D3plotRun, names: Sequence[str], element_values,
+                     where: str) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Node pairs (P, 2), i < j, that an element edge joins, and for every name the mean of
+    ``element_values(name, element_type, block)`` (E,) over the elements at the pair that
+    have it (P,), NaN at pairs without such an element (e.g. no thickness at solids)."""
+    num_nodes = run.mesh_pos.shape[0]
+    keys, values = [], []
+    for element_type, block in run.elements.items():
+        per_element = np.stack([np.asarray(element_values(name, element_type, block),
+                                           dtype=np.float64) for name in names], axis=1)
+        for a, b in _ELEMENT_EDGE_PAIRS[element_type]:
+            if b >= block.nodes.shape[1]:
+                continue
+            i, j = block.nodes[:, a], block.nodes[:, b]
+            joined = i != j
+            low, high = np.minimum(i, j)[joined], np.maximum(i, j)[joined]
+            keys.append(low.astype(np.int64) * num_nodes + high)
+            values.append(per_element[joined])
+    keys = np.concatenate(keys) if keys else np.empty(0, np.int64)
+    values = np.concatenate(values) if values else np.empty((0, len(names)))
+    unique, inverse = np.unique(keys, return_inverse=True)
+    have = ~np.isnan(values)
+    sums = np.zeros((len(unique), len(names)))
+    counts = np.zeros((len(unique), len(names)))
+    np.add.at(sums, inverse, np.where(have, values, 0.0))
+    np.add.at(counts, inverse, have)
+    for k, name in enumerate(names):
+        if not counts[:, k].any():
+            raise ValueError(f"{where}: edge field {name} — no element has it")
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = np.where(counts > 0, sums / counts, np.nan).astype(np.float32)
+    pairs = np.stack([unique // num_nodes, unique % num_nodes], axis=1)
+    return pairs, {name: mean[:, k] for k, name in enumerate(names)}
 
 
 def _components(arrays, elements: Dict[str, ElementBlock], num_nodes: int,
@@ -1033,16 +1175,14 @@ def _material_fields(run: D3plotRun, parts: Dict[int, Tuple[str, int]],
     around a node whose material has them, NaN at nodes without such elements; ``parts``
     of ``deck_parts``, ``materials`` of ``material_properties``."""
     num_nodes = run.mesh_pos.shape[0]
-    result, unknown = {}, set()
+    result = {}
     for name in names:
         average = NodalAverage(1, num_nodes)
         for block in run.elements.values():
             values = np.full(block.part_ids.shape[0], np.nan)
             for part_id in np.unique(block.part_ids).tolist():
                 material = materials.get(parts.get(part_id, ("", None))[1])
-                if material is None:
-                    unknown.add(part_id)
-                elif name in material:
+                if material is not None and name in material:
                     values[block.part_ids == part_id] = material[name]
             have = ~np.isnan(values)
             if have.any():
@@ -1052,18 +1192,20 @@ def _material_fields(run: D3plotRun, parts: Dict[int, Tuple[str, int]],
             raise ValueError(f"{where}: static field {name} — no part has a material with it "
                              f"(material types read: {sorted(MATERIAL_TYPES)})")
         result[name] = values[0]
-    if unknown:
-        warnings.warn(f"{where}: parts {sorted(unknown)[:20]} have no material of the types "
-                      f"read ({sorted(MATERIAL_TYPES)}); they have no material properties")
     return result
 
 
 def num_states(run_dir) -> int:
     """Number of states of a run, without reading the state data."""
+    return int(state_times(run_dir).shape[0])
+
+
+def state_times(run_dir) -> np.ndarray:
+    """The time of every state of a run, without reading the state data."""
     from lasso.dyna import D3plot
 
     arrays = D3plot(str(d3plot_path(run_dir)), state_array_filter=["timesteps"]).arrays
-    return int(arrays["timesteps"].shape[0])
+    return np.asarray(arrays["timesteps"], dtype=np.float64)
 
 
 def degenerate_solids(nodes: np.ndarray) -> List[np.ndarray]:
@@ -1163,7 +1305,9 @@ def as_raw_trajectory(run: D3plotRun, name: str = "run",
                          walls=run.walls, field_names=["stress", *fields] if fields else None,
                          component=run.component, component_names=run.component_names,
                          rigid_bodies=run.rigid_bodies, component_roles=run.roles,
-                         left_out=run.left_out, start_velocity=run.start_velocity)
+                         left_out=run.left_out, start_velocity=run.start_velocity,
+                         edge_pairs=run.edge_pairs, edge_static=run.edge_static,
+                         parts_without_material=run.parts_without_material)
 
 
 def read_raw_run(run_dir, frames: Optional[Sequence[int]] = None,
@@ -1172,7 +1316,8 @@ def read_raw_run(run_dir, frames: Optional[Sequence[int]] = None,
                  free_rigid_parts: Sequence[str] = (),
                  exclude_parts: Sequence[str] = (),
                  components: Optional[Dict[str, str]] = None,
-                 no_deck_walls: bool = False) -> RawTrajectory:
+                 no_deck_walls: bool = False,
+                 edge_fields: Optional[Sequence[str]] = None) -> RawTrajectory:
     """A run as ``RawTrajectory`` for ``export.py``, its states restricted to ``frames``
     and read in blocks of about ``max_block_bytes`` (``read_run_blocks``); targets as
     in ``as_raw_trajectory``, ``static_fields``, ``free_rigid_parts``, ``exclude_parts``,
@@ -1182,7 +1327,7 @@ def read_raw_run(run_dir, frames: Optional[Sequence[int]] = None,
                                   static_fields=static_fields,
                                   free_rigid_parts=free_rigid_parts,
                                   exclude_parts=exclude_parts, components=components,
-                                  no_deck_walls=no_deck_walls)
+                                  no_deck_walls=no_deck_walls, edge_fields=edge_fields)
     cells, cell_types = _raw_cells(run, str(run_dir))
 
     def frame_blocks():
@@ -1196,7 +1341,9 @@ def read_raw_run(run_dir, frames: Optional[Sequence[int]] = None,
                          field_names=["stress", *fields] if fields else None,
                          component=run.component, component_names=run.component_names,
                          rigid_bodies=run.rigid_bodies, component_roles=run.roles,
-                         left_out=run.left_out, start_velocity=run.start_velocity)
+                         left_out=run.left_out, start_velocity=run.start_velocity,
+                         edge_pairs=run.edge_pairs, edge_static=run.edge_static,
+                         parts_without_material=run.parts_without_material)
 
 
 def run_dirs(raw_dir, source: str) -> List[Path]:

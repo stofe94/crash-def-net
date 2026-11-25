@@ -46,6 +46,7 @@ COMMANDS = [
      "dataset_preprocessor.tfrecord_to_vtk"),
     ("remesh_pole", "python utils/remesh_pole.py", "utils.remesh_pole"),
     ("train", "python train/train.py", "train.train"),
+    ("prepare", "python predict/prepare.py", "predict.prepare"),
     ("rollout", "python predict/rollout.py", "predict.rollout"),
     ("plot_losses", "python utils/plot_losses.py", "utils.plot_losses"),
     ("evaluate_run", "python utils/evaluate_run.py", "utils.evaluate_run"),

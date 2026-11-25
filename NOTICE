@@ -29,6 +29,16 @@ Attribution-NonCommercial 4.0 International License
   docs/assets/bumper_beam_test_traj0128.gif
   docs/assets/bumper_beam_error_per_step.png
 
+OpenRadioss-BumperBeam-DoE135
+(https://huggingface.co/datasets/stofe94/OpenRadioss-BumperBeam-DoE135), computed with
+OpenRadioss from the same model, whose decks carry the notice "Copyright (C) 2022 Altair
+Engineering Inc., CC BY-NC 4.0"; rendered from its runs with the pole remeshed. These images
+are licensed under the Creative Commons Attribution-NonCommercial 4.0 International License
+(https://creativecommons.org/licenses/by-nc/4.0/):
+
+  docs/assets/bumper_beam_doe_test_traj0127.gif
+  docs/assets/bumper_beam_doe_error_per_step.png
+
 deforming_plate of DeepMind's MeshGraphNets release
 (https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets). DeepMind
 states no explicit license for the datasets (the Apache License 2.0 of that repository

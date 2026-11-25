@@ -54,10 +54,12 @@ EXPORT_CONFIG_KEYS = {
     "contact.radius": "contact_radius",
     "contact.pairs": "contact_pairs",
     "contact.use_deck_walls": "use_deck_walls",
+    "contact.gap": "contact_gap",
     "features.local": "static_fields",
     "features.global": "global_features",
     "features.globals_file": "globals_file",
     "features.targets": "fields",
+    "features.edges": "edge_fields",
     "large.block_mb": "block_mb",
     "large.edge_stats_stride": "edge_stats_stride",
 }

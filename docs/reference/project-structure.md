@@ -19,12 +19,14 @@ models/
   mgn_t.py                   MeshGraphNet-Transformer (physics attention)
   residual.py                optional residual target wrapper
 train/                       training CLI, config, trainer, early stopping
-predict/rollout.py           autoregressive rollout, rollout metrics, .vtu export
+predict/
+  rollout.py                 autoregressive rollout, rollout metrics, .vtu export
+  prepare.py                 CLI: new runs -> applicability check, prediction data
 protocols/                   training config of the comparison protocol
 examples/                    export, training and rollout configs: quick_start/ (the quick start,
                              train.toml also the default of train.py, and the Colab notebook
                              crashdefnet-quickstart.ipynb), deforming_plate/ (first training),
-                             bumper_beam/; copy and adapt them for own runs
+                             bumper_beam/, bumper_beam_doe/; copy and adapt them for own runs
 utils/                       normalizer, loss curves, evaluation of a run, data exploration,
                              paper comparison, protocol check, rollout animation, time zone,
                              units of a dataset,

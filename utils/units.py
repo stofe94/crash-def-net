@@ -7,10 +7,11 @@ MPa) and records the units of length and stress (``--length-unit``,
 (``length_unit``, ``stress_unit``; missing: m and Pa, the units of
 ``deforming_plate``). Models, contact radius and position noise work in the units of
 the data. The rollout converts its metrics to SI (positions and velocities in m, the
-stress in Pa), so that every report reads them alike. The reports show lengths in mm
+stresses in Pa), so that every report reads them alike. The reports show lengths in mm
 and the stress in kPa for data in Pa or kPa (the units of the paper tables), else in
-the stress unit of the data, e.g. MPa (``stress_display``). Result fields other than
-the stress keep the units of the data.
+the stress unit of the data, e.g. MPa (``stress_display``). The stresses are the
+result fields in ``STRESS_FIELDS``; every other result field keeps the units of the
+data.
 """
 
 from __future__ import annotations
@@ -20,6 +21,9 @@ from typing import Dict, Tuple
 LENGTH_UNITS = {"m": 1.0, "cm": 1e-2, "mm": 1e-3}                 # factor to m
 STRESS_UNITS = {"Pa": 1.0, "kPa": 1e3, "MPa": 1e6, "GPa": 1e9}  # factor to Pa
 SI_LENGTH, SI_STRESS = "m", "Pa"
+# Result fields in the stress unit of the data: the von Mises stress and the membrane and
+# bending stress of the d3plot reader. Their metrics are converted to Pa.
+STRESS_FIELDS = ("stress", "mean_stress", "bending_stress")
 
 
 def si_factors(info: Dict) -> Tuple[float, float]:

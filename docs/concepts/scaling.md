@@ -37,7 +37,9 @@ world edges rebuilt on the training device; the rollout rebuilds them on its own
 
 Micro-batches (`[training] micro_batch_size`) split a batch into several forward passes
 with the same optimizer step, so only one micro-batch is in memory
-([training](training.md)). Beyond that, the limit for large meshes is the GPU memory of
+([training](training.md)); rollout training over several steps recomputes the activations of
+all but the last step and stays near the memory of one step
+([rollout training](training.md#rollout-training)). Beyond that, the limit for large meshes is the GPU memory of
 one sample: training keeps the activations of every message passing step, and their size
 grows with the number of nodes and edges.
 

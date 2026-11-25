@@ -2,63 +2,31 @@
 
 A model in CrashDefNet sees one time step of a simulation as a graph: the mesh nodes
 with their features, the mesh edges and the contact edges. It predicts, per node, the
-velocity to the next step and the stress there. This page describes the benchmark data,
-how the graph of a time step is built, and what the readers of further raw formats add.
+velocity to the next step and the result fields there, such as the stress. This page
+describes how the graph of a time step is built, what crash data bring into it, and the
+`deforming_plate` benchmark on which CrashDefNet was built up.
+
 Every stage builds its graphs with the same functions
 ([`graph_features.py`](https://github.com/stofe94/crash-def-net/blob/main/dataset_preprocessor/graph_features.py)),
 so export, training and rollout see identical graphs.
 
-## The benchmark
-
-DeepMind's `deforming_plate` (Pfaff et al., 2021) contains finite element simulations in
-which an actuator impacts and deforms a hyperelastic plate: a simplified crash scenario
-with contact and large deformations. Each trajectory has its own geometry and tetrahedral
-mesh (~800–1,900 nodes in `test.tfrecord`) and 400 time steps: the actuator presses in
-until step 360, then pulls back, and the plate springs back.
-
-![Plate 13 of test.tfrecord](../assets/plates/plate_13.png){ width="32%" }
-![Plate 18 of test.tfrecord](../assets/plates/plate_18.png){ width="32%" }
-![Plate 29 of test.tfrecord](../assets/plates/plate_29.png){ width="32%" }
-![Plate 38 of test.tfrecord](../assets/plates/plate_38.png){ width="32%" }
-![Plate 76 of test.tfrecord](../assets/plates/plate_76.png){ width="32%" }
-![Plate 88 of test.tfrecord](../assets/plates/plate_88.png){ width="32%" }
-
-*Six plates of `test.tfrecord` (records 13, 18, 29, 38, 76 and 88, counted from 0) at
-their deepest indentation, time step 360. Colour: von Mises stress, from light blue (0)
-to dark blue (300 kPa and above); grey: the actuator.*
-
-Per node and step it provides the world position and the von Mises stress, plus a node
-type:
-
-| Node type | Raw value | Meaning |
-|---|---|---|
-| normal | 0 | free plate nodes; their motion is predicted |
-| actuator | 1 | scripted obstacle; motion is prescribed |
-| clamped | 3 | fixed boundary nodes |
-
-The dataset is published by DeepMind with the
-[MeshGraphNets release](https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets)
-and is not part of this repository; it is downloaded directly from DeepMind (see
-[installation](../getting-started/installation.md#raw-data)). DeepMind states no explicit
-license for the datasets (the Apache 2.0 license of that repository covers its code), so
-the terms of the source apply, in particular for commercial use.
-
 ## Graph per time step t
 
-Features follow MeshGraphNets (Pfaff et al., 2021, App. A.1); the dimensions are those of
-`deforming_plate`, other data add [columns](#general-meshes-and-run-parameters):
+The base features follow MeshGraphNets (Pfaff et al., 2021, App. A.1); the dimensions in the
+table are those of the [benchmark](#the-benchmark), and crash data add
+[columns](#general-meshes-and-run-parameters):
 
 | | Features | Dim. |
 |---|---|---|
 | Nodes `x` | one-hot node type (normal / actuator / clamped) + next actuator velocity xₜ₊₁ − xₜ (0 elsewhere) | 6 |
 | Mesh edges `edge_attr` | uᵢⱼ, ‖uᵢⱼ‖ (rest configuration) + xᵢⱼ, ‖xᵢⱼ‖ (current configuration) | 8 |
-| World edges `world_edge_attr` | xᵢⱼ, ‖xᵢⱼ‖ for all node pairs with ‖xᵢ − xⱼ‖ < r_W (`deforming_plate`: 0.03 m) that are not mesh neighbours (paper; other variants below) | 4 |
+| World edges `world_edge_attr` | xᵢⱼ, ‖xᵢⱼ‖ for all node pairs with ‖xᵢ − xⱼ‖ < r_W (`deforming_plate`: 0.03 m) that are not mesh neighbours (`all`, the rule of MeshGraphNets; other variants below) | 4 |
 | Target `y` | velocity xₜ₊₁ − xₜ (3) + stress σₜ₊₁ (1); other raw data: its [result fields](#general-meshes-and-run-parameters) | 4 |
 | `loss_mask` | all nodes except the actuator | – |
 
-Relative vectors point from sender to receiver. Mesh edges come from the six edges of
-every tetrahedron, in both directions (for other cell types see
-[below](#general-meshes-and-run-parameters)). World edges model contact: they connect nodes
+Relative vectors point from sender to receiver. Mesh edges come from the edges of every
+cell, in both directions: the six of a tetrahedron in the benchmark, those of shells, solids
+and beams in crash data ([cells](#general-meshes-and-run-parameters)). World edges model contact: they connect nodes
 that are close in the deformed configuration but not neighbours in the mesh, and they
 are rebuilt whenever the positions change (noise during training, every rollout step).
 The radius search computes the distances directly: a dense distance matrix for graphs up
@@ -82,12 +50,12 @@ can be compared on the same dataset:
 
 | `world_edges` | Pairs within r_W that get a world edge |
 |---|---|
-| `"all"` (default, paper) | all pairs that are not mesh neighbours (Pfaff et al. 2021, Sec. 3.1 on p. 4) |
+| `"all"` (default, as in MeshGraphNets) | all pairs that are not mesh neighbours (Pfaff et al. 2021, Sec. 3.1 on p. 4) |
 | `"contact"` | only pairs of different bodies (connected parts of the mesh) |
 | `"self_contact_aware"` | pairs not connected through the material: contact between bodies plus self-contact, without the near neighbours inside a body. Connected: the shortest path along the mesh edges of the rest state is shorter than `world_edge_exclude_distance` × r_W (default 2) |
 
 On `deforming_plate`, with r_W = 0.03 m and a median mesh edge length of about 0.018 m,
-the paper rule also links nodes of the same body two or three mesh edges apart; most world
+the rule `all` also links nodes of the same body two or three mesh edges apart; most world
 edges there are actuator ↔ actuator or plate ↔ plate pairs that exist already at rest, only a
 few percent the actual contact. The actuator acts on the plate only through world edges.
 
@@ -100,8 +68,8 @@ few percent the actual contact. The actuator acts on the plate only through worl
   self-contact is not exercised there, and the few world edges inside a plate cross
   narrow gaps in the plate that exist already at rest.
 - The comparison protocol compares new architectures with MeshGraphNets on
-  `self_contact_aware`; the published results of the paper, with `all`, are the
-  original reference ([baselines](../guides/comparison-protocol.md#baselines)).
+  `self_contact_aware`; the published results of the MeshGraphNets paper, with `all`, are
+  the original reference ([baselines](../guides/comparison-protocol.md#baselines)).
 
 Bodies and excluded pairs are computed once per mesh (the path rule per rest geometry)
 and stored in every sample, so position noise and rollout rebuild the same variant; the
@@ -129,33 +97,39 @@ rollout apply the same ones.
 
 !!! warning "Verification status"
     - **Verified on `deforming_plate`.** Training, rollout and the comparison with the
-      papers.
+      published results of MeshGraphNets and MGN-T.
     - **OpenRadioss runs: early stage, verified on a real crash example.** Runs of a bumper
-      beam against a pole, end to end from the raw data to the rollout
-      ([results](../results/bumper-beam.md), [tutorial](../getting-started/bumper-beam.md)).
-      Through it: the d3plot reader with the OpenRadioss starter deck, a shell mesh with
-      spot welds and ties, components with roles from an export config, a free rigid body,
-      contact edges to a rigid pole, the shell thickness as static node feature, values
-      that nodes do not have, and units other than SI.
+      beam against a pole, end to end from the raw data to the rollout, and a design of
+      experiments of 135 such runs with geometry, velocity, thickness and pole position
+      varied, from the undeformed state
+      ([design of experiments](../results/bumper-beam-doe.md), [results](../results/bumper-beam.md),
+      [tutorial](../getting-started/bumper-beam.md)). Through them: the d3plot reader with
+      the OpenRadioss starter deck, a shell mesh with spot welds and ties, components with
+      roles from an export config, a free rigid body, contact edges to a rigid pole with the
+      contact gap and the distance to the wall of the deck, the shell thickness and the yield
+      stress at the nodes and on the mesh edges, the plastic strain and the membrane and
+      bending stress as result fields, the initial velocity of the deck, values that nodes
+      do not have, and units other than SI.
     - **LS-DYNA runs, VTK time series and further data structures: early stage, tested on
       synthetic and converted data.** The keyword deck of LS-DYNA (materials, boundary
-      conditions, initial velocity, rigid walls), run parameters, result fields besides the
-      stress, contact rules and the VTK reader go through every stage; the test suite checks this on small synthetic datasets
+      conditions, initial velocity, rigid walls), run parameters, contact rules and the VTK
+      reader go through every stage; the test suite checks this on small synthetic datasets
       and on runs converted from `deforming_plate`. Real datasets with these structures
       follow.
 
-Raw data other than `deforming_plate` ([OpenRadioss runs](../guides/openradioss.md),
-[LS-DYNA runs](../guides/ls-dyna.md),
-[VTK time series](../guides/vtk.md)) may contain other cells, other result fields,
-parameters per run, static node properties and rigid walls. The dataset takes all of
-them:
+Crash runs ([OpenRadioss runs](../guides/openradioss.md), [LS-DYNA runs](../guides/ls-dyna.md),
+[VTK time series](../guides/vtk.md)) hold more than the benchmark: other cells, further result
+fields, parameters per run, static node properties, element properties and rigid walls. The
+dataset takes all of them:
 
 | | |
 |---|---|
-| Result fields | the quantities per node and frame that the model predicts besides the velocity: in `deforming_plate` the von Mises stress, in other data any number of them under their own names, e.g. stress and plastic strain, or none (VTK: `--stress-field`, `--fields`; LS-DYNA: the stress, plus `--fields plastic_strain thickness`). Each is a target column; with `--history 1` its value at t is an input `<name>_prev`. Metrics are reported per field; the rollout metrics of the stress only when the data has one |
+| Result fields | the quantities per node and frame that the model predicts besides the velocity: in `deforming_plate` the von Mises stress, in other data any number of them under their own names, e.g. stress and plastic strain, or none (VTK: `--stress-field`, `--fields`; LS-DYNA: the stress, plus `--fields plastic_strain thickness mean_stress bending_stress`, the last two the [membrane and bending parts](../guides/ls-dyna.md#the-d3plot-reader) of the stress). Each is a target column; with `--history 1` its value at t is an input `<name>_prev`. Metrics are reported per field; the rollout metrics of the stress only when the data has one |
 | Cells | lines, triangles, quadrilaterals, tetrahedra, pyramids, wedges and hexahedra, also mixed, stored in VTK node order with their VTK cell types. Mesh edges come from the edges of every cell; the rollout writes the cell types into the `.vtu` files |
 | Run parameters | `globals.json` next to a run's `d3plot` or VTK files, e.g. `{"impact_velocity": 15.6, "thickness_scale": 1.1}`. Every run of a dataset must have the same names. They are the global input `u` of a graph (one row per graph), standardized over the train trajectories, and both architectures then get a [global block](models.md#global-block-run-parameters). |
 | Static node features | properties of a node that stay over the run: `thickness` (shell thickness at the first state) and `initial_velocity_x/y/z` (from `*INITIAL_VELOCITY*`); with `--static-fields` the material properties of the deck, `density`, `youngs_modulus`, `poisson_ratio`, `yield_stress`, the mean over the elements around a node (VTK: point or cell fields). Standardized over the train nodes; every run of a dataset must have the same ones. A node without the feature, e.g. without a thickness at solids and beams, has no value and not a 0: it stays empty in the dataset (NaN) and counts in no statistics. The model gets the neutral value 0 after standardization and a column `<name>_given`, 1 where the node has a value, passed on as it is; this column exists only if nodes lack the feature, and follows it when a training chooses its features. The same holds for a result field, e.g. no stress at beams: with `--history 1` its `<name>_prev` input is neutral and `<name>_given` exists as well. Such a target counts neither in the loss nor in any metric; the velocity of the node still does |
+| Element properties on the mesh edges | with `--edge-fields` (LS-DYNA, OpenRadioss) the shell thickness and material properties of the elements next to an edge, their mean, after the 8 geometric columns of `edge_attr`. A node feature is the mean over all elements around the node; where parts of different thickness or material share nodes, e.g. at a joint, the edge keeps them apart. An edge without the property (e.g. no thickness at solids, beams and ties) has no value, with a column `<name>_given` as for nodes. Static: they do not change when the nodes move |
+| Contact gap | with `--contact-gap` two more columns of `world_edge_attr` (6): the distance of the receiver from the sender's shell surface along its normal, and the clearance between the shell surfaces, that distance minus half of the two thicknesses (static node feature `thickness`; none: 0). Two nodes far apart on parallel surfaces are close in it, and a negative clearance is an overlap of the shells. The normal at a node is the dominant direction of the shell faces around it, independent of how they are oriented; nodes without shell faces keep the node distance. Rebuilt with the world edges |
 | Rigid walls | stationary planar walls (`*RIGIDWALL_PLANAR`) and cylinders (`/RWALL/CYL`) as the last 4 node feature columns: signed distance to the nearest wall, clipped to ±5 × contact radius, and its unit normal, radial at a cylinder (no wall: distance 5 × contact radius, normal 0). They depend on the positions and are rebuilt with the world edges (noise, scheduled sampling, every rollout step) |
 | Node types | the three types stay: crash parts map onto them as deformable → normal; rigid (`*MAT_RIGID`) and prescribed motion (`*BOUNDARY_PRESCRIBED_MOTION_*`) → actuator, whose motion is taken as given input; fixed (`*BOUNDARY_SPC_*`) → clamped; [free rigid parts](#free-rigid-parts) → normal ([details](../guides/ls-dyna.md#the-d3plot-reader)). In VTK data `--actuator-parts` names parts whose motion is given (e.g. a rigid impactor), `--clamped-parts` fixed ones, the rest deform |
 | Components | the parts of d3plot and VTK raw data, any number under their own names, with [contact rules](#components-and-contact-rules) between them |
@@ -200,14 +174,53 @@ by title), or the role `free_rigid` in an
 The option changes which motion is an input and which a prediction, so exports with and
 without it are different datasets; the models of both architectures need no change.
 
-## Optional history (`--history 1`, not in the paper)
+## Optional history (`--history 1`)
 
-Appends `velocity_x/y/z_prev` (= xₜ − xₜ₋₁) and `stress_prev` (= σₜ) to the node
-features (for `deforming_plate` 10 instead of 6 columns; 9 with `--no-prev-stress`); with other result fields
-one `<name>_prev` per field, which `--no-prev-stress` leaves out as well. Only with this layout do
-`residual_target`, `[scheduled_sampling]` and `stress_noise_std` take effect. The first
-frame of each trajectory, the undeformed state, is a sample as well: its velocity input
-is the initial velocity of the deck over one frame interval (`*INITIAL_VELOCITY*`,
-`/INIVEL`), at rest without one, so that a rollout starts from it alone. The layout is
-stored in `metadata.json` and the database; model, training and rollout pick it up
-automatically.
+A crash structure moves largely by inertia, and its material carries its loading from step
+to step: the history layout gives the model the state before the current one. It appends
+`velocity_x/y/z_prev` (= xₜ − xₜ₋₁) and `stress_prev` (= σₜ) to the node features (for
+`deforming_plate` 10 instead of 6 columns; 9 with `--no-prev-stress`); with other result
+fields one `<name>_prev` per field, which `--no-prev-stress` leaves out as well. Without
+it, the node features are those of the `deforming_plate` benchmark of MeshGraphNets, a
+quasi-static case whose motion the actuator prescribes. Only with this layout do
+`residual_target`, `[scheduled_sampling]`, `[rollout_training]` and `stress_noise_std` take
+effect. The first frame of each trajectory, the undeformed state, is a sample as well: its
+velocity input is the initial velocity of the deck over one frame interval
+(`*INITIAL_VELOCITY*`, `/INIVEL`), at rest without one, so that a rollout starts from it
+alone. The layout is stored in `metadata.json` and the database; model, training and
+rollout pick it up automatically.
+
+## The benchmark
+
+DeepMind's `deforming_plate` (Pfaff et al., 2021) contains finite element simulations in
+which an actuator impacts and deforms a hyperelastic plate: a simplified crash scenario
+with contact and large deformations. Each trajectory has its own geometry and tetrahedral
+mesh (~800–1,900 nodes in `test.tfrecord`) and 400 time steps: the actuator presses in
+until step 360, then pulls back, and the plate springs back.
+
+![Plate 13 of test.tfrecord](../assets/plates/plate_13.png){ width="32%" }
+![Plate 18 of test.tfrecord](../assets/plates/plate_18.png){ width="32%" }
+![Plate 29 of test.tfrecord](../assets/plates/plate_29.png){ width="32%" }
+![Plate 38 of test.tfrecord](../assets/plates/plate_38.png){ width="32%" }
+![Plate 76 of test.tfrecord](../assets/plates/plate_76.png){ width="32%" }
+![Plate 88 of test.tfrecord](../assets/plates/plate_88.png){ width="32%" }
+
+*Six plates of `test.tfrecord` (records 13, 18, 29, 38, 76 and 88, counted from 0) at
+their deepest indentation, time step 360. Colour: von Mises stress, from light blue (0)
+to dark blue (300 kPa and above); grey: the actuator.*
+
+Per node and step it provides the world position and the von Mises stress, plus a node
+type:
+
+| Node type | Raw value | Meaning |
+|---|---|---|
+| normal | 0 | free plate nodes; their motion is predicted |
+| actuator | 1 | scripted obstacle; motion is prescribed |
+| clamped | 3 | fixed boundary nodes |
+
+The dataset is published by DeepMind with the
+[MeshGraphNets release](https://github.com/google-deepmind/deepmind-research/tree/master/meshgraphnets)
+and is not part of this repository; it is downloaded directly from DeepMind (see
+[installation](../getting-started/installation.md#raw-data)). DeepMind states no explicit
+license for the datasets (the Apache 2.0 license of that repository covers its code), so
+the terms of the source apply, in particular for commercial use.

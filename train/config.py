@@ -68,7 +68,8 @@ def setting(default: Any = dataclasses.MISSING, doc: str = "", *,
 
 @dataclass
 class TrainingConfig:
-    """All training settings. Defaults follow the paper where it gives a value."""
+    """All training settings. Model defaults follow the paper of each architecture where it
+    gives a value."""
 
     # Origin of the settings (set by ``from_toml``, not TOML keys)
     config_file: Optional[str] = None        # TOML file, relative to the repo if inside it
@@ -112,7 +113,7 @@ class TrainingConfig:
                                            "`*_prev` input instead of its value; needs an "
                                            "export with `--history 1`")
     world_edges: str = setting("all", "node pairs within the contact radius that get a world "
-                                      "edge: `all` (paper), `contact` (different bodies only), "
+                                      "edge: `all` (MeshGraphNets), `contact` (different bodies only), "
                                       "`self_contact_aware` (pairs not connected through the "
                                       "material)")
     world_edge_exclude_distance: float = setting(
@@ -159,9 +160,10 @@ class TrainingConfig:
         None, "machine setting: graphs per forward pass, a divisor of `batch_size`; "
               "`batch_size / micro_batch_size` passes make one optimizer step with the same "
               "result. Unset: `batch_size`")
-    learning_rate: float = setting(1e-4, "initial learning rate of Adam (paper 1e-4)")
+    learning_rate: float = setting(1e-4, "initial learning rate of Adam (MeshGraphNets and "
+                                         "MGN-T papers: 1e-4)")
     weight_decay: float = setting(0.0, "weight decay of Adam")
-    max_grad_norm: float = setting(1.0, "gradient clipping to this norm (not in the paper)")
+    max_grad_norm: float = setting(1.0, "gradient clipping to this norm")
     seed: int = setting(42, "seed of the weight initialization, the sample order and the noise")
     device: str = setting("auto", "`auto` (GPU if available), `cpu` or `cuda`")
 
@@ -172,7 +174,8 @@ class TrainingConfig:
     min_learning_rate: float = setting(1e-6, "end learning rate (`exponential`), lower bound "
                                              "(`plateau`, `cosine`)")
     lr_decay_steps: Union[int, str] = setting(
-        5_000_000, "`exponential`: optimizer steps to reach `min_lr` (paper 5 M); `\"auto\"` "
+        5_000_000, "`exponential`: optimizer steps to reach `min_lr` (MeshGraphNets paper: "
+                   "5 M); `\"auto\"` "
                    "= epochs × optimizer steps per epoch, so it is reached at the end of the run")
     scheduler_patience: int = setting(8, "`plateau`: evaluations without improvement of the "
                                          "first criterion before the learning rate drops")
@@ -199,11 +202,20 @@ class TrainingConfig:
 
     # [loss]
     loss_type: str = setting("mse", "loss on the normalized targets")
+    loss_edge_stretch_weight: float = setting(
+        0.0, "weight of the loss on the length change of the mesh edges in one step "
+             "(prediction against ground truth, in units of the velocity change of the "
+             "targets): keeps the predicted mesh from stretching, folding stays free; 0: off")
+    loss_rigid_body_weight: float = setting(
+        0.0, "weight of the loss on the mean velocity of every free rigid body (in units of "
+             "the velocity change of the targets), the motion the rollout gives the body; "
+             "0: off")
 
     # [noise]
     world_noise_std: float = setting(0.0, "position noise on the free nodes, standard "
                                           "deviation in the length unit of the data "
-                                          "(`length_unit` of the export; paper 3e-3 m)")
+                                          "(`length_unit` of the export; MeshGraphNets "
+                                          "paper: 3e-3 m)")
     stress_noise_std: float = setting(0.0, "noise on `stress_prev`, standard deviation in "
                                            "the stress unit of the data (`stress_unit` of the "
                                            "export, Pa by default; history layout only)")
@@ -211,7 +223,7 @@ class TrainingConfig:
     # [scheduled_sampling]
     scheduled_sampling: bool = setting(False, "replace the `*_prev` inputs of a share of the "
                                               "nodes by the model's prediction (history layout "
-                                              "only; not in the paper)")
+                                              "only)")
     scheduled_sampling_start_ratio: float = setting(1.0, "share of the nodes that keep the "
                                                          "ground truth at epoch 0")
     scheduled_sampling_end_ratio: float = setting(0.3, "share of the nodes that keep the "
@@ -219,6 +231,25 @@ class TrainingConfig:
     scheduled_sampling_warmup_epochs: int = setting(50, "epochs over which the share goes "
                                                         "linearly from the start to the end "
                                                         "ratio")
+    scheduled_sampling_steps: int = setting(1, "predicted steps before the sample: the model "
+                                               "rolls out from the ground truth this many "
+                                               "steps back, so that its inputs carry the "
+                                               "drift of a short rollout; with more than 1 "
+                                               "the share applies to whole samples instead "
+                                               "of nodes")
+
+    # [rollout_training]
+    rollout_training: bool = setting(False, "train on windows of consecutive steps that the "
+                                            "model rolls out on its own predictions, with the "
+                                            "loss on every step and the gradients through the "
+                                            "whole window (history layout only; instead of "
+                                            "`[scheduled_sampling]`)")
+    rollout_training_steps: int = setting(4, "steps of a window: the first from the ground "
+                                             "truth, every further one from the model's "
+                                             "prediction of the step before; every epoch the "
+                                             "trajectories are cut into such windows at a "
+                                             "random phase, so that every sample is trained "
+                                             "once per epoch; 1: one-step training")
 
     # [checkpointing]
     checkpoint_dir: str = setting("checkpoints", "output folder of the run")
@@ -245,6 +276,18 @@ class TrainingConfig:
         if self.world_edge_exclude_distance <= 0:
             raise ValueError(f"world_edge_exclude_distance must be > 0, "
                              f"got {self.world_edge_exclude_distance}")
+        for name in ("loss_edge_stretch_weight", "loss_rigid_body_weight"):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be >= 0, got {getattr(self, name)}")
+        if self.scheduled_sampling_steps < 1:
+            raise ValueError(f"scheduled_sampling_steps must be >= 1, "
+                             f"got {self.scheduled_sampling_steps}")
+        if self.rollout_training_steps < 1:
+            raise ValueError(f"rollout_training_steps must be >= 1, "
+                             f"got {self.rollout_training_steps}")
+        if self.scheduled_sampling and self.rollout_training:
+            raise ValueError("scheduled_sampling and rollout_training are two training "
+                             "methods — enable one of them")
         for name in ("local_features", "global_features", "target_fields"):
             names = getattr(self, name)
             if names is not None and not (isinstance(names, list)
@@ -371,6 +414,8 @@ class TrainingConfig:
             unused |= {"early_stopping_patience", "early_stopping_min_epochs"}
         if not self.scheduled_sampling:
             unused |= {name for name in names if name.startswith("scheduled_sampling_")}
+        if not self.rollout_training:
+            unused |= {name for name in names if name.startswith("rollout_training_")}
         return unused
 
     def to_dict(self) -> Dict[str, Any]:
@@ -443,6 +488,8 @@ TOML_KEYS = {
     "training.early_stopping.criteria": "early_stopping_criteria",
 
     "loss.type": "loss_type",
+    "loss.edge_stretch_weight": "loss_edge_stretch_weight",
+    "loss.rigid_body_weight": "loss_rigid_body_weight",
 
     "noise.world_noise_std": "world_noise_std",
     "noise.stress_noise_std": "stress_noise_std",
@@ -451,6 +498,10 @@ TOML_KEYS = {
     "scheduled_sampling.start_ratio": "scheduled_sampling_start_ratio",
     "scheduled_sampling.end_ratio": "scheduled_sampling_end_ratio",
     "scheduled_sampling.warmup_epochs": "scheduled_sampling_warmup_epochs",
+    "scheduled_sampling.steps": "scheduled_sampling_steps",
+
+    "rollout_training.enabled": "rollout_training",
+    "rollout_training.steps": "rollout_training_steps",
 
     "checkpointing.checkpoint_dir": "checkpoint_dir",
     "checkpointing.save_every": "save_every",

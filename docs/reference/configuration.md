@@ -9,7 +9,7 @@ python train/train.py --config configs/my_run.toml [--epochs N] [--device cuda]
 ```
 
 - Every key has a default; a config sets only what differs. The defaults follow the
-  papers where they give a value.
+  papers of the two architectures, MeshGraphNets and MGN-T, where they give a value.
 - Command line options of `train.py` override the TOML when they are given
   ([command line](cli.md#train)).
 - Unknown keys are reported at start-up, so typos do not go unnoticed.
@@ -43,7 +43,7 @@ protocol fixes most of them ([protocol](../guides/comparison-protocol.md#trainin
 |---|---|---|
 | `architecture` | `"meshgraphnets"` | Model architecture; one of `meshgraphnets`, `mgn_t` |
 | `residual_target` | `false` | Predict the change of every target that has a `*_prev` input instead of its value; needs an export with `--history 1` |
-| `world_edges` | `"all"` | Node pairs within the contact radius that get a world edge: `all` (paper), `contact` (different bodies only), `self_contact_aware` (pairs not connected through the material) |
+| `world_edges` | `"all"` | Node pairs within the contact radius that get a world edge: `all` (MeshGraphNets), `contact` (different bodies only), `self_contact_aware` (pairs not connected through the material) |
 | `world_edge_exclude_distance` | `2.0` | `self_contact_aware`: pairs with a path along the mesh edges of the rest state shorter than this many contact radii get no world edge |
 | `world_edge_exclude_hops` | unset | `self_contact_aware`: pairs at most this many mesh edges apart get no world edge; instead of `world_edge_exclude_distance` |
 
@@ -81,9 +81,9 @@ protocol fixes most of them ([protocol](../guides/comparison-protocol.md#trainin
 | `epochs` | `100` | Training epochs |
 | `batch_size` | `2` | Graphs per optimizer step (MeshGraphNets paper 2, MGN-T paper 32) |
 | `micro_batch_size` | unset | Machine setting: graphs per forward pass, a divisor of `batch_size`; `batch_size / micro_batch_size` passes make one optimizer step with the same result. Unset: `batch_size` |
-| `learning_rate` | `0.0001` | Initial learning rate of Adam (paper 1e-4) |
+| `learning_rate` | `0.0001` | Initial learning rate of Adam (MeshGraphNets and MGN-T papers: 1e-4) |
 | `weight_decay` | `0.0` | Weight decay of Adam |
-| `max_grad_norm` | `1.0` | Gradient clipping to this norm (not in the paper) |
+| `max_grad_norm` | `1.0` | Gradient clipping to this norm |
 | `seed` | `42` | Seed of the weight initialization, the sample order and the noise |
 | `device` | `"auto"` | `auto` (GPU if available), `cpu` or `cuda` |
 
@@ -93,7 +93,7 @@ protocol fixes most of them ([protocol](../guides/comparison-protocol.md#trainin
 |---|---|---|
 | `type` | `"exponential"` | Learning rate schedule: per optimizer step (`exponential`), per epoch (`cosine`), at evaluations (`plateau`) or none; one of `exponential`, `plateau`, `cosine`, `none` |
 | `min_lr` | `1e-06` | End learning rate (`exponential`), lower bound (`plateau`, `cosine`) |
-| `decay_steps` | `5_000_000` | `exponential`: optimizer steps to reach `min_lr` (paper 5 M); `"auto"` = epochs × optimizer steps per epoch, so it is reached at the end of the run |
+| `decay_steps` | `5_000_000` | `exponential`: optimizer steps to reach `min_lr` (MeshGraphNets paper: 5 M); `"auto"` = epochs × optimizer steps per epoch, so it is reached at the end of the run |
 | `patience` | `8` | `plateau`: evaluations without improvement of the first criterion before the learning rate drops |
 | `factor` | `0.5` | `plateau`: factor of the drop |
 
@@ -119,22 +119,32 @@ protocol fixes most of them ([protocol](../guides/comparison-protocol.md#trainin
 | Key | Default | Description |
 |---|---|---|
 | `type` | `"mse"` | Loss on the normalized targets; one of `mse`, `mae`, `huber`, `smooth_l1` |
+| `edge_stretch_weight` | `0.0` | Weight of the loss on the length change of the mesh edges in one step (prediction against ground truth, in units of the velocity change of the targets): keeps the predicted mesh from stretching, folding stays free; 0: off |
+| `rigid_body_weight` | `0.0` | Weight of the loss on the mean velocity of every free rigid body (in units of the velocity change of the targets), the motion the rollout gives the body; 0: off |
 
 ## [noise]
 
 | Key | Default | Description |
 |---|---|---|
-| `world_noise_std` | `0.0` | Position noise on the free nodes, standard deviation in the length unit of the data (`length_unit` of the export; paper 3e-3 m) |
+| `world_noise_std` | `0.0` | Position noise on the free nodes, standard deviation in the length unit of the data (`length_unit` of the export; MeshGraphNets paper: 3e-3 m) |
 | `stress_noise_std` | `0.0` | Noise on `stress_prev`, standard deviation in the stress unit of the data (`stress_unit` of the export, Pa by default; history layout only) |
 
 ## [scheduled_sampling]
 
 | Key | Default | Description |
 |---|---|---|
-| `enabled` | `false` | Replace the `*_prev` inputs of a share of the nodes by the model's prediction (history layout only; not in the paper) |
+| `enabled` | `false` | Replace the `*_prev` inputs of a share of the nodes by the model's prediction (history layout only) |
 | `start_ratio` | `1.0` | Share of the nodes that keep the ground truth at epoch 0 |
 | `end_ratio` | `0.3` | Share of the nodes that keep the ground truth after the warmup |
 | `warmup_epochs` | `50` | Epochs over which the share goes linearly from the start to the end ratio |
+| `steps` | `1` | Predicted steps before the sample: the model rolls out from the ground truth this many steps back, so that its inputs carry the drift of a short rollout; with more than 1 the share applies to whole samples instead of nodes |
+
+## [rollout_training]
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Train on windows of consecutive steps that the model rolls out on its own predictions, with the loss on every step and the gradients through the whole window (history layout only; instead of `[scheduled_sampling]`) |
+| `steps` | `4` | Steps of a window: the first from the ground truth, every further one from the model's prediction of the step before; every epoch the trajectories are cut into such windows at a random phase, so that every sample is trained once per epoch; 1: one-step training |
 
 ## [checkpointing]
 
@@ -178,7 +188,7 @@ The keys of `python -m dataset_preprocessor.export --config FILE`, each with the
 | `select_seed` | – | Draw the trajectories of each split at random with this seed (stored in metadata.json); default: the first ones |
 | `num_steps` | `40` | Frames per trajectory (samples per trajectory = num_steps - 1) |
 | `time_stride` | `10` | Raw frames between two selected frames |
-| `history` | `0` | 1: append velocity_prev (+ stress_prev) to the node features (enables residual_target / scheduled sampling); 0 = paper |
+| `history` | `0` | 1: append velocity_prev (+ stress_prev) to the node features (enables residual_target / scheduled sampling / rollout training); 0: the features of the deforming_plate benchmark |
 | `prev_stress` | `--prev-stress` | With --history 1: include stress_prev |
 
 ### [units]
@@ -195,6 +205,7 @@ The keys of `python -m dataset_preprocessor.export --config FILE`, each with the
 | `radius` | – | World edge radius, in the length unit of the raw data; default: collision_radius of meta.json (required for d3plot / vtk raw data without meta.json) |
 | `pairs` | – | Contact rules of raw data with components (LS-DYNA and VTK parts): world edges only between these pairs, e.g. plate:impactor plate:plate (self-contact), also with patterns (box_\*:beam_\*); none given: every pair |
 | `use_deck_walls` | `--deck-walls` | D3plot: use the rigid walls of the decks (\*RIGIDWALL_PLANAR, /RWALL/CYL) as node features |
+| `gap` | `--no-contact-gap` | Two more world edge features: the distance of the receiver from the sender's shell surface along its normal, and the clearance between the shell surfaces (that distance minus half of both thicknesses, from the static feature thickness) |
 
 ### [features]
 
@@ -203,7 +214,8 @@ The keys of `python -m dataset_preprocessor.export --config FILE`, each with the
 | `local` | – | Static node features; vtk: point or cell fields of the first state (vectors: one per component); d3plot: thickness, initial_velocity and the material properties of the deck density, youngs_modulus, poisson_ratio, yield_stress (default: thickness and initial_velocity where the runs have them) |
 | `global` | – | Run parameters in the dataset, one input per graph; default: all that the runs have |
 | `globals_file` | – | JSON file with the run parameters of all runs, by the name of the run folder; default: a globals.json in every run folder |
-| `targets` | – | Further result fields per state as targets, each under its own name; vtk: point or cell fields, e.g. plastic_strain (vectors: one per component); d3plot: plastic_strain, thickness (shells) |
+| `targets` | – | Further result fields per state as targets, each under its own name; vtk: point or cell fields, e.g. plastic_strain (vectors: one per component); d3plot: plastic_strain, thickness (shells), mean_stress (of the membrane part, tension positive), bending_stress (shells with two or more integration points) |
+| `edges` | – | D3plot: element properties on the mesh edges, the mean over the elements next to an edge: thickness (shells, from the deck) and the material properties density, youngs_modulus, poisson_ratio, yield_stress; unlike --static-fields they keep parts apart that share nodes |
 
 ### [large]
 

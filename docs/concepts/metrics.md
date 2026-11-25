@@ -11,7 +11,7 @@ The model is applied to its own predictions, for every trajectory of the split:
 
 1. The initial state is the ground truth of one frame: by default the first frame of the
    dataset, the undeformed state (with a history export together with its initial velocity,
-   [optional history](graphs.md#optional-history-history-1-not-in-the-paper)); for a model
+   [optional history](graphs.md#optional-history-history-1)); for a model
    trained on a part of the frames the first of them, and with
    [`--start-frame`](../guides/rollout.md) any other. Every later frame of the trajectory is
    predicted, up to the last.
@@ -19,11 +19,11 @@ The model is applied to its own predictions, for every trajectory of the split:
    follow their prescribed motion. Free rigid parts move as rigid bodies, by the rigid
    motion closest to their predicted velocities
    ([free rigid parts](graphs.md#free-rigid-parts)).
-3. The world-space part of the mesh edges and all world (contact) edges are rebuilt
-   from the predicted positions.
-4. The model predicts velocity and stress. The stress is an output only and is not
-   fed back. With a history export the `*_prev` columns are replaced by the previous
-   prediction.
+3. The world-space part of the mesh edges, all world (contact) edges and the distances to
+   rigid walls are rebuilt from the predicted positions.
+4. The model predicts the velocity and the result fields, e.g. the stress. With a history
+   export the `*_prev` columns are replaced by the previous prediction; without one, the
+   result fields are outputs only and are not fed back.
 
 Errors are measured on the nodes in `loss_mask` at every predicted frame. Step t is the
 frame t steps after the initial state, with the fields predicted for it.
@@ -41,13 +41,13 @@ summary, in `rollout_info.json` and in `test_metrics.json`:
 | RMSE-all | over the whole rollout |
 | R-RMSE | as above, error divided by the infinity norm of the trajectory (largest \|q\| component or \|σ\|) |
 
-As in the paper, the squared error is averaged over all nodes, components, steps and
+As in the MGN-T paper, the squared error is averaged over all nodes, components, steps and
 trajectories before taking the root: one RMSE over all trajectories together
 (**pooled**). A trajectory with a large error weighs more than in the median: RMSEs of
 2, 2 and 8 mm on three equal trajectories give √((2² + 2² + 8²) / 3) = 4.9 mm pooled and
 2.0 mm as median. Median, best and worst first take one RMSE per trajectory, then the
 median, the smallest and the largest of them: here 2.0, 2 and 8 mm. `_se` is the standard
-error over the trajectories. The log shows the units of the paper's tables
+error over the trajectories. The log shows the units of the tables of the MGN-T paper
 (q ×10⁻³ m, σ ×10³ Pa, R-RMSE in %).
 
 ## Relative L2 position error
@@ -73,7 +73,7 @@ with the same steps and nodes. Nodes of an actuator, such as an impactor, are no
 
 Used for model selection and logged during training: `rollout mse` (normalized MSE) and
 `pos rmse` (length of the position error vector per node, mean of the per-step RMSEs;
-by the vector length about √3 times q RMSE-all, not comparable with the paper). The
+by the vector length about √3 times q RMSE-all, not comparable with published values). The
 rollout summary also has the RMSE and MAE of every target column (`rmse_per_field`,
 `mae_per_field`), whatever result fields the data has.
 

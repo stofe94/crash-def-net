@@ -19,7 +19,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crashdefnet"
-version = "1.0.0"
+version = "1.1.0"
 description = "Graph neural network surrogates for crash simulation (MeshGraphNets, MeshGraphNet-Transformer), from raw simulation data to evaluation against published results"
 readme = "README.md"
 license = {text = "AGPL-3.0-only"}

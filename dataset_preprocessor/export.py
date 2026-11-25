@@ -43,6 +43,15 @@ Large data
   settings and per-trajectory hashes of all blobs, computed while writing), so
   that a rollout need not hash the whole file.
 
+Prediction data
+---------------
+``write_dataset(..., initial_state=InitialState(...))`` (``predict/prepare.py``) writes
+new runs that hold only their initial state: the first state stands for every frame,
+so that prescribed nodes stay at rest, the motion before frame 0 comes from the
+initial velocity of the decks, the layout and the normalizer are those of the
+training data, and ``info.ground_truth = 0`` tells the rollout that there is nothing
+to compare with.
+
 Usage (without arguments the small test set of ``EXPORT_DEFAULTS`` is written)::
 
     python -m dataset_preprocessor.export [--out-dir DIR] [--n-train N] ...
@@ -61,7 +70,7 @@ import struct
 import sys
 import time
 import warnings
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import partial
 from itertools import chain
 from pathlib import Path
@@ -109,11 +118,13 @@ from dataset_preprocessor.graph_features import (  # noqa: E402
     WALL_FEATURE_DIM,
     WORLD_EDGE_FEATURE_DIM,
     WORLD_EDGE_FEATURE_NAMES,
+    WORLD_GAP_FEATURE_NAMES,
     before_first_frame,
     edge_features,
     mesh_edges_from_cells,
     node_feature_names,
     relative_features,
+    shell_faces,
     target_feature_names,
     trajectory_features,
     wall_features,
@@ -194,6 +205,11 @@ class RawTrajectory:
     # (N, 3) motion over one frame interval before frame 0, at the initial velocity of the
     # decks: the velocity input of frame 0 with history; None: at rest before frame 0
     start_velocity: Optional[np.ndarray] = None
+    # Element properties next to the node pairs (i < j) of element edges (d3plot edge_fields):
+    # (P, 2) pairs and name -> (P,); on the mesh edges see _edge_values.
+    edge_pairs: Optional[np.ndarray] = None
+    edge_static: Optional[Dict[str, np.ndarray]] = None
+    parts_without_material: Optional[List[str]] = None   # d3plot: no material read
 
     def blocks(self) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
         """The frames in order, as (world_pos (t, N, 3), fields (t, N, F)) blocks."""
@@ -204,6 +220,49 @@ class RawTrajectory:
 
     def result_field_names(self) -> List[str]:
         return list(DEFAULT_FIELD_NAMES if self.field_names is None else self.field_names)
+
+
+@dataclass
+class InitialState:
+    """Prediction data: runs read from their initial state alone (module docstring).
+
+    ``frame_interval``: the time between two frames of the training data, in the time unit
+    of the decks; the motion before frame 0 is the initial velocity times it.
+    ``static_names``: the static node features of the training data, so that a run gets
+    the same columns (a ``_given`` column of a feature it has everywhere as ones).
+    ``normalizer``: that of the training data; nothing is fitted.
+    """
+
+    frame_interval: float
+    static_names: List[str]
+    normalizer: Normalizer
+    edge_static_names: List[str] = field(default_factory=list)   # likewise, on the mesh edges
+
+
+VELOCITY_FIELDS = [f"initial_velocity_{axis}" for axis in "xyz"]
+
+
+def _from_initial_state(traj: RawTrajectory, num_frames: int, state: InitialState
+                        ) -> RawTrajectory:
+    """The run as prediction data: its first state for all ``num_frames`` frames, the
+    start velocity from the initial velocity of the decks (``InitialState``)."""
+    world_pos, fields = next(traj.blocks())
+    world_pos, fields = world_pos[:1], fields[:1]
+    static = dict(traj.node_static or {})
+    velocity = [static.get(name) for name in VELOCITY_FIELDS]
+    start = None
+    if all(v is not None for v in velocity):
+        start = (np.stack(velocity, axis=1) * state.frame_interval).astype(np.float32)
+    for name in VELOCITY_FIELDS:
+        if name not in state.static_names:
+            static.pop(name, None)
+
+    def frames():
+        for _ in range(num_frames):
+            yield world_pos, fields
+
+    return replace(traj, world_pos=None, stress=None, frame_blocks=frames(),
+                   node_static=static or None, start_velocity=start)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -444,10 +503,11 @@ class NormalizerFitter:
     # running moments -> attribute
     _GROUPS = {"dynamic": "_dynamic", "target": "_target", "delta": "_delta",
                "mesh": "_mesh", "world": "_world", "walls": "_walls",
-               "static": "_static", "globals": "_globals"}
+               "static": "_static", "globals": "_globals", "edge_static": "_edge_static"}
 
     def __init__(self, contact_radius: float, history: int = 0, prev_stress: bool = True,
-                 edge_stats_stride: int = 1, first_frame: Optional[int] = None):
+                 edge_stats_stride: int = 1, first_frame: Optional[int] = None,
+                 contact_gap: bool = False):
         if edge_stats_stride < 1:
             raise ValueError(f"edge_stats_stride must be >= 1, got {edge_stats_stride}")
         self.contact_radius = contact_radius
@@ -457,17 +517,21 @@ class NormalizerFitter:
         self.first_frame = history if first_frame is None else first_frame
         self.prev_stress = prev_stress
         self.edge_stats_stride = edge_stats_stride
+        self.contact_gap = contact_gap   # two more world edge columns (world_edge_features)
         # Sized by the result fields: with the first train trajectory (or restore()).
         self._dynamic: Optional[_RunningMoments] = None
         self._target: Optional[_RunningMoments] = None
         self._delta: Optional[_RunningMoments] = None
         self._mesh = _RunningMoments(MESH_EDGE_FEATURE_DIM)
-        self._world = _RunningMoments(WORLD_EDGE_FEATURE_DIM)
+        self._world = _RunningMoments(WORLD_EDGE_FEATURE_DIM
+                                      + (len(WORLD_GAP_FEATURE_NAMES) if contact_gap else 0))
         self._walls = _RunningMoments(WALL_FEATURE_DIM)
         self.global_names: List[str] = []   # set by the exporter from the first trajectory
         self._globals: Optional[_RunningMoments] = None
         self.static_names: List[str] = []   # likewise
         self._static: Optional[_RunningMoments] = None
+        self.edge_static_names: List[str] = []   # likewise; element properties on the edges
+        self._edge_static: Optional[_RunningMoments] = None
         self.field_names: List[str] = list(DEFAULT_FIELD_NAMES)   # likewise
         self._current: Optional[Dict] = None   # the trajectory being added
 
@@ -477,8 +541,10 @@ class NormalizerFitter:
         for world_pos, stress in traj.blocks():
             self.add_frames(world_pos, stress)
 
-    def start(self, traj: RawTrajectory, mesh_edge_index: Optional[torch.Tensor] = None) -> None:
-        """Begin a train trajectory: its run parameters, static node features and mesh."""
+    def start(self, traj: RawTrajectory, mesh_edge_index: Optional[torch.Tensor] = None,
+              edge_values: Optional[np.ndarray] = None) -> None:
+        """Begin a train trajectory: its run parameters, static node features and mesh, and
+        the element properties on its mesh edges (static: once per trajectory)."""
         if self._target is None:
             num_dynamic = len(node_feature_names(self.history, self.prev_stress,
                                                  field_names=self.field_names)) - NUM_NODE_TYPES
@@ -496,6 +562,10 @@ class NormalizerFitter:
                 self._static = _RunningMoments(len(self.static_names))
             self._static.add(torch.tensor(
                 np.stack([traj.node_static[n] for n in self.static_names], axis=1)))
+        if self.edge_static_names and edge_values is not None:
+            if self._edge_static is None:
+                self._edge_static = _RunningMoments(len(self.edge_static_names))
+            self._edge_static.add(torch.from_numpy(edge_values.astype(np.float64)))
         if mesh_edge_index is None:
             mesh_edge_index = mesh_edges_from_cells(traj.cells, traj.cell_types)
         self._current = {
@@ -505,6 +575,13 @@ class NormalizerFitter:
             "mesh_edge_index": mesh_edge_index,
             "mesh_space": relative_features(torch.tensor(traj.mesh_pos, dtype=torch.float32),
                                             mesh_edge_index),
+            # the contact gap: shell faces and the thickness at the nodes (0: none)
+            "gap": {} if not self.contact_gap else {
+                "face": shell_faces(traj.cells, traj.cell_types),
+                "contact_thickness": torch.nan_to_num(torch.tensor(
+                    (traj.node_static or {}).get("thickness",
+                                                 np.zeros(traj.mesh_pos.shape[0])),
+                    dtype=torch.float32))},
             "carry": None,      # last frames of the previous block
             "next_sample": 0,   # index of the next sample in the trajectory
             # the frames before frame 0 that the first sample needs: at the start velocity
@@ -544,7 +621,8 @@ class NormalizerFitter:
             if (current["next_sample"] + k) % self.edge_stats_stride:
                 continue
             mesh_edge_attr, _, world_edge_attr = edge_features(
-                current["mesh_edge_index"], current["mesh_space"], pos, self.contact_radius)
+                current["mesh_edge_index"], current["mesh_space"], pos, self.contact_radius,
+                **current["gap"])
             self._mesh.add(mesh_edge_attr)
             self._world.add(world_edge_attr)
         current["next_sample"] += current_pos.shape[0]
@@ -592,8 +670,15 @@ class NormalizerFitter:
         if self.history:
             normalizer.set_stats("target_delta",
                                  *self._delta.mean_std("samples", True, _MIN_FEATURE_STD))
-        normalizer.set_stats("mesh_edge_features",
-                             *self._mesh.mean_std("mesh edges", False, _MIN_EDGE_STD))
+        mesh_mean, mesh_std = self._mesh.mean_std("mesh edges", False, _MIN_EDGE_STD)
+        if self.edge_static_names:   # the element properties after the geometric columns
+            edge_mean, edge_std = self._edge_static.mean_std("mesh edges", False, _MIN_EDGE_STD)
+            for column, name in enumerate(self.edge_static_names):
+                if name.endswith(GIVEN_SUFFIX):
+                    edge_mean[column], edge_std[column] = 0.0, 1.0
+            mesh_mean = np.concatenate([mesh_mean, edge_mean])
+            mesh_std = np.concatenate([mesh_std, edge_std])
+        normalizer.set_stats("mesh_edge_features", mesh_mean, mesh_std)
         normalizer.set_stats("world_edge_features",
                              *self._world.mean_std("world edges", False, _MIN_EDGE_STD))
         return normalizer
@@ -694,12 +779,14 @@ def _insert_trajectory(conn: sqlite3.Connection, index: int, split: str, source:
                        global_names: Sequence[str] = (), static_names: Sequence[str] = (),
                        fitter: Optional[NormalizerFitter] = None,
                        component_names: Optional[List[str]] = None,
-                       with_start: bool = False) -> None:
+                       with_start: bool = False,
+                       edge_values: Optional[np.ndarray] = None) -> None:
     """One ``trajectories`` row plus one ``frames`` row per frame, block by block;
     with ``fitter`` (train split) the frames go into the statistics as well. The
     components of the run are stored as indices into ``component_names``, the
     components of the dataset, to which new names are appended; ``with_start`` stores
-    the start velocity of the run."""
+    the start velocity of the run; ``edge_values`` (E, K) the element properties on its
+    mesh edges (``_edge_values``)."""
     mesh_id, mesh_edge_index = _insert_mesh(conn, traj, meshes)
     static = (
         traj.node_type.astype(np.uint8).tobytes(),
@@ -719,17 +806,23 @@ def _insert_trajectory(conn: sqlite3.Connection, index: int, split: str, source:
                               dtype=np.uint32)
         components = to_dataset[np.asarray(traj.component)].tobytes()
     start = _start_motion(traj).numpy().tobytes() if with_start else None
+    edge_static = None if edge_values is None else edge_values.astype(np.float32).tobytes()
     digest = hashlib.sha256()
-    for blob in static + tuple(blob for blob in (components, start) if blob is not None):
+    for blob in static + tuple(blob for blob in (components, start, edge_static)
+                               if blob is not None):
         _hash(digest, blob)
+    # The column only when there are edge properties: DBs of earlier exports lack it.
+    extra = ", edge_static" if edge_static is not None else ""
     conn.execute(
         "INSERT INTO trajectories (id, split, sequence_id, source, mesh_id, num_nodes, "
         "num_frames, node_type, mesh_pos, globals, node_static, walls, sha256, components, "
-        "start_velocity) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        f"start_velocity{extra}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+        f"{', ?' if extra else ''})",
         (index, split, f"{split}_traj{index:04d}", source, mesh_id, traj.mesh_pos.shape[0],
-         num_frames, *static, "", components, start))
+         num_frames, *static, "", components, start,
+         *((edge_static,) if edge_static is not None else ())))
     if fitter is not None:
-        fitter.start(traj, mesh_edge_index)
+        fitter.start(traj, mesh_edge_index, edge_values)
     frame = 0
     for world_pos, stress in traj.blocks():
         rows = []
@@ -878,6 +971,36 @@ def _mark_missing_features(traj: RawTrajectory, static_names: Sequence[str],
             traj.node_static.setdefault(name + GIVEN_SUFFIX, given.astype(np.float32))
 
 
+def _edge_values(traj: RawTrajectory, edge_static_names: Sequence[str]
+                 ) -> Tuple[Optional[np.ndarray], List[str]]:
+    """The element properties of the reader (``edge_pairs``, ``edge_static``) on the mesh
+    edges of the run (E, K), in the order of ``mesh_edges_from_cells``, and their names: a
+    property that some edges lack (NaN, e.g. no thickness at beams or tie lines) gets a
+    ``_given`` column, 1 where it has a value, as do those of ``edge_static_names`` (the first
+    run). (None, []) without edge fields."""
+    if not traj.edge_static:
+        return None, []
+    edges = mesh_edges_from_cells(traj.cells, traj.cell_types).numpy()
+    num_nodes = traj.mesh_pos.shape[0]
+    pair_keys = traj.edge_pairs[:, 0].astype(np.int64) * num_nodes + traj.edge_pairs[:, 1]
+    order = np.argsort(pair_keys)
+    edge_keys = np.minimum(edges[0], edges[1]).astype(np.int64) * num_nodes \
+        + np.maximum(edges[0], edges[1])
+    at = np.searchsorted(pair_keys[order], edge_keys).clip(max=max(len(order) - 1, 0))
+    found = (pair_keys[order][at] == edge_keys) if len(order) else np.zeros(len(edge_keys), bool)
+    columns, names = [], []
+    for name in sorted(traj.edge_static):
+        values = np.where(found, traj.edge_static[name][order][at], np.nan).astype(np.float32)
+        columns.append(values)
+        names.append(name)
+    for name, values in list(zip(names, columns)):
+        given = ~np.isnan(values)
+        if not given.all() or name + GIVEN_SUFFIX in edge_static_names:
+            columns.append(given.astype(np.float32))
+            names.append(name + GIVEN_SUFFIX)
+    return np.stack(columns, axis=1), names
+
+
 def _describe_components(traj: RawTrajectory) -> str:
     """The parts of a run in the dataset by role, and those left out."""
     lines = [f"  {role}: {', '.join(names)}" for role, names in
@@ -913,6 +1036,8 @@ def write_dataset(
     global_features: Optional[Sequence[str]] = None,
     globals_file: Optional[str] = None,
     export_config: Optional[Dict] = None,
+    initial_state: Optional[InitialState] = None,
+    contact_gap: bool = False,
 ) -> Dict[str, str]:
     """Write ``dataset.db``, ``normalizer.json`` and ``metadata.json`` to ``out_dir``.
 
@@ -932,7 +1057,8 @@ def write_dataset(
     world edges then only join nodes of these pairs. ``global_features`` restricts the
     run parameters, ``globals_file`` (JSON: run folder -> parameters) holds them instead of
     a ``globals.json`` per run; ``export_config`` (the content of a ``--config`` file) is
-    stored with the dataset. An existing ``dataset.db`` is
+    stored with the dataset. ``initial_state`` writes prediction data (module docstring):
+    only the first state of every run is read. An existing ``dataset.db`` is
     replaced, or with
     ``resume`` continued (see the module docstring); ``progress`` receives one
     line per run. Returns the paths of the three files.
@@ -1025,16 +1151,24 @@ def write_dataset(
         settings["global_features"] = json.dumps(list(global_features))
     if export_config is not None:
         settings["export_config"] = json.dumps(export_config, sort_keys=True)
+    if contact_gap:   # only then: other exports stay as before
+        settings["contact_gap"] = "1"
+    if initial_state is not None:   # prediction data; other exports stay as before
+        settings["ground_truth"] = "0"
+        settings["frame_interval"] = repr(float(initial_state.frame_interval))
     thickness_required = "thickness" in ((reader_options or {}).get("static_fields") or ())
     components_shown = False
 
     fitter = NormalizerFitter(contact_radius, history, prev_stress, edge_stats_stride,
-                              first_frame=0)
+                              first_frame=0, contact_gap=contact_gap)
     db_path = out / "dataset.db"
     done: Dict[int, str] = {}       # trajectories already in the DB -> source
     meshes: Dict[str, int] = {}     # SHA-256 of a stored mesh -> id
     global_names: List[str] = []
     static_names: List[str] = []
+    edge_static_names: List[str] = []   # element properties on the mesh edges (_edge_values)
+    # Parts without a material read, over the runs this export reads (resumed: from then on).
+    without_material: Dict[str, None] = {}
     field_names: List[str] = list(DEFAULT_FIELD_NAMES)
     component_names: List[str] = []   # of the whole dataset, in the order they appear
     rigid_bodies: List[str] = []      # components that are free rigid bodies
@@ -1046,6 +1180,8 @@ def write_dataset(
         info = dict(conn.execute("SELECT key, value FROM info"))
         global_names = fitter.global_names = json.loads(info.get("global_names", "[]"))
         static_names = fitter.static_names = json.loads(info.get("static_names", "[]"))
+        edge_static_names = fitter.edge_static_names = json.loads(
+            info.get("edge_static_names", "[]"))
         field_names = fitter.field_names = json.loads(
             info.get("field_names", json.dumps(DEFAULT_FIELD_NAMES)))
         component_names = json.loads(info.get("component_names", "[]"))
@@ -1060,12 +1196,16 @@ def write_dataset(
         for path in (db_path, Path(f"{db_path}-journal")):
             path.unlink(missing_ok=True)
         conn = None   # created with the first run, whose size sets the page size
+    if initial_state is not None:   # the columns of the training data
+        static_names = fitter.static_names = list(initial_state.static_names)
+        edge_static_names = fitter.edge_static_names = list(initial_state.edge_static_names)
 
     block_bytes = int(block_mb * 2 ** 20) if block_mb else None
     runs = [(name, position) for name, positions in selection.values() for position in positions]
+    read_frames = [0] if initial_state is not None else frames
     num_read, seen = 0, set()
     try:
-        for index, (source, read) in enumerate(raw_runs(raw_format, raw_dir, runs, frames,
+        for index, (source, read) in enumerate(raw_runs(raw_format, raw_dir, runs, read_frames,
                                                         reader_options, block_bytes)):
             num_read += 1
             if source in seen:   # d3plot / vtk: sources without a folder share raw_dir
@@ -1080,6 +1220,8 @@ def write_dataset(
                 continue
             start = time.time()
             traj = replace(read())   # a copy: the additions below stay out of the reader's run
+            if initial_state is not None:
+                traj = _from_initial_state(traj, len(frames), initial_state)
             traj.globals = _run_parameters(traj.globals, source, run_table, global_features)
             fields_given = _fields_given(traj)
             _mark_missing_features(traj, static_names, fields_given,
@@ -1090,13 +1232,21 @@ def write_dataset(
                 if progress and not components_shown:
                     progress(_describe_components(traj))
                     components_shown = True
+            without_material.update(dict.fromkeys(traj.parts_without_material or ()))
+            edge_values, run_edge_names = _edge_values(traj, edge_static_names)
+            if index == 0 and initial_state is None:
+                edge_static_names = fitter.edge_static_names = run_edge_names
+            elif run_edge_names != edge_static_names:
+                raise ValueError(f"trajectory {index}: edge properties {run_edge_names} differ "
+                                 f"from those of the first trajectory {edge_static_names}")
             names = (sorted(traj.globals or {}), sorted(traj.node_static or {}),
                      traj.result_field_names())
             if conn is None:
                 conn = _create_db(db_path, settings, traj.mesh_pos.shape[0], len(names[2]))
             if index == 0:
                 global_names = fitter.global_names = names[0]
-                static_names = fitter.static_names = names[1]
+                if initial_state is None:
+                    static_names = fitter.static_names = names[1]
                 field_names = fitter.field_names = names[2]
             elif names != (global_names, static_names, field_names):
                 raise ValueError(f"trajectory {index}: run parameters / static node features / "
@@ -1121,7 +1271,7 @@ def write_dataset(
                 _insert_trajectory(conn, index, split, source, traj, len(frames), meshes,
                                    global_names, static_names,
                                    fitter if split == "train" else None, component_names,
-                                   with_start=bool(history))
+                                   with_start=bool(history), edge_values=edge_values)
                 _check_duplicates(conn, index, split, source)
                 if not fields_given.all():   # only then: other exports stay as before
                     conn.execute("INSERT OR REPLACE INTO info (key, value) VALUES "
@@ -1139,7 +1289,9 @@ def write_dataset(
                                      + ([("field_names", json.dumps(field_names))]
                                         if field_names != DEFAULT_FIELD_NAMES else [])
                                      + ([("rigid_bodies", json.dumps(rigid_bodies))]
-                                        if rigid_bodies else []))
+                                        if rigid_bodies else [])
+                                     + ([("edge_static_names", json.dumps(edge_static_names))]
+                                        if edge_static_names else []))
                 if split == "train":
                     fitter.save(conn)
             if progress:
@@ -1168,12 +1320,18 @@ def write_dataset(
         if conn is not None:
             conn.close()
 
+    if without_material and progress:   # once, instead of a warning per run
+        progress(f"Parts without a material read, so without material properties at their "
+                 f"nodes and edges (the _given columns mark them): "
+                 f"{', '.join(without_material)}")
     normalizer_path = out / "normalizer.json"
-    fitter.normalizer(with_walls=max_walls > 0).save(str(normalizer_path))
+    (initial_state.normalizer if initial_state is not None
+     else fitter.normalizer(with_walls=max_walls > 0)).save(str(normalizer_path))
 
     names = node_feature_names(history, prev_stress, static_names=static_names,
                                walls=max_walls > 0, field_names=field_names)
     targets = target_feature_names(field_names)
+    world_names = list(WORLD_EDGE_FEATURE_NAMES) + (WORLD_GAP_FEATURE_NAMES if contact_gap else [])
     metadata = {
         # TFRecord: DeepMind's benchmark; other raw data: the name of the export
         "dataset": "deforming_plate" if raw_format == "tfrecord" else out.name,
@@ -1182,12 +1340,12 @@ def write_dataset(
         **({"first_frame": 0} if history else {}),
         "prev_stress": bool(prev_stress and history),
         "node_feature_dims": len(names),
-        "edge_feature_dims": MESH_EDGE_FEATURE_DIM,
-        "world_edge_feature_dims": WORLD_EDGE_FEATURE_DIM,
+        "edge_feature_dims": MESH_EDGE_FEATURE_DIM + len(edge_static_names),
+        "world_edge_feature_dims": len(world_names),
         "target_dim": len(targets),
         "node_feature_names": names,
-        "edge_feature_names": list(MESH_EDGE_FEATURE_NAMES),
-        "world_edge_feature_names": list(WORLD_EDGE_FEATURE_NAMES),
+        "edge_feature_names": list(MESH_EDGE_FEATURE_NAMES) + edge_static_names,
+        "world_edge_feature_names": world_names,
         "target_feature_names": targets,
         "loss_mask": "all nodes except actuator (node_type 1)",
         "contact_radius": contact_radius,
@@ -1220,10 +1378,19 @@ def write_dataset(
     if max_walls:
         metadata["max_walls"] = max_walls
         metadata["wall_distance_cutoff"] = WALL_DISTANCE_CUTOFF * contact_radius
+    if contact_gap:
+        metadata["contact_gap"] = True
+    if edge_static_names:
+        metadata["edge_static_names"] = edge_static_names
+    if without_material:
+        metadata["parts_without_material"] = list(without_material)
     if edge_stats_stride != 1:
         metadata["edge_stats_stride"] = edge_stats_stride
     if select_seed is not None:
         metadata["select_seed"] = select_seed
+    if initial_state is not None:
+        metadata["ground_truth"] = False
+        metadata["frame_interval"] = float(initial_state.frame_interval)
     metadata_path = out / "metadata.json"
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
@@ -1283,6 +1450,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "parts): world edges only between these pairs, e.g. "
                              "plate:impactor plate:plate (self-contact), also with patterns "
                              "(box_*:beam_*); none given: every pair")
+    parser.add_argument("--contact-gap", action=argparse.BooleanOptionalAction, default=False,
+                        help="two more world edge features: the distance of the receiver from "
+                             "the sender's shell surface along its normal, and the clearance "
+                             "between the shell surfaces (that distance minus half of both "
+                             "thicknesses, from the static feature thickness)")
     parser.add_argument("--deck-walls", dest="use_deck_walls", default=True,
                         action=argparse.BooleanOptionalAction,
                         help="d3plot: use the rigid walls of the decks (*RIGIDWALL_PLANAR, "
@@ -1311,13 +1483,21 @@ def build_parser() -> argparse.ArgumentParser:
     fields.add_argument("--fields", nargs="*", default=[],
                         help="further result fields per state as targets, each under its own "
                              "name; vtk: point or cell fields, e.g. plastic_strain (vectors: "
-                             "one per component); d3plot: plastic_strain, thickness (shells)")
+                             "one per component); d3plot: plastic_strain, thickness (shells), "
+                             "mean_stress (of the membrane part, tension positive), "
+                             "bending_stress (shells with two or more integration points)")
     fields.add_argument("--static-fields", nargs="*", default=None,
                         help="static node features; vtk: point or cell fields of the first "
                              "state (vectors: one per component); d3plot: thickness, "
                              "initial_velocity and the material properties of the deck "
                              "density, youngs_modulus, poisson_ratio, yield_stress (default: "
                              "thickness and initial_velocity where the runs have them)")
+    fields.add_argument("--edge-fields", nargs="*", default=[],
+                        help="d3plot: element properties on the mesh edges, the mean over the "
+                             "elements next to an edge: thickness (shells, from the deck) and "
+                             "the material properties density, youngs_modulus, poisson_ratio, "
+                             "yield_stress; unlike --static-fields they keep parts apart that "
+                             "share nodes")
     fields.add_argument("--free-rigid-parts", nargs="*", default=[], metavar="PART",
                         help="rigid parts whose motion results from the crash (e.g. a barrier "
                              "with mass): the model predicts it and the rollout moves each "
@@ -1363,7 +1543,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="raw frames between two selected frames")
     parser.add_argument("--history", type=int, choices=(0, 1), default=d["history"],
                         help="1: append velocity_prev (+ stress_prev) to the node features "
-                             "(enables residual_target / scheduled sampling); 0 = paper")
+                             "(enables residual_target / scheduled sampling / rollout training); "
+                             "0: the features of the deforming_plate benchmark")
     parser.add_argument("--prev-stress", action=argparse.BooleanOptionalAction,
                         default=d["prev_stress"], help="with --history 1: include stress_prev")
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction,
@@ -1396,7 +1577,8 @@ def _reader_options(args: argparse.Namespace, components: Dict[str, str]) -> Tup
                  free_rigid_parts=args.free_rigid_parts, components=components),
             dict(fields=args.fields, static_fields=args.static_fields,
                  free_rigid_parts=args.free_rigid_parts, exclude_parts=args.exclude_parts,
-                 components=components, no_deck_walls=not args.use_deck_walls))
+                 components=components, no_deck_walls=not args.use_deck_walls,
+                 edge_fields=args.edge_fields))
 
 
 def _first_run(args: argparse.Namespace, raw_dir: Path, components: Dict[str, str]
@@ -1558,7 +1740,7 @@ def main(argv=None) -> None:
             block_mb=args.block_mb, progress=print,
             contact_pairs=contact_pairs, global_features=args.global_features,
             globals_file=str(_repo_path(args.globals_file)) if args.globals_file else None,
-            export_config=export_config,
+            export_config=export_config, contact_gap=args.contact_gap,
         )
     except ValueError as error:
         sys.exit(f"export.py: error: {error}")

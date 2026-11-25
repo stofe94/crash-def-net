@@ -6,8 +6,8 @@ authors:
   - family-names: Stocker
     given-names: Felix
     email: felix.stocker@sto-eng.de
-version: 1.0.0
-date-released: "2026-11-09"
+version: 1.1.0
+date-released: "2026-11-24"
 license: AGPL-3.0-only
 doi: 10.5281/zenodo.23575635
 repository-code: "https://github.com/stofe94/crash-def-net"

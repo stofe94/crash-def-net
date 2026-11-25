@@ -1,5 +1,10 @@
 # Deforming plate
 
+!!! note "Made with an earlier version"
+    These results were trained and rolled out with release
+    [v0.4.0](https://github.com/stofe94/crash-def-net/tree/v0.4.0) of CrashDefNet. How the
+    current version compares: [at the end of the page](#discussion).
+
 The two architectures in CrashDefNet, **MeshGraphNets (MGN)** and
 **MeshGraphNet-Transformer (MGN-T)**, on DeepMind's `deforming_plate`, next to the values
 of the papers. The runs are deliberately small: a subset of the data, one GPU, a few
@@ -43,7 +48,7 @@ with a global stage over the simulated structure only. The actuator thus acts on
 through contact, and the plate passes the load on through its material.
 
 Values the paper leaves open are set as follows; the implementation's general
-assumptions are listed in [models](../concepts/models.md#assumptions-where-the-paper-leaves-gaps):
+assumptions are listed in [models](../concepts/models.md#assumptions-where-the-mgn-t-paper-leaves-gaps):
 
 | Setting | Value | Why |
 |---|---|---|
@@ -75,9 +80,9 @@ Reference rows: MGN-T from Iparraguirre et al. (arXiv v4, Tab. 3), MGN from Pfaf
 
 ![Error over the test trajectories](../assets/error_per_trajectory.png)
 
-All metrics next to the paper's values (whiskers: standard error):
+All metrics next to the values of both papers (whiskers: standard error):
 
-![Absolute errors compared with the MGN-T paper](../assets/absolute_errors.png)
+![Absolute errors compared with the MGN-T and MeshGraphNets papers](../assets/absolute_errors.png)
 
 Error over the rollout, averaged over the 20 test trajectories. The drop at the end is
 the unloading phase, where the plate springs back:
@@ -90,7 +95,7 @@ the unloading phase, where the plate springs back:
   geometries deform more than any training trajectory: trajectory 149 by up to 597 mm
   (training: maximum 445 mm, median 77 mm). Squared before averaging, their errors dominate
   the pooled values; for the typical geometry the median is the better guide, only the pooled
-  values compare with the paper.
+  values compare with the papers.
 - **Efficiency.** MGN-T has **7.5× fewer parameters** than MeshGraphNets, needs
   **2.6× less training time** (2 h 54 min instead of 7 h 34 min) and about a quarter of
   the GPU memory (~2 instead of ~8 GB).
@@ -106,19 +111,19 @@ the unloading phase, where the plate springs back:
 - **Large deformations.** Trajectories 149, 146 and 147 have the largest errors of both
   models and deform most (597, 380 and 276 mm).
 
-### Why the numbers are not comparable with the paper
+### Why the numbers are not comparable with the papers
 
-| | Paper | Own runs |
+| | Papers | Own runs |
 |---|---|---|
-| Training data | number of trajectories not stated (DeepMind's training split holds 1,200) | 100 trajectories |
-| Time step | stride 1, 400 rollout steps | stride 4, 98 rollout steps |
-| MGN-T configuration | arXiv v4 | arXiv v4; open values as [above](#mgn-t-configuration) |
-| Contact edges of MeshGraphNets | all pairs within the contact radius (`all`) | `self_contact_aware`, as MGN-T |
+| Training data | MeshGraphNets: 1,000 trajectories per dataset (App. A.1; DeepMind's training split holds 1,200); MGN-T: not stated | 100 trajectories |
+| Time step | both: stride 1, 400 rollout steps | stride 4, 98 rollout steps |
+| MGN-T configuration | MGN-T: arXiv v4 | arXiv v4; open values as [above](#mgn-t-configuration) |
+| Contact edges of MeshGraphNets | MeshGraphNets: all pairs within the contact radius (`all`) | `self_contact_aware`, as MGN-T |
 | Training | MGN-T: 25 epochs, batch 32 (arXiv v4, Sec. 5.1); ~8 h on an RTX 4090 (v3) | MGN-T: 60 epochs, batch 8, 2 h 54 min on an RTX A4000 |
-| Test set | size not stated | 20 trajectories |
+| Test set | MeshGraphNets: 100 trajectories (App. A.1); MGN-T: size not stated | 20 trajectories |
 
 - **RMSE-1** is not comparable: at stride 4 the nodes move about four times as far per
-  step as in the paper.
+  step as in the papers.
 - **RMSE-all** covers the same physical time span, but with fewer steps, which means
   fewer chances for errors to accumulate.
 

@@ -31,9 +31,9 @@ trajectory with N nodes.
 
 | Table | One row per | Columns |
 |---|---|---|
-| `info` | setting | `key`, `value` (text, JSON for lists): `format` (`trajectories_v4`), `fingerprint`, `contact_radius`, `num_steps`, `time_stride`, `frames` (the raw frames selected), `history`, `prev_stress`, with history `first_frame` (0: the first frame is a sample, from `start_velocity`), `raw_format`, `sources`, `splits`, `edge_stats_stride`, `global_names`, `static_names`; with result fields other than the stress alone `field_names` (missing: only `stress`); with components `component_names` and, with contact rules, `contact_pairs`; with walls `max_walls`; with cylinder walls `wall_columns` (7: point on the axis, unit axis, radius; missing: 6, point and unit normal); if nodes lack a result field `field_gaps`; with run parameters `global_input` (`graph`: the input `u` of a graph); with `--select-seed` the seed (`select_seed`); for VTK raw data the reader options (`vtk_options`), for LS-DYNA runs those given (`d3plot_options`: `fields`, `static_fields`, `free_rigid_parts`, `exclude_parts`, `components`, `no_deck_walls`); with `--global-features` and `--globals-file` their values (`global_features`, `globals_file`), with `--config` its content (`export_config`); units other than m and Pa (`length_unit`, `stress_unit`); with free rigid parts their component names (`rigid_bodies`) |
+| `info` | setting | `key`, `value` (text, JSON for lists): with prediction data `ground_truth` (0) and `frame_interval`; `format` (`trajectories_v4`), `fingerprint`, `contact_radius`, `num_steps`, `time_stride`, `frames` (the raw frames selected), `history`, `prev_stress`, with history `first_frame` (0: the first frame is a sample, from `start_velocity`), `raw_format`, `sources`, `splits`, `edge_stats_stride`, `global_names`, `static_names`; with result fields other than the stress alone `field_names` (missing: only `stress`); with components `component_names` and, with contact rules, `contact_pairs`; with walls `max_walls`; with cylinder walls `wall_columns` (7: point on the axis, unit axis, radius; missing: 6, point and unit normal); if nodes lack a result field `field_gaps`; with run parameters `global_input` (`graph`: the input `u` of a graph); with `--select-seed` the seed (`select_seed`); for VTK raw data the reader options (`vtk_options`), for LS-DYNA runs those given (`d3plot_options`: `fields`, `static_fields`, `free_rigid_parts`, `exclude_parts`, `components`, `no_deck_walls`, `edge_fields`); with `--edge-fields` the columns of the element properties on the mesh edges (`edge_static_names`, with `<name>_given` where edges lack one); with `--contact-gap` `contact_gap` (1); with `--global-features` and `--globals-file` their values (`global_features`, `globals_file`), with `--config` its content (`export_config`); units other than m and Pa (`length_unit`, `stress_unit`); with free rigid parts their component names (`rigid_bodies`) |
 | `meshes` | distinct mesh | `sha256`, `num_nodes`, `num_cells`, `num_edges`, `cells` (int32, tetrahedra or padded with −1), `cell_types` (uint8 VTK types, NULL for tetrahedra), `mesh_edges` (int32 (2, E), both directions) |
-| `trajectories` | trajectory | `split`, `sequence_id` (e.g. `test_traj0010`), `source` (raw run), `mesh_id`, `num_nodes`, `num_frames`, `node_type` (uint8 (N), raw values 0 / 1 / 3), `mesh_pos` (float32 (N, 3)), `globals`, `node_static` (NaN: the node has no value), `walls` (optional), `sha256`, `components` (uint32 (N), optional: the component of every node), `start_velocity` (float32 (N, 3), with history: the motion over one frame interval before the first frame at the initial velocity, the velocity input of the first frame) |
+| `trajectories` | trajectory | `split`, `sequence_id` (e.g. `test_traj0010`), `source` (raw run), `mesh_id`, `num_nodes`, `num_frames`, `node_type` (uint8 (N), raw values 0 / 1 / 3), `mesh_pos` (float32 (N, 3)), `globals`, `node_static` (NaN: the node has no value), `walls` (optional), `sha256`, `components` (uint32 (N), optional: the component of every node), `start_velocity` (float32 (N, 3), with history: the motion over one frame interval before the first frame at the initial velocity, the velocity input of the first frame), `edge_static` (float32 (E, K), with `--edge-fields`: the element properties on the mesh edges, in the order of `meshes.mesh_edges`; NaN: the edge has no value) |
 | `frames` | selected frame | `trajectory_id`, `frame` (0 … `num_frames` − 1), `world_pos` (float32 (N, 3)), `stress` (float32 (N, F): the result fields, in `deforming_plate` F = 1, the stress; NaN: the node has no value) |
 | `moments` | feature group | running statistics of the train split, for `--resume` |
 
@@ -62,7 +62,8 @@ The feature layout and the export settings; models are sized from it, with the
 | `global_feature_names`, `global_feature_dims` | run parameters and their number: the width of the global input `u`; only when the runs have them |
 | `component_names`, `contact_pairs` | the components of the runs and the contact rules between them; only when the runs have components |
 | `rigid_bodies` | the free rigid parts (`--free-rigid-parts`), whose motion the model predicts and the rollout keeps rigid; only when there are any |
-| `static_feature_names`, `max_walls`, `wall_distance_cutoff`, `edge_stats_stride`, `select_seed`, `export_config` | only when they apply |
+| `static_feature_names`, `max_walls`, `wall_distance_cutoff`, `edge_stats_stride`, `select_seed`, `export_config`, `contact_gap`, `edge_static_names`, `parts_without_material` (parts without a material read, so without material properties) | only when they apply |
+| `ground_truth`, `frame_interval`, `applicability` | prediction data of [`prepare.py`](../guides/prediction.md) only: `false` (the frames after the first are the initial state again), the time between two frames of the training data, the verdict of the check per run |
 
 ### normalizer.json
 
@@ -79,6 +80,15 @@ With history a group `target_delta` is added, with run parameters a group
 `global_features` (one value per train trajectory). Every checkpoint stores a copy of the
 columns its run selects, which rollout and resumed training use, so a model keeps its scale
 after a new export.
+
+### applicability.json
+
+Written by [`prepare.py`](cli.md#prepare) next to prediction data (or alone with
+`--check-only`): `checkpoint`, `epoch`, `training_data` (the export the checks compare
+with), `frame_interval`, and per run in `runs` its `verdict` and its `findings`, each with
+`check`, `value` (of the run), `reference` (of the train runs), `status` (`ok`, `outside`,
+`error`, `review`, `info`, `not checked`) and `note`
+([the applicability check](../guides/prediction.md#the-applicability-check)).
 
 ## Training run
 
@@ -112,6 +122,9 @@ A list with one record per epoch:
 |---|---|
 | `epoch`, `train_loss`, `val_loss`, `learning_rate`, `epoch_time_seconds` | always |
 | `val_rollout_mse`, `val_rollout_pos_rmse`, `val_rollout_pos_rmse_final` | at evaluations with rollout validation |
+| `val_rollout_edge_rmse`, `val_rollout_body_pos_rmse_final`, `val_rollout_body_vel_rmse_final` | at evaluations with rollout validation: length error of the mesh edges, mean over the steps; position and velocity error of the free rigid bodies at the last step (with such bodies); in m, m per frame |
+| `train_edge_stretch_loss`, `train_rigid_body_loss` | with the [additional loss terms](../concepts/training.md#loss-and-optimizer-step): the term unweighted, mean over the epoch |
+| `train_rollout_loss` | with [rollout training](../concepts/training.md#rollout-training): the loss over all steps of the windows, the one optimized (`train_loss`: the steps from the ground truth) |
 | `train_loss_clean`, `gap_ratio` | at evaluations: train loss without noise, `max(1, val / train)` |
 | `selection_score` | at evaluations: the worst relative excess over the criteria's lowest values |
 | `selected` | `true` at the selected epoch (the weights of `best_model.pt`) |
@@ -122,8 +135,8 @@ A list with one record per epoch:
 ### test_metrics.json
 
 The selected model on the test split: `mse_normalized`, `mae_normalized`,
-`rmse_per_field` and `mae_per_field` (single step, in SI: velocity in m per frame, stress in
-Pa, other result fields in the units of the data), and `rollout` with
+`rmse_per_field` and `mae_per_field` (single step, in SI: velocity in m per frame, the stresses
+in Pa, other result fields in the units of the data), and `rollout` with
 `rollout_metrics`, `mean_mse_normalized`, `position_rmse`, `position_rmse_final`,
 `rmse_per_field` and the rollout metrics of every trajectory (`sequences`).
 
@@ -140,16 +153,16 @@ The call, model, data, settings and environment of the rollout:
 | `status`, `started`, `finished`, `duration_seconds`, `command` | the call |
 | `model` | `checkpoint` (path, size, modification time, SHA-256), `training_run`, `epoch`, `architecture`, `parameters`, `training_config` |
 | `data` | `data_dir`, `dataset_db` (with `fingerprint`), `normalizer` (with SHA-256) and `normalizer_source`, `split`, `max_sequences`, `start_frame` and `end_frame` (the raw frames the rollout starts and ends with: given, or those of the training; null: the whole trajectory), `max_steps`, `metadata`, `matches_training_dataset`, `differences_to_training_dataset` |
-| `settings` | `device`, `export_vtu`, `one_step`, `config_file` (the file of `--config`, if any), `evaluate` |
+| `settings` | `device`, `export_vtu`, `one_step`, `config_file` (the file of `--config`, if any), `evaluate`, `animate` |
 | `environment` | `git` (`commit`, `branch`, `uncommitted_changes`), `host`, versions of Python, PyTorch and PyG |
-| `results` | `summary_file`, `initial_frame`, `sequences`, `rollout_metrics`, `mean_mse_normalized`, `mean_position_rmse`, `final_position_rmse`, `position_rel_l2`, `rmse_per_field` |
+| `results` | `summary_file`, `initial_frame`, `sequences`, `rollout_metrics`, `mean_mse_normalized`, `mean_position_rmse`, `final_position_rmse`, `position_rel_l2`, `rmse_per_field`; of prediction data `ground_truth: false` instead of the errors, and `data` holds the verdicts of the check (`applicability`) |
 
 ### Rollout summary
 
 `<split>_rollout_summary.json` holds the errors of the rollout, as the mean over the
 trajectories and in `sequences` for every trajectory, in SI whatever the units of the data
-([units](../guides/export.md#units)): positions and velocities in m, the stress in Pa, other
-result fields in the units of the data:
+([units](../guides/export.md#units)): positions and velocities in m, the stresses (`stress`,
+`mean_stress`, `bending_stress`) in Pa, other result fields in the units of the data:
 
 | Key | Content |
 |---|---|
@@ -159,8 +172,14 @@ result fields in the units of the data:
 | `displacement_rms_per_step` | RMS displacement of the ground truth since the initial state: the error of a prediction in which nothing moves |
 | `position_rel_l2_per_step`, `position_rel_l2` | relative L2 position error per step and its mean over the steps ([definition](../concepts/metrics.md#relative-l2-position-error)) |
 | `rmse_per_field`, `mae_per_field`, `rmse_per_field_per_step` | per target column |
+| `edge_length_rmse_per_step` | RMSE of the length of the mesh edges between nodes of `loss_mask`, prediction against ground truth: how much the predicted mesh stretches |
+| `rigid_body_position_rmse_per_step`, `rigid_body_velocity_rmse_per_step` | with free rigid bodies: position and velocity error over their nodes (velocity in m per frame) |
 | `initial_frame`, `frames` | the raw frame of the run the rollout starts from, and the raw frames from the first frame of the dataset to the last predicted one |
 | `sequences.<trajectory>` | the same per trajectory, plus `num_predicted_steps`, `final_position_rmse`, `final_rmse_per_field` |
+
+Of prediction data ([predict new runs](../guides/prediction.md)) the summary holds
+`ground_truth: false`, `split`, `num_sequences`, `target_feature_names`, `initial_frame`,
+`frames` and `num_predicted_steps` per trajectory, no errors.
 
 ### .vtu time series
 
@@ -170,4 +189,4 @@ frame). The frames up to the initial state are ground truth, with prediction = g
 truth and error 0; every later file is a rollout step. Points are the predicted positions; point data:
 `world_pos_gt`, `position_error`, and `<field>_pred`, `<field>_gt`, `<field>_error` for
 `velocity_x/y/z` and every result field; cells with their VTK types. In the units of the
-data.
+data. Of prediction data only the predicted positions and `<field>_pred`.

@@ -20,6 +20,12 @@ holds nothing of it):
 * ``initial_velocity``: ``/INIVEL/TRA`` as (velocity, node IDs, part IDs) of its node group,
   which may also be ``/GRNOD/PART`` (the nodes of these parts); other kinds of ``/INIVEL``
   and velocities in a skew frame are not read (warning).
+* ``rigid_body_masses``: the ``MASS`` of every ``/RBODY`` (fifth field of its first card,
+  20 characters wide), by its title; none where the field is blank or 0.
+* ``part_materials``: density, Young's modulus and Poisson's ratio of the material of every
+  ``/PART``, by part ID, and the yield stress where the law has one: ``/MAT/ELAST``
+  (``/MAT/LAW1``) and ``/MAT/PLAS_JOHNS`` (``/MAT/LAW2``, yield stress = first field of
+  its third card, ``a`` or ``sigma_Y``); other laws are not read.
 
 Cards in fixed format: integers in 10 characters, floats in 20. ``#include`` is not
 followed.
@@ -47,6 +53,8 @@ class RadiossDeck:
     clamped: Set[int] = field(default_factory=set)
     ties: List[Tuple[Set[int], List[int]]] = field(default_factory=list)
     initial_velocity: List[Tuple[np.ndarray, Set[int], Set[int]]] = field(default_factory=list)
+    part_materials: Dict[int, Dict[str, float]] = field(default_factory=dict)   # part ID -> ...
+    rigid_body_masses: Dict[str, float] = field(default_factory=dict)   # /RBODY title -> mass
 
 
 def starter_deck(run_dir) -> Optional[Path]:
@@ -154,17 +162,49 @@ def _read_walls(blocks: Dict[str, List[str]]) -> Tuple[np.ndarray, Set[str]]:
     return np.array(walls, dtype=np.float32).reshape(-1, WALL_COLUMNS), titles
 
 
+_ELASTIC_LAWS = ("ELAST", "LAW1")
+_PLASTIC_LAWS = ("PLAS_JOHNS", "LAW2")
+
+
+def _read_materials(blocks: Dict[str, List[str]]) -> Dict[int, Dict[str, float]]:
+    """Material ID -> properties of the laws read (module docstring)."""
+    materials = {}
+    for keyword, cards in blocks.items():
+        parts = keyword.split("/")   # "", "MAT", law, ID
+        if len(parts) < 4 or parts[1] != "MAT" or parts[2] not in _ELASTIC_LAWS + _PLASTIC_LAWS:
+            continue
+        if len(cards) < 3 or (parts[2] in _PLASTIC_LAWS and len(cards) < 4):
+            warnings.warn(f"{keyword}: too few cards; the material is ignored")
+            continue
+        density = _floats(cards[1], 1)[0]
+        youngs_modulus, poisson_ratio = _floats(cards[2], 2)
+        material = {"density": density, "youngs_modulus": youngs_modulus,
+                    "poisson_ratio": poisson_ratio}
+        if parts[2] in _PLASTIC_LAWS:
+            material["yield_stress"] = _floats(cards[3], 1)[0]
+        materials[int(parts[3])] = material
+    return materials
+
+
 def read_deck(path) -> RadiossDeck:
     """What a starter deck adds to a d3plot (module docstring)."""
     blocks = _read_blocks(path)
     thickness = {prop: _floats(cards[3][20:], 1)[0] for prop, cards in _items(blocks, "/PROP/SHELL")}
+    materials = _read_materials(blocks)
     deck = RadiossDeck()
     for part, cards in _items(blocks, "/PART"):
         prop = _integer(cards[1], 0)
         if prop in thickness:
             deck.shell_thickness[part] = thickness[prop]
+        material = _integer(cards[1], 10)
+        if material in materials:
+            deck.part_materials[part] = materials[material]
     deck.walls, deck.rigid_titles = _read_walls(blocks)
-    deck.rigid_titles |= {cards[0].strip() for _, cards in _items(blocks, "/RBODY")}
+    for _, cards in _items(blocks, "/RBODY"):
+        deck.rigid_titles.add(cards[0].strip())
+        mass = cards[1][40:60].strip() if len(cards) > 1 else ""
+        if mass and float(mass) > 0:
+            deck.rigid_body_masses[cards[0].strip()] = float(mass)
     deck.initial_velocity = _read_initial_velocity(blocks)
     for _, cards in _items(blocks, "/BCS"):
         if cards[1][3:6] == "111":

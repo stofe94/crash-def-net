@@ -137,11 +137,11 @@ published values of MGN-T and MeshGraphNets, with figures of the error over the 
 over the trajectories. What the numbers show:
 [deforming plate results](../results/deforming-plate.md#what-the-numbers-show); why they are not directly comparable
 with the papers:
-[conditions](../results/deforming-plate.md#why-the-numbers-are-not-comparable-with-the-paper).
+[conditions](../results/deforming-plate.md#why-the-numbers-are-not-comparable-with-the-papers).
 
 ## Next steps
 
 - [Add an architecture](adding-an-architecture.md): a third model in the same
   comparison.
-- [Compare with the papers](evaluation.md#compare-with-the-papers): all options and
+- [Compare with published results](evaluation.md#compare-with-published-results): all options and
   files of the report.

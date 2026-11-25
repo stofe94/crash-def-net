@@ -13,7 +13,7 @@ together: [how CrashDefNet works](../concepts/overview.md).
 | [train](#train) | dataset → trained model |
 | [rollout](#rollout) | model → rollout of a split |
 | [plot_losses](#plot_losses), [evaluate_run](#evaluate_run) | one run on its own |
-| [compare_paper](#compare_paper), [check_protocol](#check_protocol) | runs against the papers and against each other |
+| [compare_paper](#compare_paper), [check_protocol](#check_protocol) | runs against the published results of MeshGraphNets and MGN-T and against each other |
 | [explore_data](#explore_data) | a dataset, split against split |
 | [animate_rollout](#animate_rollout) | GIF of a rollout |
 | [app](#app) | the whole workflow in the browser ([the app](../guides/app.md)) |
@@ -37,6 +37,7 @@ python -m dataset_preprocessor.export [options]
 | `--sources NAME [NAME ...], --source-tfrecord NAME [NAME ...]` | `test.tfrecord` | Where the runs come from, one name, or three, one per split: train val test. TFRecord: the file inside --raw-dir (test.tfrecord: 100 trajectories); d3plot / vtk: the folder below --raw-dir (&lt;name without .tfrecord&gt; for converted runs), else all runs below --raw-dir |
 | `--contact-radius CONTACT_RADIUS` | – | World edge radius, in the length unit of the raw data; default: collision_radius of meta.json (required for d3plot / vtk raw data without meta.json) |
 | `--contact-pairs [A:B ...]` | – | Contact rules of raw data with components (LS-DYNA and VTK parts): world edges only between these pairs, e.g. plate:impactor plate:plate (self-contact), also with patterns (box_\*:beam_\*); none given: every pair |
+| `--contact-gap, --no-contact-gap` | `--no-contact-gap` | Two more world edge features: the distance of the receiver from the sender's shell surface along its normal, and the clearance between the shell surfaces (that distance minus half of both thicknesses, from the static feature thickness) |
 | `--deck-walls, --no-deck-walls` | `--deck-walls` | D3plot: use the rigid walls of the decks (\*RIGIDWALL_PLANAR, /RWALL/CYL) as node features |
 | `--length-unit {m,cm,mm}` | `m` | Unit of the lengths in the raw data (positions, contact radius, e.g. mm for LS-DYNA models); the values are kept, the reports convert to SI |
 | `--stress-unit {Pa,kPa,MPa,GPa}` | `Pa` | Unit of the stress in the raw data (e.g. MPa for LS-DYNA models in mm, t, s); the values are kept, the reports convert to SI |
@@ -47,7 +48,7 @@ python -m dataset_preprocessor.export [options]
 | `--select-seed SELECT_SEED` | – | Draw the trajectories of each split at random with this seed (stored in metadata.json); default: the first ones |
 | `--num-steps NUM_STEPS` | `40` | Frames per trajectory (samples per trajectory = num_steps - 1) |
 | `--time-stride TIME_STRIDE` | `10` | Raw frames between two selected frames |
-| `--history {0,1}` | `0` | 1: append velocity_prev (+ stress_prev) to the node features (enables residual_target / scheduled sampling); 0 = paper |
+| `--history {0,1}` | `0` | 1: append velocity_prev (+ stress_prev) to the node features (enables residual_target / scheduled sampling / rollout training); 0: the features of the deforming_plate benchmark |
 | `--prev-stress, --no-prev-stress` | `--prev-stress` | With --history 1: include stress_prev |
 | `--overwrite, --no-overwrite` | `--overwrite` | Replace an existing dataset.db |
 
@@ -58,8 +59,9 @@ python -m dataset_preprocessor.export [options]
 | `--components [PATTERN=ROLE ...]` | – | What goes into the dataset: name patterns of the parts with their role (deformable, actuator, fixed, free_rigid); every other part is left out; instead of --free-rigid-parts, --exclude-parts, --actuator-parts and --clamped-parts; default: every part, roles from the raw data |
 | `--global-features [NAME ...]` | – | Run parameters in the dataset, one input per graph; default: all that the runs have |
 | `--globals-file GLOBALS_FILE` | – | JSON file with the run parameters of all runs, by the name of the run folder; default: a globals.json in every run folder |
-| `--fields [FIELDS ...]` | – | Further result fields per state as targets, each under its own name; vtk: point or cell fields, e.g. plastic_strain (vectors: one per component); d3plot: plastic_strain, thickness (shells) |
+| `--fields [FIELDS ...]` | – | Further result fields per state as targets, each under its own name; vtk: point or cell fields, e.g. plastic_strain (vectors: one per component); d3plot: plastic_strain, thickness (shells), mean_stress (of the membrane part, tension positive), bending_stress (shells with two or more integration points) |
 | `--static-fields [STATIC_FIELDS ...]` | – | Static node features; vtk: point or cell fields of the first state (vectors: one per component); d3plot: thickness, initial_velocity and the material properties of the deck density, youngs_modulus, poisson_ratio, yield_stress (default: thickness and initial_velocity where the runs have them) |
+| `--edge-fields [EDGE_FIELDS ...]` | – | D3plot: element properties on the mesh edges, the mean over the elements next to an edge: thickness (shells, from the deck) and the material properties density, youngs_modulus, poisson_ratio, yield_stress; unlike --static-fields they keep parts apart that share nodes |
 | `--free-rigid-parts [PART ...]` | – | Rigid parts whose motion results from the crash (e.g. a barrier with mass): the model predicts it and the rollout moves each as a rigid body; default: rigid parts are actuators, their motion given. d3plot: \*MAT_RIGID and /RBODY parts without prescribed motion, by title; vtk: any parts |
 | `--exclude-parts [PART ...]` | – | D3plot only: parts left out of the export, named as the components, e.g. display models written as shells: their elements and the nodes only they hold; nodal fields are averaged without them; default: every part stays |
 
@@ -156,6 +158,27 @@ python train/train.py [options]
 | `--seed SEED` | – | Random seed ([training].seed) |
 | `--num-workers NUM_DATALOADER_WORKERS` | – | DataLoader workers ([data].num_dataloader_workers) |
 | `--resume RESUME` | – | Checkpoint to continue from |
+
+## prepare
+
+Check new FE runs against the training data of a model and prepare them for a prediction from their initial state.
+
+```bash
+python predict/prepare.py [options]
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--checkpoint CHECKPOINT` | – | Trained model (best_model.pt or checkpoint_epoch_N.pt) |
+| `--raw-dir RAW_DIR` | – | Folder with the new runs: d3plot with at least the initial state and the deck next to it, one folder per run |
+| `--source SOURCE` | `` | Subfolder of --raw-dir with the runs (default: every run below --raw-dir) |
+| `--out-dir OUT_DIR` | – | Folder of the prediction data (dataset.db, metadata.json, normalizer.json, applicability.json); needed unless --check-only |
+| `--train-data-dir TRAIN_DATA_DIR` | – | Export the model was trained on (default: data_dir of its training config); its train runs are the reference of the checks |
+| `--frame-interval FRAME_INTERVAL` | – | Time between two frames of the training data in the time unit of the decks (default: from the raw data of the training data) |
+| `--num-steps NUM_STEPS` | – | Frames to predict, the initial state included (default: those of the training data) |
+| `--check-only` | `False` | Only check the runs, write nothing but applicability.json (with --out-dir) |
+| `--force` | `False` | Prepare runs whose check failed as well |
+| `--overwrite` | `False` | Replace an existing dataset.db in --out-dir |
 
 ## rollout
 

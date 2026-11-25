@@ -3,11 +3,18 @@
 Terms from finite element simulation and from machine learning as CrashDefNet uses them.
 
 **Actuator**
-: The rigid body that impacts the plate in `deforming_plate` (node type 1). Its motion is
-  prescribed: the model gets its next velocity as input and predicts nothing for it. In
-  LS-DYNA and OpenRadioss runs, rigid parts and nodes with prescribed motion become actuator
-  nodes, as do the parts with the role `actuator` in an export config.
-  [Data and graphs](../concepts/graphs.md#the-benchmark)
+: A part whose motion is given, not predicted (node type 1): e.g. a rigid impactor or a fixed
+  pole, in `deforming_plate` the body that presses into the plate. The model gets its next
+  velocity as input and predicts nothing for it. In LS-DYNA and OpenRadioss runs, rigid parts
+  and nodes with prescribed motion become actuator nodes, as do the parts with the role
+  `actuator` in an export config.
+  [Data and graphs](../concepts/graphs.md#general-meshes-and-run-parameters)
+
+**Applicability check**
+: The comparison of a new run with the runs a model was trained on, before the run is
+  prepared for a prediction: what the model cannot take stops it, what lies outside the
+  ranges of the train runs is named.
+  [Predict new runs](../guides/prediction.md#the-applicability-check)
 
 **Baseline (original, comparable)**
 : The two MeshGraphNets references: the *original* is the published result of the
@@ -40,6 +47,11 @@ Terms from finite element simulation and from machine learning as CrashDefNet us
   contact rules and the roles of an export config refer to components. The models do not
   see the names. [Components](../concepts/graphs.md#components-and-contact-rules)
 
+**Contact gap**
+: Two further features of a contact edge: the distance of the receiver from the sender's
+  shell surface along its normal, and the clearance between the shell surfaces after their
+  thicknesses (`--contact-gap`). [Data and graphs](../concepts/graphs.md#general-meshes-and-run-parameters)
+
 **Contact radius (r_W)**
 : Distance below which two nodes that are not linked through the material get a world
   edge; 0.03 m in `deforming_plate` (`collision_radius` in `meta.json`).
@@ -58,6 +70,11 @@ Terms from finite element simulation and from machine learning as CrashDefNet us
 **Early stopping**
 : Ending a training run when no criterion has reached a new low for `patience`
   evaluations. [Training](../concepts/training.md#model-selection-and-early-stopping)
+
+**Element properties (mesh edges)**
+: Thickness and material properties of the elements next to a mesh edge, as features of
+  that edge (`--edge-fields`); unlike node features they keep parts apart that share nodes.
+  [Data and graphs](../concepts/graphs.md#general-meshes-and-run-parameters)
 
 **Encoder, processor, decoder**
 : The three stages of MeshGraphNets and MGN-T: MLPs map the features into latents, the
@@ -94,8 +111,8 @@ Terms from finite element simulation and from machine learning as CrashDefNet us
 
 **History layout**
 : An export with `--history 1`: the previous velocity and stress become node inputs.
-  Needed for the residual target, scheduled sampling and stress noise; not in the paper.
-  [Optional history](../concepts/graphs.md#optional-history-history-1-not-in-the-paper)
+  Needed for the residual target, scheduled sampling, rollout training and stress noise.
+  [Optional history](../concepts/graphs.md#optional-history-history-1)
 
 **Latent**
 : The learned vector a model keeps per node or edge between its stages; its width is
@@ -107,6 +124,11 @@ Terms from finite element simulation and from machine learning as CrashDefNet us
 
 **Loss mask**
 : The nodes on which loss and errors are computed: all except the actuator.
+
+**Membrane and bending stress**
+: Result fields from the stress at the integration points of a shell: the mean stress of
+  the membrane part, positive in tension, and the von Mises stress of the bending part
+  (`mean_stress`, `bending_stress`). [LS-DYNA runs](../guides/ls-dyna.md#the-d3plot-reader)
 
 **Mesh edge**
 : An edge of a cell of the simulation mesh, in both directions. Its features hold the
@@ -149,27 +171,47 @@ Terms from finite element simulation and from machine learning as CrashDefNet us
   cost grows linearly with the number of nodes. [Models](../concepts/models.md#meshgraphnet-transformer-mgn_t)
 
 **Pooled**
-: A metric over several trajectories computed as in the papers: squared errors averaged
-  over all nodes, steps and trajectories, then the root. Trajectories with large errors
-  weigh more than in the median. [Rollout metrics](../concepts/metrics.md#rollout-metrics)
+: A metric over several trajectories computed as in the MeshGraphNets and MGN-T papers:
+  squared errors averaged over all nodes, steps and trajectories, then the root.
+  Trajectories with large errors weigh more than in the median. [Rollout metrics](../concepts/metrics.md#rollout-metrics)
 
 **Position noise**
 : Gaussian noise on the current positions of the free nodes during training
   (`world_noise_std`), with the target corrected, so that the model learns to recover from
   its own errors in a rollout.
 
+**Prediction data**
+: A dataset of new runs that hold only their initial state, written by `prepare.py` in the
+  layout of the training data and without ground truth; the rollout predicts it.
+  [Predict new runs](../guides/prediction.md)
+
 **Residual target**
 : `residual_target = true`: the model predicts the change of a target against its
   previous value instead of the value itself; needs the history layout.
+
+**Result field**
+: A quantity per node and frame that the model predicts besides the velocity, e.g. the von
+  Mises stress or the plastic strain; with the history layout also an input.
+  [Data and graphs](../concepts/graphs.md#general-meshes-and-run-parameters)
 
 **RMSE-1, RMSE-all, R-RMSE**
 : The rollout metrics: root mean square error of one step from the ground truth, of the
   whole rollout, and relative to the largest value of the trajectory.
   [Rollout metrics](../concepts/metrics.md#rollout-metrics)
 
+**Rigid wall**
+: A stationary wall of the deck, planar or a cylinder, that enters at every node as the
+  signed distance to its surface and its normal. [Data and graphs](../concepts/graphs.md#general-meshes-and-run-parameters)
+
 **Rollout (autoregressive)**
 : Applying the model to its own predictions, step after step over a whole trajectory,
   starting from the ground truth at step 0. [Rollout and metrics](../concepts/metrics.md)
+
+**Rollout training**
+: Training on windows of consecutive steps that the model rolls out on its own
+  predictions, with the loss on every step and the gradients through the whole window;
+  needs the history layout.
+  [Rollout training](../concepts/training.md#rollout-training)
 
 **Rollout validation**
 : A rollout of the val split during training; its errors are selection criteria.
@@ -184,8 +226,10 @@ Terms from finite element simulation and from machine learning as CrashDefNet us
   trajectory with n frames gives n − 1 samples.
 
 **Scheduled sampling**
-: Replacing the previous-state inputs of a part of the nodes by the model's own
-  prediction during training; needs the history layout.
+: Replacing the previous-state inputs of a part of the nodes, or with several steps of
+  whole samples, by the model's own prediction during one-step training; needs the history
+  layout.
+  [One-step training](../concepts/training.md#one-step-training)
 
 **Self-contact**
 : Contact between two parts of the same body, e.g. the folds of a crushed structure.
@@ -195,8 +239,8 @@ Terms from finite element simulation and from machine learning as CrashDefNet us
 : The train, val (validation) or test part of a dataset; each holds whole trajectories.
 
 **Stride (time stride)**
-: Raw simulation steps between two exported frames (`--time-stride`); the paper uses
-  every step.
+: Raw simulation steps between two exported frames (`--time-stride`); MeshGraphNets and
+  MGN-T use every step of `deforming_plate`.
 
 **Trajectory**
 : One simulation run: a geometry with its mesh, followed over the load case. In

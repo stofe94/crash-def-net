@@ -10,7 +10,7 @@ with the project.
 
 - Further recent architectures, integrated and tested as they are published
 - More complex crash scenarios, with all architectures side by side
-- Training on the full `deforming_plate` training split, as in the papers
+- Training on the full `deforming_plate` training split, as in MeshGraphNets and MGN-T
 - Less memory and computation per node
 - Scaling to full-vehicle meshes as soon as the data require it
 - A published test suite for every stage of the pipeline

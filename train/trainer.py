@@ -1,17 +1,31 @@
 """
-trainer.py — One-step training of the MeshGraphNets on deforming_plate.
+trainer.py — Training of the models: one step from the ground truth, or rollout training.
 
-Per batch (in this order):
+Per batch of the one-step training (in this order):
 
 1. **Scheduled sampling** (optional, needs history): the model predicts step t
-   from its predecessor sample; on a random subset of nodes that prediction
-   replaces the ``*_prev`` inputs, and the current positions move with it.
+   from its predecessor sample (with ``scheduled_sampling_steps`` > 1: rolls out from
+   that many steps back); on a random subset of nodes that prediction replaces the
+   ``*_prev`` inputs, and the current positions move with it.
 2. **Position noise** (``world_noise_std``, paper App. A.2.2): Gaussian noise on
    the current positions of the free nodes; velocity target, ``velocity_prev``
    and all edges are adjusted consistently.
 3. **Stress noise** (optional, needs history) on ``stress_prev``.
 4. Loss on the normalized targets of the nodes in ``loss_mask``, without targets a
-   node does not have (``target_given``), gradient clipping, optimizer step; the exponential LR schedule steps per batch.
+   node does not have (``target_given``), plus the optional terms on the length change
+   of the mesh edges and on the mean velocity of the free rigid bodies
+   (``loss_*_weight``); gradient clipping, optimizer step; the exponential LR schedule
+   steps per batch.
+
+**Rollout training** (``rollout_training``, needs history) replaces the one-step
+batches by windows of up to ``rollout_training_steps`` consecutive samples of a
+trajectory (``RolloutWindowSampler``): the first step of a window starts from the ground
+truth (with the noise above), every further one from the model's prediction of the step
+before, written into the ``*_prev`` inputs with the positions and all edges moved along,
+as in the rollout. The loss covers every step; its velocity target, corrected by the
+displacement, makes it the position error after the step. The gradients flow through the
+whole window; every step but the last is recomputed in the backward pass (activation
+checkpointing), so that memory stays near that of one step.
 
 After every epoch the single-step validation loss is computed; with rollout
 validation every N epochs also the autoregressive rollout error on the val
@@ -49,12 +63,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, ReduceLROnPlateau
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Subset
 from torch_geometric.data import Batch
 from tqdm import tqdm
 
 from dataset_preprocessor import (
     PredecessorPairDataset,
+    RolloutWindowSampler,
     TrajectoryDataset,
     collate_with_predecessor,
 )
@@ -63,6 +79,7 @@ from dataset_preprocessor.graph_features import (
     ALL_FEATURES,
     PREV_STRESS_NAMES,
     PREV_VELOCITY_NAMES,
+    VELOCITY_TARGET_COLUMNS,
     VELOCITY_TARGET_NAMES,
     FeatureSelection,
     add_world_edges,
@@ -75,7 +92,7 @@ from train.config import TrainingConfig
 from train.early_stopping import ROLLOUT_CRITERIA, EarlyStopping
 from utils.normalizer import Normalizer
 from utils.timezone import Formatter, now
-from utils.units import SI_LENGTH, SI_STRESS, si_factors
+from utils.units import SI_LENGTH, SI_STRESS, STRESS_FIELDS, si_factors
 
 logger = logging.getLogger("train")
 
@@ -111,7 +128,7 @@ def create_dataloaders(config: TrainingConfig, normalizer: Normalizer
     """Train/val/test loaders over ``<data_dir>/dataset.db``.
 
     With scheduled sampling every train item also carries its predecessor
-    sample. The test loader is None for an empty test split. With
+    sample, with rollout training the samples before it in its window. The test loader is None for an empty test split. With
     ``lazy_loading`` the frames stay in the DB and every worker reads the
     frames of its samples through its own connection.
     """
@@ -126,8 +143,9 @@ def create_dataloaders(config: TrainingConfig, normalizer: Normalizer
                    features=config.features, start_frame=config.start_frame,
                    end_frame=config.end_frame)
     # With position noise every train batch gets its world edges anew on the
-    # device (displace_nodes): the contact search in the loader would be wasted.
-    world_edges_in_loader = config.world_noise_std <= 0
+    # device (displace_nodes), with rollout training every step after the first of a
+    # window: the contact search in the loader would be wasted.
+    world_edges_in_loader = config.world_noise_std <= 0 and not config.rollout_training
     train_set = TrajectoryDataset(db_path, "train", normalizer,
                                       build_world_edges=world_edges_in_loader, **loading)
     val_set = TrajectoryDataset(db_path, "val", normalizer, **loading)
@@ -152,8 +170,13 @@ def create_dataloaders(config: TrainingConfig, normalizer: Normalizer
                            f"{train_set.unused_features}")
 
     train_collate = Batch.from_data_list
-    if config.scheduled_sampling:
-        train_set = PredecessorPairDataset(train_set)
+    sampler = None
+    if config.rollout_training:
+        sampler = RolloutWindowSampler(train_set, config.rollout_training_steps)
+        train_set = PredecessorPairDataset(train_set, config.rollout_training_steps - 1)
+        train_collate = collate_with_predecessor
+    elif config.scheduled_sampling:
+        train_set = PredecessorPairDataset(train_set, config.scheduled_sampling_steps)
         train_collate = collate_with_predecessor
 
     workers = config.num_dataloader_workers
@@ -167,7 +190,8 @@ def create_dataloaders(config: TrainingConfig, normalizer: Normalizer
     train_batch_size = config.micro_batch_size or config.batch_size
     parallel = dict(num_workers=workers, persistent_workers=workers > 0,
                     multiprocessing_context="spawn" if workers > 0 else None)
-    train_loader = DataLoader(train_set, shuffle=True, collate_fn=train_collate,
+    train_loader = DataLoader(train_set, shuffle=sampler is None, sampler=sampler,
+                              collate_fn=train_collate,
                               **{**common, "batch_size": train_batch_size}, **parallel)
     val_loader = DataLoader(val_set, shuffle=False, collate_fn=Batch.from_data_list,
                             **common, **parallel)
@@ -429,6 +453,23 @@ class Trainer:
         self._check_history_options()
 
         self.loss_fn = LOSS_FUNCTIONS[config.loss_type](reduction="none")
+        # Additional loss terms (name -> weight) and their scale: the velocity change per
+        # step of the targets (the delta statistics; without them the target statistics).
+        self.num_bodies = len(metadata.get("rigid_bodies", []))
+        self.extra_loss_weights = {name: weight for name, weight in (
+            ("edge_stretch", config.loss_edge_stretch_weight),
+            ("rigid_body", config.loss_rigid_body_weight if self.num_bodies else 0.0))
+            if weight > 0}
+        if config.loss_rigid_body_weight > 0 and not self.num_bodies:
+            logger.warning("loss rigid_body_weight > 0 but the dataset has no free rigid "
+                           "bodies — the term is left out")
+        self.velocity_change_std = None
+        if self.extra_loss_weights:
+            group = "target_delta" if "target_delta" in normalizer else "target"
+            self.velocity_change_std = normalizer.mean_std(group, self.device)[1][
+                VELOCITY_TARGET_COLUMNS]
+        self.last_extra_losses: Dict[str, float] = {}
+        self.last_rollout_loss: Optional[float] = None   # rollout training: all steps
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=config.learning_rate,
                                           weight_decay=config.weight_decay)
         self.scheduler = self._create_scheduler()
@@ -469,9 +510,10 @@ class Trainer:
 
     def _check_history_options(self) -> None:
         """Options that need the history layout (``*_prev`` inputs)."""
-        if self.config.scheduled_sampling and not self.prev_to_target:
-            raise ValueError("scheduled_sampling needs *_prev inputs — export the "
-                             "dataset with --history 1")
+        for option in ("scheduled_sampling", "rollout_training"):
+            if getattr(self.config, option) and not self.velocity_prev_columns:
+                raise ValueError(f"{option} needs *_prev inputs — export the "
+                                 "dataset with --history 1")
         if self.config.stress_noise_std > 0 and self.stress_prev_column is None:
             logger.warning("stress_noise_std > 0 but the dataset has no stress_prev "
                            "column — stress noise is disabled")
@@ -511,47 +553,93 @@ class Trainer:
                        - cfg.scheduled_sampling_end_ratio) * progress)
         return cfg.scheduled_sampling_end_ratio
 
-    def _apply_scheduled_sampling(self, batch, prev_batch, epoch: int):
-        """Replace ``*_prev`` inputs by the model's prediction from the predecessor.
+    def _apply_scheduled_sampling(self, batch, prev_batches, epoch: int):
+        """Replace ``*_prev`` inputs by the model's prediction from the predecessors.
 
-        This hands the model the state a rollout would produce. Velocities of
-        kinematic nodes stay ground truth, and the actuator keeps all its
-        inputs. Where ``velocity_prev`` changes by d, the current positions move
-        by d as well (x_t = x_{t-1} + velocity_prev).
+        This hands the model the state a rollout would produce. With one predecessor the
+        prediction replaces the inputs of a share of the nodes. With several
+        (``scheduled_sampling_steps``) the model rolls out from the oldest one: every
+        predecessor gets the prediction of the one before it on all its nodes, and a
+        share of the samples takes the rolled-out state on all nodes, so that its drift
+        stays coherent as in a rollout (mixed per node, the drift of several steps would
+        tear the mesh between neighbours as no rollout does); a batch in which no sample
+        does skips the rollout. Velocities of kinematic nodes stay ground truth, and the
+        actuator keeps all its inputs.
         """
         ratio = self.teacher_forcing_ratio(epoch)
         if ratio >= 1.0:
             return batch
+        chosen = None
+        if len(prev_batches) > 1:
+            # Whole samples. Drawn on the CPU, so that deciding needs no wait for the GPU;
+            # if no sample takes the rolled-out state, the rollout is not needed.
+            chosen = torch.rand(batch.num_graphs) > ratio
+            if not chosen.any():
+                return batch
 
         was_training = self.model.training
         self.model.eval()
+        prediction = offset = None
         with torch.no_grad():
-            prev_batch = self._with_world_edges(prev_batch)
-            prediction = self.normalizer.denormalize(self.model(prev_batch), "target")
+            for prev_batch in reversed(prev_batches):   # the oldest first
+                if prediction is not None:   # moving the nodes rebuilds all edges
+                    rows = prev_batch.has_predecessor & prev_batch.loss_mask
+                    offset = self._feed_prediction(prev_batch, prediction, rows, offset)
+                prev_batch = self._with_world_edges(prev_batch)   # only where still missing
+                prediction = self.normalizer.denormalize(self.model(prev_batch), "target")
         self.model.train(was_training)
 
+        if chosen is not None:   # whole samples, so that their drift stays coherent
+            graph = getattr(batch, "batch", None)
+            graph = torch.zeros_like(batch.loss_mask, dtype=torch.long) if graph is None else graph
+            use_prediction = chosen.to(batch.x.device)[graph]
+        else:                    # a share of the nodes
+            use_prediction = torch.rand(batch.x.shape[0], device=batch.x.device) > ratio
+        use_prediction &= batch.has_predecessor & batch.loss_mask
+        self._feed_prediction(batch, prediction, use_prediction, offset)
+        return batch
+
+    def _feed_prediction(self, batch, prediction: torch.Tensor, rows: torch.Tensor,
+                         offset: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Write ``prediction`` (raw targets of the step before) into the ``*_prev``
+        inputs of the nodes ``rows`` and move their positions consistently
+        (``_write_prediction``). Returns the displacement applied here (None without
+        velocity inputs)."""
+        delta = self._write_prediction(batch, prediction, rows, offset)
+        if delta is not None:
+            displace_nodes(batch, delta, self.normalizer, self.contact_radius)
+        return delta
+
+    def _write_prediction(self, batch, prediction: torch.Tensor, rows: torch.Tensor,
+                          offset: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Write ``prediction`` into the ``*_prev`` inputs of the nodes ``rows`` and return
+        the displacement of their current positions that goes with it, not yet applied:
+        the change of ``velocity_prev`` plus ``offset``, the displacement already applied
+        to the step before (x_t = x_{t-1} + velocity_prev); None without velocity inputs.
+        Masks select instead of indexing: no wait for the GPU, and the gradients flow
+        (rollout training)."""
         x_before = batch.x
         node_mean, node_std = self.normalizer.mean_std("node_features", x_before.device)
-        use_prediction = torch.rand(x_before.shape[0], device=x_before.device) > ratio
-        use_prediction &= batch.has_predecessor & batch.loss_mask
         free = free_node_mask(x_before)
         velocity_columns = self.velocity_prev_columns or []
 
         x = x_before.clone()
         given = getattr(batch, "target_given", None)
         for column, target_column in self.prev_to_target.items():
-            rows = use_prediction & free if column in velocity_columns else use_prediction
+            selected = rows & free if column in velocity_columns else rows
             if given is not None:
-                rows = rows & given[:, target_column]
-            x[rows, column] = ((prediction[rows, target_column] - node_mean[column])
-                               / node_std[column])
+                selected = selected & given[:, target_column]
+            value = (prediction[:, target_column] - node_mean[column]) / node_std[column]
+            x[:, column] = torch.where(selected, value, x[:, column])
         batch.x = x
 
-        if velocity_columns:
-            delta = (x[:, velocity_columns] - x_before[:, velocity_columns]) \
-                * node_std[velocity_columns]
-            displace_nodes(batch, delta, self.normalizer, self.contact_radius)
-        return batch
+        if not velocity_columns:
+            return None
+        delta = (x[:, velocity_columns] - x_before[:, velocity_columns]) \
+            * node_std[velocity_columns]
+        if offset is not None:
+            delta = delta + offset * (rows & free)[:, None]
+        return delta
 
     def _apply_position_noise(self, batch):
         """Gaussian noise on the current positions of the free nodes, resampled
@@ -564,9 +652,23 @@ class Trainer:
                        self.velocity_prev_columns)
         return batch
 
-    def _apply_stress_noise(self, batch):
-        """Gaussian noise (Pa) on ``stress_prev`` of the loss nodes; the target
-        stays, so the model learns to correct a drifting previous value."""
+    def _window_start_noise(self, batch, nodes: torch.Tensor) -> torch.Tensor:
+        """Rollout training: position noise on the free ``nodes`` (those of the samples a
+        window starts with), written into ``velocity_prev`` as ``displace_nodes`` does;
+        returns the displacement, which the caller applies with that of the fed nodes in
+        one contact search."""
+        noise = torch.randn(batch.x.shape[0], 3, device=batch.x.device) \
+            * self.config.world_noise_std * (free_node_mask(batch.x) & nodes)[:, None]
+        _, node_std = self.normalizer.mean_std("node_features", batch.x.device)
+        columns = self.velocity_prev_columns
+        x = batch.x.clone()
+        x[:, columns] += noise / node_std[columns]
+        batch.x = x
+        return noise
+
+    def _apply_stress_noise(self, batch, nodes: Optional[torch.Tensor] = None):
+        """Gaussian noise (Pa) on ``stress_prev`` of the loss nodes (and of ``nodes``);
+        the target stays, so the model learns to correct a drifting previous value."""
         column = self.stress_prev_column
         column_std = float(self.normalizer.stats["node_features"]["std"][column])
         noise = torch.randn(batch.x.shape[0], device=batch.x.device) \
@@ -574,6 +676,8 @@ class Trainer:
         given = getattr(batch, "target_given", None)
         if given is not None:
             noise = noise * given[:, self.target_names.index("stress")]
+        if nodes is not None:
+            noise = noise * nodes
         x = batch.x.clone()
         x[:, column] = x[:, column] + noise * batch.loss_mask
         batch.x = x
@@ -581,22 +685,74 @@ class Trainer:
 
     # ── epochs ──────────────────────────────────────────────────────────────
 
-    def _loss_sum(self, batch, prediction: torch.Tensor) -> torch.Tensor:
-        """Loss summed over the targets of the nodes in ``loss_mask``, without targets a node
-        does not have (``target_given``); the masks multiply instead of indexing, which
-        would wait for the GPU."""
-        terms = self.loss_fn(prediction, batch.y) * batch.loss_mask[:, None]
+    def _loss_sum(self, batch, prediction: torch.Tensor,
+                  nodes: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Loss summed over the targets of the nodes in ``loss_mask`` (and in ``nodes``),
+        without targets a node does not have (``target_given``); the masks multiply
+        instead of indexing, which would wait for the GPU."""
+        mask = batch.loss_mask if nodes is None else batch.loss_mask & nodes
+        terms = self.loss_fn(prediction, batch.y) * mask[:, None]
         given = getattr(batch, "target_given", None)
         return (terms if given is None else terms * given).sum()
 
-    def _num_loss_terms(self, batch) -> torch.Tensor:
+    def _num_loss_terms(self, batch, nodes: Optional[torch.Tensor] = None) -> torch.Tensor:
+        mask = batch.loss_mask if nodes is None else batch.loss_mask & nodes
         given = getattr(batch, "target_given", None)
         if given is None:
-            return batch.loss_mask.sum() * batch.y.shape[-1]
-        return (batch.loss_mask[:, None] & given).sum()
+            return mask.sum() * batch.y.shape[-1]
+        return (mask[:, None] & given).sum()
+
+    def _extra_losses(self, batch, prediction: torch.Tensor,
+                      nodes: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """The additional loss terms in use (``extra_loss_weights``), each a mean, in
+        units of the velocity change per step of the targets:
+
+        - ``edge_stretch``: length change of every mesh edge between two nodes of
+          ``loss_mask`` in this step, prediction against ground truth. Rotations of the
+          edge (folding) leave it unchanged, stretching does not.
+        - ``rigid_body``: mean velocity of every free rigid body (the translation the
+          rollout gives it), prediction against ground truth, per component.
+
+        The target means cancel in both differences, so the normalized values times the
+        target std suffice. Masks multiply instead of indexing (no wait for the GPU).
+        """
+        terms: Dict[str, torch.Tensor] = {}
+        if not self.extra_loss_weights:
+            return terms
+        loss_mask = batch.loss_mask if nodes is None else batch.loss_mask & nodes
+        columns = VELOCITY_TARGET_COLUMNS
+        _, target_std = self.normalizer.mean_std("target", prediction.device)
+        std = target_std[columns]
+        if "edge_stretch" in self.extra_loss_weights:
+            i, j = batch.edge_index
+            keep = ((i < j) & loss_mask[i] & loss_mask[j]).to(prediction.dtype)
+            edge = batch.world_pos[j] - batch.world_pos[i]
+            velocity, true_velocity = prediction[:, columns] * std, batch.y[:, columns] * std
+            predicted = edge + velocity[j] - velocity[i]
+            true = edge + true_velocity[j] - true_velocity[i]
+            error = (predicted.norm(dim=1) - true.norm(dim=1)) / self.velocity_change_std.mean()
+            terms["edge_stretch"] = (error.pow(2) * keep).sum() / keep.sum().clamp(min=1)
+        if "rigid_body" in self.extra_loss_weights and hasattr(batch, "rigid_body"):
+            member = (batch.rigid_body >= 0) & loss_mask
+            graph = getattr(batch, "batch", None)
+            graph = torch.zeros_like(batch.rigid_body) if graph is None else graph
+            index = torch.where(member, batch.rigid_body + graph * self.num_bodies, 0)
+            groups = int(batch.num_graphs) * self.num_bodies
+            weight = member.to(prediction.dtype)
+            error = (prediction[:, columns] - batch.y[:, columns]) * std * weight[:, None]
+            sums = torch.zeros((groups, len(columns)), dtype=prediction.dtype,
+                               device=prediction.device).index_add_(0, index, error)
+            counts = torch.zeros(groups, dtype=prediction.dtype,
+                                 device=prediction.device).index_add_(0, index, weight)
+            mean_error = sums / counts.clamp(min=1)[:, None] / self.velocity_change_std
+            present = (counts > 0).to(prediction.dtype)
+            terms["rigid_body"] = ((mean_error.pow(2).sum(1) * present).sum()
+                                   / (present.sum() * len(columns)).clamp(min=1))
+        return terms
 
     def train_epoch(self, loader: DataLoader, epoch: int) -> float:
-        """One pass over the train split; returns the mean loss per graph.
+        """One pass over the train split; returns the mean loss per graph (with rollout
+        training: of the steps from the ground truth, per window).
 
         ``accumulation_steps`` micro-batches of the loader make one optimizer
         step. Their loss is normalized by the nodes of all of them, so the
@@ -605,45 +761,161 @@ class Trainer:
         """
         self.model.train()
         total_loss = torch.zeros((), device=self.device)
+        rollout_total = torch.zeros((), device=self.device)
+        extra_totals = {name: torch.zeros((), device=self.device)
+                        for name in self.extra_loss_weights}
         num_graphs = 0
         steps = self.config.accumulation_steps
         micro_batches = iter(loader)
         progress = tqdm(total=math.ceil(len(loader) / steps), desc=f"Epoch {epoch + 1}",
                         leave=False)
         while group := list(itertools.islice(micro_batches, steps)):
-            batches = [self._train_batch(item, epoch) for item in group]
-            count = sum(self._num_loss_terms(batch) for batch in batches)
             self.optimizer.zero_grad()
-            step_loss = torch.zeros((), device=self.device)
-            for batch in batches:
-                loss = self._loss_sum(batch, self.model(batch)) / count
-                loss.backward()
-                step_loss += loss.detach()
+            if self.config.rollout_training:
+                step_loss, step_extra, graphs, step_rollout = self._rollout_training_step(group)
+                rollout_total += step_rollout * graphs
+            else:
+                step_loss, step_extra, graphs = self._one_step_training_step(group, epoch)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(),
                                            max_norm=self.config.max_grad_norm)
             self.optimizer.step()
             if self.config.scheduler == "exponential":
                 self.scheduler.step()
 
-            graphs = sum(batch.num_graphs for batch in batches)
             total_loss += step_loss * graphs
+            for name, value in step_extra.items():
+                extra_totals[name] += value * graphs
             num_graphs += graphs
             progress.update()
             if progress.n % PROGRESS_EVERY == 0:   # reading the loss waits for the GPU
                 progress.set_postfix(loss=f"{step_loss.item():.4f}")
         progress.close()
+        # The additional terms unweighted, per graph; the returned loss is that of the
+        # targets alone, comparable to the val loss.
+        self.last_extra_losses = {name: (value / max(num_graphs, 1)).item()
+                                  for name, value in extra_totals.items()}
+        self.last_rollout_loss = ((rollout_total / max(num_graphs, 1)).item()
+                                  if self.config.rollout_training else None)
         return (total_loss / max(num_graphs, 1)).item()
+
+    def _one_step_training_step(self, group: List, epoch: int
+                                ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], int]:
+        """Forward and backward passes over the micro-batches of one optimizer step:
+        the loss, the additional terms and the number of graphs."""
+        batches = [self._train_batch(item, epoch) for item in group]
+        count = sum(self._num_loss_terms(batch) for batch in batches)
+        step_loss = torch.zeros((), device=self.device)
+        step_extra = {name: torch.zeros((), device=self.device)
+                      for name in self.extra_loss_weights}
+        for batch in batches:
+            prediction = self.model(batch)
+            node_loss = self._loss_sum(batch, prediction) / count
+            loss = node_loss
+            for name, value in self._extra_losses(batch, prediction).items():
+                loss = loss + self.extra_loss_weights[name] * value / len(batches)
+                step_extra[name] += value.detach() / len(batches)
+            loss.backward()
+            step_loss += node_loss.detach()
+        return step_loss, step_extra, sum(batch.num_graphs for batch in batches)
+
+    def _rollout_training_step(self, group: List) -> Tuple[torch.Tensor,
+                                                           Dict[str, torch.Tensor], int,
+                                                           torch.Tensor]:
+        """Forward and backward passes over the windows of one optimizer step (rollout
+        training): the loss of the steps from the ground truth (comparable to the val
+        loss), the additional terms, the number of windows and the loss over all steps of
+        the windows, the one optimized. Every term counts once, over all windows."""
+        windows = [self._window(item) for item in group]
+        count = sum(self._num_loss_terms(step, nodes)
+                    for chain, valid in windows for step, nodes in zip(chain, valid))
+        first_sum = torch.zeros((), device=self.device)
+        first_terms = torch.zeros((), device=self.device)
+        step_rollout = torch.zeros((), device=self.device)
+        step_extra = {name: torch.zeros((), device=self.device)
+                      for name in self.extra_loss_weights}
+        for chain, valid in windows:
+            loss_sum, first, terms, extra = self._window_loss(chain, valid)
+            loss = loss_sum / count
+            for name, value in extra.items():
+                loss = loss + self.extra_loss_weights[name] * value / len(windows)
+                step_extra[name] += value.detach() / len(windows)
+            loss.backward()
+            step_rollout += loss_sum.detach() / count
+            first_sum += first
+            first_terms += terms
+        windows_count = sum(chain[-1].num_graphs for chain, _ in windows)
+        return first_sum / first_terms.clamp(min=1), step_extra, windows_count, step_rollout
+
+    def _window(self, item) -> Tuple[List, List[Optional[torch.Tensor]]]:
+        """The batches of the windows of a micro-batch on the device, oldest first, and the
+        nodes of each that count in the loss (None: all): a window shorter than the chain
+        is padded with repeated samples, flagged by ``has_predecessor`` of the step after.
+        Depths without a sample of any window are left out, decided on the CPU before the
+        transfer."""
+        batch, prev_batches = item
+        chain = [batch]
+        for prev_batch in prev_batches:
+            if not bool(chain[-1].has_predecessor.any()):
+                break
+            chain.append(prev_batch)
+        chain = [step.to(self.device) for step in reversed(chain)]
+        return chain, [newer.has_predecessor for newer in chain[1:]] + [None]
+
+    def _window_loss(self, chain: List, valid: List[Optional[torch.Tensor]]
+                     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                                Dict[str, torch.Tensor]]:
+        """Roll the model out over a window (``_window``). The first step of every window
+        starts from the ground truth, with the noise; every further step from the
+        prediction of the step before, written into its ``*_prev`` inputs with the
+        positions and all edges moved along, as in the rollout, without cutting the
+        gradient. Returns the loss summed over all steps, the loss and the number of terms
+        of the steps from the ground truth, and the additional terms, means over the
+        steps."""
+        cfg = self.config
+        loss_sum = torch.zeros((), device=self.device)
+        first_sum = torch.zeros((), device=self.device)
+        first_terms = torch.zeros((), device=self.device)
+        extra = {name: torch.zeros((), device=self.device) for name in self.extra_loss_weights}
+        prediction = offset = None
+        for k, (step, nodes) in enumerate(zip(chain, valid)):
+            # The samples whose window starts at this step: inputs from the ground truth.
+            starts = ~step.has_predecessor if nodes is None else nodes & ~step.has_predecessor
+            delta = None
+            if prediction is not None:
+                rows = step.has_predecessor & step.loss_mask
+                delta = self._write_prediction(
+                    step, self.normalizer.denormalize(prediction, "target"), rows, offset)
+            if cfg.world_noise_std > 0:
+                noise = self._window_start_noise(step, starts)
+                delta = noise if delta is None else delta + noise
+            if delta is not None:   # one contact search for fed and noisy nodes
+                displace_nodes(step, delta, self.normalizer, self.contact_radius)
+            else:
+                self._with_world_edges(step)
+            if cfg.stress_noise_std > 0 and self.stress_prev_column is not None:
+                self._apply_stress_noise(step, starts)
+            offset = delta
+            if k < len(chain) - 1:   # activations recomputed in the backward pass
+                prediction = checkpoint(self.model, step, use_reentrant=False)
+            else:
+                prediction = self.model(step)
+            loss_sum = loss_sum + self._loss_sum(step, prediction, nodes)
+            first_sum = first_sum + self._loss_sum(step, prediction.detach(), starts)
+            first_terms = first_terms + self._num_loss_terms(step, starts)
+            for name, value in self._extra_losses(step, prediction, nodes).items():
+                extra[name] = extra[name] + value / len(chain)
+        return loss_sum, first_sum, first_terms, extra
 
     def _train_batch(self, item, epoch: int):
         """A micro-batch of the train loader on the device, with scheduled sampling,
         noise and world edges."""
-        prev_batch = None
-        if isinstance(item, (tuple, list)):          # (sample, predecessor) pairs
-            item, prev_batch = item
-            prev_batch = prev_batch.to(self.device)
+        prev_batches = None
+        if isinstance(item, (tuple, list)):          # (sample, [predecessors])
+            item, prev_batches = item
+            prev_batches = [prev_batch.to(self.device) for prev_batch in prev_batches]
         batch = item.to(self.device)
-        if prev_batch is not None and epoch > 0:
-            batch = self._apply_scheduled_sampling(batch, prev_batch, epoch)
+        if prev_batches and epoch > 0:
+            batch = self._apply_scheduled_sampling(batch, prev_batches, epoch)
         if self.config.world_noise_std > 0:   # also builds the world edges
             batch = self._apply_position_noise(batch)
         else:
@@ -687,11 +959,20 @@ class Trainer:
         finally:
             self.model.train(was_training)
         position_rmse = summary["position_rmse_per_step"]
-        return {
+        metrics = {
             "rollout_mse": summary["mean_mse_normalized"],
             "rollout_pos_rmse": float(np.mean(position_rmse)),
             "rollout_pos_rmse_final": float(position_rmse[-1]),
         }
+        # Recorded, no selection criteria: stretching of the predicted mesh, and the end
+        # state of the free rigid bodies.
+        if summary.get("edge_length_rmse_per_step"):
+            metrics["rollout_edge_rmse"] = float(np.mean(summary["edge_length_rmse_per_step"]))
+        for name, key in (("rigid_body_position_rmse", "rollout_body_pos_rmse_final"),
+                          ("rigid_body_velocity_rmse", "rollout_body_vel_rmse_final")):
+            if summary.get(f"{name}_per_step"):
+                metrics[key] = float(summary[f"{name}_per_step"][-1])
+        return metrics
 
     def _rollout_metrics(self, epoch: int) -> Optional[Dict[str, float]]:
         """Val rollout metrics if a rollout validation is due after ``epoch``:
@@ -804,6 +1085,10 @@ class Trainer:
                 "is_best": is_best,
                 "peak_memory": {**peak_memory(self.device), "machine": machine},
             }
+            record.update({f"train_{name}_loss": value
+                           for name, value in self.last_extra_losses.items()})
+            if self.last_rollout_loss is not None:
+                record["train_rollout_loss"] = self.last_rollout_loss
             if rollout_metrics is not None:
                 record.update({f"val_{key}": value for key, value in rollout_metrics.items()})
             if train_loss_clean is not None:
@@ -872,10 +1157,19 @@ class Trainer:
         stress_noise = cfg.stress_noise_std if self.stress_prev_column is not None else 0.0
         logger.info(f"Noise: position {cfg.world_noise_std} "
                     f"{self.metadata.get('length_unit', SI_LENGTH)}, stress_prev {stress_noise}")
+        if self.extra_loss_weights:
+            logger.info("Additional loss terms: " + ", ".join(
+                f"{name} x {weight}" for name, weight in self.extra_loss_weights.items()))
         if cfg.scheduled_sampling:
+            steps = (f", rolled out over {cfg.scheduled_sampling_steps} steps"
+                     if cfg.scheduled_sampling_steps > 1 else "")
             logger.info(f"Scheduled sampling: teacher forcing {cfg.scheduled_sampling_start_ratio}"
                         f" -> {cfg.scheduled_sampling_end_ratio} over "
-                        f"{cfg.scheduled_sampling_warmup_epochs} epochs")
+                        f"{cfg.scheduled_sampling_warmup_epochs} epochs{steps}")
+        if cfg.rollout_training:
+            logger.info(f"Rollout training: windows of up to {cfg.rollout_training_steps} "
+                        "steps on the model's own predictions, the loss on every step, the "
+                        "gradients through the window (activations recomputed per step)")
         selection = self.selection
         when = (f"every {cfg.rollout_validation_every} epoch(s) with a val rollout"
                 if self.rollout_runner else "every epoch")
@@ -894,6 +1188,10 @@ class Trainer:
                    epoch_durations: List[float], start_time: float) -> None:
         message = (f"Epoch {epoch + 1:4d}/{self.config.epochs} | "
                    f"train {record['train_loss']:.4f} | val {record['val_loss']:.4f}")
+        for name in self.last_extra_losses:
+            message += f" | {name} {record[f'train_{name}_loss']:.4f}"
+        if "train_rollout_loss" in record:
+            message += f" | train over the windows {record['train_rollout_loss']:.4f}"
         if record.get("train_loss_clean") is not None:
             message += (f" | train (no noise) {record['train_loss_clean']:.4f}, "
                         f"gap x{record['gap_ratio']:.2f}")
@@ -901,6 +1199,11 @@ class Trainer:
             message += (f" | rollout mse {rollout_metrics['rollout_mse']:.4f}, "
                         f"pos rmse {rollout_metrics['rollout_pos_rmse']:.4f} "
                         f"(final {rollout_metrics['rollout_pos_rmse_final']:.4f})")
+            if "rollout_edge_rmse" in rollout_metrics:
+                message += f", edge rmse {rollout_metrics['rollout_edge_rmse']:.2e}"
+            if "rollout_body_pos_rmse_final" in rollout_metrics:
+                message += (f", rigid body final {rollout_metrics['rollout_body_pos_rmse_final']:.4f}"
+                            f" / {rollout_metrics['rollout_body_vel_rmse_final']:.2e} per step")
         message += f" | lr {record['learning_rate']:.2e}"
         if record["is_best"]:
             message += " | * best"
@@ -991,8 +1294,8 @@ class Trainer:
         """Single-step test metrics on the nodes in ``loss_mask``.
 
         Normalized MSE/MAE over all targets, plus RMSE/MAE per target field in SI
-        (velocity in m per selected frame, stress in Pa; other result fields in the
-        units of the data, ``utils.units``). The errors are summed per batch
+        (velocity in m per selected frame, the stresses in Pa; other result fields in
+        the units of the data, ``utils.units``). The errors are summed per batch
         (float64), so memory does not grow with the split.
         """
         self.model.eval()
@@ -1011,8 +1314,8 @@ class Trainer:
             rows += given.sum(0).double().cpu()
         squared, absolute, raw_squared, raw_absolute = sums / rows.clamp_min(1)
         length, stress = si_factors(self.metadata)
-        si = [length if name in VELOCITY_TARGET_NAMES else stress if name == "stress" else 1.0
-              for name in self.target_names]
+        si = [length if name in VELOCITY_TARGET_NAMES else stress if name in STRESS_FIELDS
+              else 1.0 for name in self.target_names]
         return {
             "mse_normalized": squared.mean().item(),
             "mae_normalized": absolute.mean().item(),

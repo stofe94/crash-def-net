@@ -5,31 +5,18 @@ that training, rollout and every evaluation tool read. It reads these raw format
 
 | Raw format | Status | Guide |
 |---|---|---|
-| DeepMind TFRecord (default) | standard: the `deforming_plate` benchmark | this page |
-| OpenRadioss runs (`d3plot` converted from the animation files, with starter deck) | early stage, verified on a real crash example, a [bumper beam against a pole](../results/bumper-beam.md) | [OpenRadioss runs](openradioss.md) |
+| OpenRadioss runs (`d3plot` converted from the animation files, with starter deck) | early stage, verified on a real crash example, a [bumper beam against a pole](../results/bumper-beam-doe.md) | [OpenRadioss runs](openradioss.md) |
 | LS-DYNA runs (`d3plot` with keyword deck) | early stage, checked on runs converted from `deforming_plate` | [LS-DYNA runs](ls-dyna.md) |
 | VTK time series (`.vtu`, `.vtp`, `.vtk`) | early stage, checked on runs converted from `deforming_plate` | [VTK time series](vtk.md) |
+| DeepMind TFRecord (default) | standard: the `deforming_plate` benchmark | [export the benchmark](#export-the-benchmark) |
 
-The TFRecord is the format of the benchmark and of the comparison with the papers. The
-d3plot and VTK readers take general meshes, parts, rigid bodies and boundary conditions
-([general meshes](../concepts/graphs.md#general-meshes-and-run-parameters)). What the
-dataset contains and how a graph is built from it: [data and graphs](../concepts/graphs.md).
-
-## Export the benchmark
-
-Needs `meta.json` and `test.tfrecord` of DeepMind's `deforming_plate` in
-`datasets/deforming_plate/raw_dataset/` ([installation](../getting-started/installation.md#raw-data)).
-
-```bash
-python -m dataset_preprocessor.export                 # small test set, ~3 s
-python -m dataset_preprocessor.export --help          # all options
-```
-
-Without options the exporter writes the small dataset of the quick start: 8 / 2 / 2
-trajectories of `test.tfrecord`, 40 frames each at stride 10, into
-`data/deforming_plate_s10_small/`. Relative paths are resolved against the repository
-root, so the working directory does not matter. Every option:
-[command line reference](../reference/cli.md#export).
+Crash runs (d3plot, VTK) are best defined in a config file, which names their parts, roles
+and features; the readers take general meshes, parts, rigid bodies and boundary conditions
+([general meshes](../concepts/graphs.md#general-meshes-and-run-parameters)). Without a config
+and without options the exporter writes the small `deforming_plate` dataset of the quick
+start, the benchmark on which CrashDefNet was built up
+([export the benchmark](#export-the-benchmark)). What the dataset contains and how a graph is
+built from it: [data and graphs](../concepts/graphs.md).
 
 The output folder (`--out-dir`, the `[data] data_dir` of a training config) holds:
 
@@ -41,40 +28,8 @@ The output folder (`--out-dir`, the `[data] data_dir` of a training config) hold
 
 Their contents: [file formats](../reference/file-formats.md#dataset-folder).
 
-## Choose trajectories and frames
-
-A trajectory is one simulation run: one geometry with its own mesh, followed over the
-load case. The splits hold whole trajectories, so val and test geometries are never
-seen in training. If two splits would hold the same run, by its path or by its content,
-the export stops.
-
-- **One source** (default `--sources test.tfrecord`, 100 trajectories): the
-  splits are disjoint, contiguous ranges, `--n-train` first, then `--n-val` and
-  `--n-test`.
-- **DeepMind's original splits:** three names, one per split,
-  `--sources train.tfrecord valid.tfrecord test.tfrecord`; each split takes its
-  trajectories from its own file (`train.tfrecord`: 1,200 trajectories).
-- **Random selection:** `--select-seed 42` draws the trajectories of each split at
-  random instead of taking the first ones; `metadata.json` lists the drawn ones
-  (`splits.<split>.indices`).
-- **Frames:** `--num-steps` frames per trajectory, `--time-stride` raw frames apart
-  (paper: every frame), always from the first frame of the run on. A trajectory gives
-  `num_steps - 1` training samples, one per pair of consecutive frames, also with
-  `--history 1`; a training can use a part of them
-  ([choose the frames](training.md#choose-the-frames)).
-
-### Dataset variants
-
-| Folder | Command options | Size | Used for |
-|---|---|---|---|
-| `deforming_plate_s10_small` | (defaults) 8/2/2 traj., 40 frames, stride 10 | ~11 MB | quick start ([`examples/quick_start/`](https://github.com/stofe94/crash-def-net/tree/main/examples/quick_start)) |
-| `deforming_plate_s4` | `--n-train 80 --n-val 10 --n-test 10 --num-steps 100 --time-stride 4` | ~225 MB | all 100 trajectories of `test.tfrecord` |
-| `deforming_plate_s4_t150` | `--sources train.tfrecord valid.tfrecord test.tfrecord --select-seed 42 --n-train 100 --n-val 30 --n-test 20 --num-steps 100 --time-stride 4` | ~330 MB | DeepMind's original splits, trajectories drawn at random: [comparison protocol](../guides/comparison-protocol.md), [results](../results/deforming-plate.md) |
-| as in the paper | `--num-steps 400 --time-stride 1` | ~0.85 GB (100 traj.) | paper setting |
-
-A dataset exported with `--history 1` also gives the model the previous velocity and
-stress as inputs ([optional history](../concepts/graphs.md#optional-history-history-1-not-in-the-paper));
-`residual_target`, scheduled sampling and stress noise need it.
+Relative paths are resolved against the repository root, so the working directory does not
+matter. Every option: [command line reference](../reference/cli.md#export).
 
 ## Define the dataset in a config file
 
@@ -117,11 +72,13 @@ stress = "GPa"
 [contact]
 radius = 30
 # pairs = [["beam_*", "beam_*"], ["beam_*", "barrier"]]
+# gap  = true                  # contact gap on the world edges (--contact-gap)
 
 [features]
 local   = ["thickness"]        # static node features
 global  = ["impact_velocity"]  # run parameters, one input per graph
 targets = ["plastic_strain"]   # result fields besides the von Mises stress
+# edges = ["thickness", "yield_stress"]   # element properties on the mesh edges
 ```
 
 | Role | Meaning | Motion in training and rollout |
@@ -154,6 +111,33 @@ A training then chooses among these features
 ([choose the features](training.md#choose-the-features)). Every key:
 [configuration reference](../reference/configuration.md#export-config).
 
+## Choose trajectories and frames
+
+A trajectory is one simulation run: one geometry with its own mesh, followed over the
+load case. The splits hold whole trajectories, so val and test geometries are never
+seen in training. If two splits would hold the same run, by its path or by its content,
+the export stops.
+
+- **One source** (a folder of runs, or the default `test.tfrecord` with 100 trajectories):
+  the splits are disjoint, contiguous ranges, `--n-train` first, then `--n-val` and
+  `--n-test`.
+- **One source per split:** three names, e.g. the folders `TRAIN VAL TEST` of a design of
+  experiments or DeepMind's original splits `train.tfrecord valid.tfrecord test.tfrecord`;
+  each split takes its trajectories from its own source (`train.tfrecord`: 1,200
+  trajectories).
+- **Random selection:** `--select-seed 42` draws the trajectories of each split at
+  random instead of taking the first ones; `metadata.json` lists the drawn ones
+  (`splits.<split>.indices`).
+- **Frames:** `--num-steps` frames per trajectory, `--time-stride` raw frames apart
+  (MeshGraphNets and MGN-T on `deforming_plate`: every frame), always from the first frame
+  of the run on. A trajectory gives `num_steps - 1` training samples, one per pair of
+  consecutive frames, also with `--history 1`; a training can use a part of them
+  ([choose the frames](training.md#choose-the-frames)).
+
+A dataset exported with `--history 1` also gives the model the previous velocity and result
+fields as inputs ([optional history](../concepts/graphs.md#optional-history-history-1));
+`residual_target`, scheduled sampling, rollout training and stress noise need it.
+
 ## Units
 
 The exporter keeps the values of the raw data in their units: `deforming_plate` is in
@@ -164,14 +148,15 @@ records them as `length_unit` / `stress_unit` when they are not m and Pa.
 - **In the units of the data:** the stored values, the model inputs and targets, the
   contact radius (`--contact-radius`), the position noise of the training
   (`world_noise_std`) and the `.vtu` files of a rollout. Choose the noise for the motion
-  per frame of the data: the paper value 3e-3 m is too large for a crash run whose nodes
-  move a few mm per frame.
+  per frame of the data: the value of the MeshGraphNets paper, 3e-3 m, is too large for a
+  crash run whose nodes move a few mm per frame.
 - **In SI:** the metrics of the rollout and of the test evaluation (positions and
-  velocities in m, the stress in Pa), so that they read alike for every dataset. Other
+  velocities in m, the stresses in Pa: the von Mises stress and the result fields
+  `mean_stress` and `bending_stress`), so that they read alike for every dataset. Other
   result fields, e.g. the plastic strain, keep the units of the data.
 - **Shown** in the logs, the reports of [evaluation and data exploration](evaluation.md)
   and the animation: lengths in mm, the stress in kPa for data in Pa or kPa, as in the
-  paper tables, else in the unit of the data, e.g. MPa.
+  tables of the MGN-T paper, else in the unit of the data, e.g. MPa.
 
 ## Large and interrupted exports
 
@@ -194,6 +179,29 @@ on the number of runs nor on their length (~0.5 GB for `deforming_plate`).
 
 How the data layout scales to crash datasets of a few hundred GB:
 [scaling](../concepts/scaling.md).
+
+## Export the benchmark
+
+Needs `meta.json` and `test.tfrecord` of DeepMind's `deforming_plate` in
+`datasets/deforming_plate/raw_dataset/` ([installation](../getting-started/installation.md#raw-data)).
+
+```bash
+python -m dataset_preprocessor.export                 # small test set, ~3 s
+python -m dataset_preprocessor.export --help          # all options
+```
+
+Without options the exporter writes the small dataset of the quick start: 8 / 2 / 2
+trajectories of `test.tfrecord`, 40 frames each at stride 10, into
+`data/deforming_plate_s10_small/`.
+
+### Dataset variants
+
+| Folder | Command options | Size | Used for |
+|---|---|---|---|
+| `deforming_plate_s10_small` | (defaults) 8/2/2 traj., 40 frames, stride 10 | ~11 MB | quick start ([`examples/quick_start/`](https://github.com/stofe94/crash-def-net/tree/main/examples/quick_start)) |
+| `deforming_plate_s4` | `--n-train 80 --n-val 10 --n-test 10 --num-steps 100 --time-stride 4` | ~225 MB | all 100 trajectories of `test.tfrecord` |
+| `deforming_plate_s4_t150` | `--sources train.tfrecord valid.tfrecord test.tfrecord --select-seed 42 --n-train 100 --n-val 30 --n-test 20 --num-steps 100 --time-stride 4` | ~330 MB | DeepMind's original splits, trajectories drawn at random: [comparison protocol](../guides/comparison-protocol.md), [results](../results/deforming-plate.md) |
+| as in MeshGraphNets and MGN-T | `--num-steps 400 --time-stride 1` | ~0.85 GB (100 traj.) | their setting on `deforming_plate` |
 
 ## Next steps
 

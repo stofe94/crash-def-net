@@ -115,6 +115,10 @@ world_noise_std = 3e-3   # paper: 3e-3 m on the positions of the free nodes
 [scheduled_sampling]
 enabled = false          # needs --history 1; not in the paper
 
+[rollout_training]
+enabled = false          # needs --history 1; instead of scheduled sampling; not in the paper
+steps   = 4              # steps per window: the first from the ground truth, the rest predicted
+
 [checkpointing]
 checkpoint_dir = "checkpoints/example_run"
 save_every     = 5       # checkpoint_epoch_N.pt every N epochs (best_model.pt always)

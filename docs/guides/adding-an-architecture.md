@@ -2,8 +2,8 @@
 
 CrashDefNet is built so that a new model architecture can be tested quickly: the model
 plugs into the existing pipeline, and data, training, rollout, metrics and the
-comparison with the paper work unchanged. MGN-T was added this way. It needs four small
-steps.
+comparison with published results work unchanged. MGN-T was added this way. It needs four
+small steps.
 
 This holds for architectures that take the graph of the pipeline and predict the targets
 per node. Depending on how an architecture is built, other inputs, graph structures,
@@ -38,7 +38,7 @@ know the feature layout. `data` is a (batched) PyTorch Geometric graph with
 | `world_edge_index`, `world_edge_attr` | (2, E_W), (E_W, world_edge_in_dim) | contact edges in the variant of `[model] world_edges`; may be empty |
 | `mesh_pos` | (N, 3) | undeformed positions (e.g. for positional encodings) |
 | `world_pos` | (N, 3) | current positions, raw units |
-| `batch` | (N,) | graph index of each node; missing for a single graph (e.g. in the rollout) |
+| `batch` | (N,) | graph index of each node; may be missing for a single graph |
 | `u` | (B, global_in_dim) | normalized run parameters, one row per graph; only for datasets with run parameters |
 
 For a dataset with run parameters `create_model` also passes `global_in_dim`; a model
@@ -52,7 +52,7 @@ can be reused, e.g. `make_mlp` and `GraphNetBlock` from `models/meshgraphnets.py
 
 - Add the name to `ARCHITECTURES`.
 - Add a field per hyperparameter to `TrainingConfig`, prefixed with the name, with a
-  default (the paper value where there is one) and a description, e.g.
+  default (the published value where there is one) and a description, e.g.
   `my_model_latent_size: int = setting(64, "width of the latents")`.
 - Map the TOML keys onto the fields in `TOML_KEYS`, e.g.
   `"model.my_model.latent_size": "my_model_latent_size"`.
@@ -100,6 +100,7 @@ python train/train.py --config configs/my_model.toml --epochs 1
 The full comparison with MeshGraphNets follows the
 [steps of the comparison protocol](../guides/comparison-protocol.md#steps).
 
-Everything else applies to the new model automatically: position noise, rollout
-validation and model selection, early stopping, the optional residual target, the
-rollout metrics and the `.vtu` export.
+Everything else applies to the new model automatically: position noise, scheduled
+sampling and rollout training, the additional loss terms, rollout validation and model
+selection, early stopping, the optional residual target, the rollout metrics and the
+`.vtu` export.

@@ -6,7 +6,7 @@ none of them overwrites an earlier evaluation:
 | Tool | Question it answers |
 |---|---|
 | `utils/evaluate_run.py` | How did this one run train, and how does it do over the test geometries? |
-| `utils/compare_paper.py` | How do the rollouts compare with the published values of the papers? |
+| `utils/compare_paper.py` | How do the rollouts compare with the published values of MeshGraphNets and MGN-T? |
 | `utils/check_protocol.py` | Were two runs trained under the comparison protocol, and which one is better per trajectory? |
 
 The metrics they report: [rollout and metrics](../concepts/metrics.md).
@@ -18,9 +18,9 @@ python utils/evaluate_run.py rollouts/<rollout>     # the rollout and its traini
 python utils/evaluate_run.py checkpoints/<run>      # without a rollout: test_metrics.json
 ```
 
-Evaluates one run on its own, without the paper: the training, the single-step test
-errors and the rollout with its spread over the trajectories. A rollout can also start the
-evaluation itself ([rollout in a config file](rollout.md#define-a-rollout-in-a-config-file)).
+Evaluates one run on its own, without published results: the training,
+the single-step test errors and the rollout with its spread over the trajectories. A rollout
+can also start the evaluation itself ([rollout in a config file](rollout.md#define-a-rollout-in-a-config-file)).
 Writes a new folder `evaluations/<YYYYMMDD_HHMMSS>_<run>_evaluation/`, or into the new or
 empty folder given with `--output-dir`:
 
@@ -38,7 +38,7 @@ pooled error against the median and trajectories far above it, error growth, err
 relative to the displacement. A checkpoint folder alone uses `test_metrics.json`
 (rollout metrics per trajectory, no curves per step).
 
-## Compare with the papers
+## Compare with published results
 
 ```bash
 python utils/compare_paper.py                      # every finished rollout in rollouts/
@@ -52,17 +52,17 @@ a new folder `evaluations/<YYYYMMDD_HHMMSS>_paper_comparison/`:
 
 | File | Content |
 |---|---|
-| `01_absolute_errors.png` | RMSE-1 and RMSE-all of position and stress next to the paper |
+| `01_absolute_errors.png` | RMSE-1 and RMSE-all of position and stress next to the papers |
 | `02_relative_errors.png` | R-RMSE of position and stress |
 | `03_error_per_step.png` | error over the raw frames of the run, from the first predicted frame on (grey: before it) |
 | `04_error_per_trajectory.png` | RMSE-all over the trajectories of every rollout: all pooled, median, best and worst trajectory; paper mean as reference line |
-| `05_table_metrics.png`, `05b_table_compact.png`, `06_table_conditions.png` | tables as images: all metrics, summary with the multiple of the paper, conditions of each run |
+| `05_table_metrics.png`, `05b_table_compact.png`, `06_table_conditions.png` | tables as images: all metrics, summary with the multiple of the paper values, conditions of each run |
 | `comparison.md`, `metrics.csv`, `metrics.json` | report with all tables and figures, raw values |
 
 Rollouts that are still running are listed but not evaluated. `--exclude` adds rows
-without the given trajectories (e.g. an outlier), pooled like the paper. The rows with
+without the given trajectories (e.g. an outlier), pooled like the other rows. The rows with
 all trajectories always remain. The numbers of a small run are not comparable with the
-papers ([why](../results/deforming-plate.md#why-the-numbers-are-not-comparable-with-the-paper)).
+papers ([why](../results/deforming-plate.md#why-the-numbers-are-not-comparable-with-the-papers)).
 
 ## Check the comparison protocol
 

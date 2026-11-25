@@ -39,23 +39,25 @@ identical.
 | | MGN-T |
 |---|---|
 | Architecture | as arXiv v4, 0.51 M parameters ([configuration](deforming-plate.md#mgn-t-configuration)); transformer over the structure, without the pole (`transformer_nodes = "structure"`) |
-| Contact edges | between bodies and for self-contact (`self_contact_aware`), radius 30 mm |
-| Inputs per node | node type, prescribed velocity, previous velocity and stress, shell thickness from the starter deck, with markers for nodes without stress or thickness |
-| Targets | change of velocity and stress from one state to the next (`residual_target`) |
+| Contact edges | between bodies and for self-contact (`self_contact_aware`), radius 30 mm; each with the distance from the shell surface of the sender and the clearance between the shell surfaces ([contact gap](../concepts/graphs.md#general-meshes-and-run-parameters)) |
+| Inputs per node | node type, prescribed velocity, previous velocity and result fields, shell thickness and yield stress from the starter deck, distance to the [cylinder of the deck](../guides/openradioss.md#a-pole-as-contact-partner) and its normal, with markers for nodes without a result field, thickness or yield stress |
+| Inputs per mesh edge | besides the geometry, thickness and yield stress of the elements next to the edge |
+| Targets | change of velocity, von Mises stress, plastic strain, membrane mean stress and bending stress from one state to the next (`residual_target`) |
+| Loss | MSE of the targets, plus the length change of the mesh edges in a step and the velocity of the rigid body, each against the simulation, with weight 1 ([loss](../concepts/training.md#loss-and-optimizer-step)) |
 | Frames | training and rollout from 10 ms (`[data] start_frame = 1`) |
-| Training | 80 epochs, batch 4, learning rate 2.8 · 10⁻⁴ to 10⁻⁶ (cosine), noise 0.3 mm and 10 MPa, scheduled sampling, seed 42; **3 h 18 min** |
-| Hardware | 1× NVIDIA RTX A4000 (16 GB); GPU 7.3 GB, RAM 4.6 GB in the main process |
-| Model selection | rollout MSE on the 14 validation runs, every 4 epochs; epoch 40 |
+| Training | 80 epochs, batch 4, learning rate 2.8 · 10⁻⁴ to 10⁻⁶ (cosine), noise 0.3 mm and 10 MPa, scheduled sampling, seed 42; **3 h 20 min** |
+| Hardware | 1× NVIDIA RTX A4000 (16 GB); GPU 7.3 GB, RAM 5.5 GB in the main process |
+| Model selection | rollouts of the 14 validation runs every 4 epochs, by the position error over the rollout and at its last step; epoch 80, the last (early stopping from epoch 41 on, not triggered) |
 | Rollout | 9 autoregressive steps from 10 to 100 ms, 7 test runs |
 
 The training data leave out the first frame on purpose: the step from the undeformed state to
 the first deformed state, in which the beam hits the pole, is too large to be resolved with the
 current physical modelling.
 
-With scheduled sampling a growing share of the nodes takes its previous velocity and stress
-from the model's own prediction of the step before, as in the rollout, instead of from the
-simulation: from none of the nodes at the start to 70 % after 40 of the 80 epochs
-([training](../concepts/training.md#loss-and-optimizer-step)).
+With scheduled sampling a growing share of the nodes takes its previous velocity and result
+fields from the model's own prediction of the step before, as in the rollout, instead of from
+the simulation: from none of the nodes at the start to 70 % after 40 of the 80 epochs
+([training](../concepts/training.md#one-step-training)).
 
 ## Results
 
@@ -63,13 +65,13 @@ Test split, 7 runs ([metrics](../concepts/metrics.md#rollout-metrics)):
 
 | Metric | All (pooled) | Median | Best | Worst |
 |---|---|---|---|---|
-| Position RMSE-1 [mm] | 0.876 ± 0.064 | 0.850 | 0.627 | 1.07 |
-| Position RMSE-all [mm] | **6.19 ± 0.47** | 6.25 | 3.87 | 7.29 |
-| Position error / displacement [%] | 10.0 | 9.78 | 6.75 | 12.8 |
-| Position rel. L2 [×10⁻³] | 16.1 | 16.6 | 10.7 | 19.3 |
-| Stress RMSE-1 [MPa] | 33.7 ± 1.2 | 34.2 | 27.6 | 38.1 |
-| Stress RMSE-all [MPa] | 70.8 ± 2.3 | 69.5 | 63.6 | 80.2 |
-| Stress R-RMSE-all [%] | **8.55 ± 0.27** | 8.34 | 7.74 | 9.51 |
+| Position RMSE-1 [mm] | 0.784 ± 0.056 | 0.830 | 0.535 | 0.945 |
+| Position RMSE-all [mm] | **4.80 ± 0.74** | 3.92 | 2.71 | 8.38 |
+| Position error / displacement [%] | 7.76 | 6.43 | 4.16 | 14.8 |
+| Position rel. L2 [×10⁻³] | 11.9 | 11.0 | 7.67 | 20.8 |
+| Stress RMSE-1 [MPa] | 29.8 ± 0.7 | 29.3 | 27.5 | 33.0 |
+| Stress RMSE-all [MPa] | 63.2 ± 4.6 | 59.3 | 51.7 | 89.0 |
+| Stress R-RMSE-all [%] | **7.60 ± 0.53** | 7.16 | 6.28 | 10.5 |
 
 Position error / displacement: the position error as a share of the displacement of the
 ground truth since the initial state
@@ -85,9 +87,9 @@ ground truth; grey: before the first prediction.*
 ## Discussion
 
 Over the whole impact the model carries the deformation on its own predictions: the position
-error stays at about a tenth of the displacement in every test run, and the stress error at
-8 to 10 % of the largest stress of the run, with little spread between the runs. The surface of
-the structure stays smooth over the whole impact, close to the simulation. The results show
+error stays at 4 to 15 % of the displacement in the test runs, 6 % in the median run, and the
+stress error at 6 to 11 % of the largest stress of the run. The surface of the structure stays
+smooth over the whole impact, close to the simulation. The results show
 that the chain from OpenRadioss runs to the trained model works on a real crash example; the
 processing of such data is at an early stage of development
 ([verification status](../concepts/graphs.md#general-meshes-and-run-parameters)).
@@ -95,4 +97,5 @@ processing of such data is at an early stage of development
 A scientific evaluation of the results is planned for later releases of CrashDefNet and will be
 published separately, as a paper or in another form.
 
-Rolled out with release v1.0.0. How to run it: [tutorial](../getting-started/bumper-beam.md).
+Trained and rolled out with the development state of v1.1.0. How to run it:
+[tutorial](../getting-started/bumper-beam.md).

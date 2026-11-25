@@ -26,7 +26,7 @@ n_val       = 14
 n_test      = 7
 num_steps   = 11      # every state: 0 to 100 ms at 10 ms
 time_stride = 1
-history     = 1       # previous velocity and stress as inputs: the motion comes from inertia
+history     = 1       # previous velocity and result fields as inputs: the motion comes from inertia
 
 [units]               # of the decks: kg, mm, ms
 length = "mm"
@@ -43,7 +43,10 @@ stress = "GPa"
 
 [contact]
 radius         = 30       # mm
-use_deck_walls = false    # the pole acts through contact edges, not as wall features
+use_deck_walls = true     # the cylinder of the deck as node features, next to the contact edges to the meshed pole
+gap            = true     # on every contact edge: distance to the shell surface and clearance
 
 [features]
-local = ["thickness"]     # shell thickness from /PROP/SHELL of the starter deck
+local   = ["thickness", "yield_stress"]   # from the starter deck: /PROP/SHELL, /MAT/PLAS_JOHNS (a)
+targets = ["plastic_strain", "mean_stress", "bending_stress"]   # result fields after the von Mises stress
+edges   = ["thickness", "yield_stress"]   # of the elements next to every mesh edge

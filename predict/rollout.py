@@ -24,7 +24,10 @@ step to its own predictions:
    predicted directly and not fed back.
 
 Errors are measured on the nodes in ``loss_mask`` at every predicted frame, without
-targets a node does not have (``target_given``).
+targets a node does not have (``target_given``). Prediction data of ``predict/prepare.py``
+(new runs from their initial state, ``info.ground_truth = 0``) is rolled out the same way,
+but has nothing to compare with: the summary and the ``.vtu`` files hold the prediction
+only, and evaluation and animation are left out.
 
 Every call writes into a folder of its own and never overwrites an earlier
 rollout: ``rollouts/<YYYYMMDD_HHMMSS>_<training run>_<checkpoint>_<split>/``
@@ -41,10 +44,13 @@ rollout: ``rollouts/<YYYYMMDD_HHMMSS>_<training run>_<checkpoint>_<split>/``
   dataset predicts it, the stress; see ``_RolloutMetrics``) plus normalized MSE, RMSE/MAE per target field, position
   RMSE, the RMS displacement of the ground truth (its scale) and the relative L2
   position error (``position_rel_l2``: ||x_pred - x_true|| / ||x_true|| over the nodes
-  and their coordinates, as in Nabian et al., arXiv:2510.15201), each per step,
+  and their coordinates, as in Nabian et al., arXiv:2510.15201), the length error of the
+  mesh edges and, with free rigid bodies, their position and velocity errors
+  (``_structure_errors``), each per step,
   for every trajectory and as the mean over them. The metrics are in SI, whatever
   the units of the data (``utils.units``): positions and velocities in m, the
-  stress in Pa; other result fields in the units of the data;
+  stresses (``utils.units.STRESS_FIELDS``) in Pa; other result fields in the units of
+  the data;
 - ``rollout.log`` and optionally one ``.vtu`` per frame of the run under
   ``<split>/<trajectory>/`` (prediction, ground truth, error; needs pyvista)
   plus ``<trajectory>.vtu.series``, which ParaView opens as one time series. Each file
@@ -107,7 +113,7 @@ from dataset_preprocessor.graph_features import (  # noqa: E402
     select_metadata,
 )
 from utils.timezone import Formatter, from_timestamp, now  # noqa: E402
-from utils.units import SI_STRESS, stress_display  # noqa: E402
+from utils.units import SI_STRESS, STRESS_FIELDS, stress_display  # noqa: E402
 
 logger = logging.getLogger("rollout")
 
@@ -142,6 +148,11 @@ _NODES_OF_CELL_TYPE[list(CELL_NUM_NODES)] = list(CELL_NUM_NODES.values())
 # metadata.json keys that may differ without changing the samples: the machine
 # (raw_dir) and the storage format of dataset.db (db_format)
 _MACHINE_SPECIFIC_METADATA = {"raw_dir", "db_format"}
+# Which runs a dataset holds, not how they are read: prediction data differs in these from
+# the training data by nature (predict/prepare.py).
+_SELECTION_METADATA = {"dataset", "sources", "splits", "sample_counts", "num_steps",
+                       "select_seed", "export_config", "ground_truth", "frame_interval",
+                       "applicability"}
 
 
 class RolloutRunner:
@@ -254,6 +265,8 @@ class RolloutRunner:
 
         self.model.eval()
         self._target_names = dataset.target_feature_names
+        self._ground_truth = dataset.ground_truth
+        one_step = one_step and dataset.ground_truth
         prev_to_target = prev_to_target_columns(dataset.node_feature_names, self._target_names)
         all_metrics = _StepMetrics(self._target_names)
         rollout_metrics: List[_RolloutMetrics] = []
@@ -277,6 +290,13 @@ class RolloutRunner:
                    "frames": dataset.raw_frames[:initial + 1 + num_steps],
                    "rollout_metrics": _RolloutMetrics.aggregate(rollout_metrics),
                    **all_metrics.summary(), "sequences": sequence_results}
+        if not dataset.ground_truth:   # prediction data: nothing to compare with
+            summary = {key: summary[key] for key in ("split", "num_sequences",
+                                                     "target_feature_names", "initial_frame",
+                                                     "frames")}
+            summary.update(ground_truth=False, sequences={
+                sequence_id: {"num_predicted_steps": result["num_predicted_steps"]}
+                for sequence_id, result in sequence_results.items()})
         if self.output_dir is not None:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             summary_path = self.output_dir / f"{split}_rollout_summary.json"
@@ -323,12 +343,11 @@ class RolloutRunner:
         # The rollout metrics of the stress, if the dataset predicts it.
         stress = names.index("stress") if "stress" in names else None
         num_bodies = len(dataset.rigid_bodies)   # free rigid bodies per graph
-        # Errors in SI (utils.units): positions and velocities in m, the stress in Pa.
+        # Errors in SI (utils.units): positions and velocities in m, the stresses in Pa.
         length, stress_si = dataset.si_factors
-        si = torch.ones(len(names), device=self.device)
+        si = torch.tensor([stress_si if name in STRESS_FIELDS else 1.0 for name in names],
+                          device=self.device)
         si[VELOCITY_TARGET_COLUMNS] = length
-        if stress is not None:
-            si[stress] = stress_si
         num_graphs, num_steps = len(group), len(group[0][1])
         step_errors: List[torch.Tensor] = []   # (len(_step_rows(names)), graphs) per step
         totals = _RolloutSums(num_graphs, self.device)
@@ -412,11 +431,13 @@ class RolloutRunner:
             next_pos = pos + prediction[:, VELOCITY_TARGET_COLUMNS]
             true_next = true_pos + target[:, VELOCITY_TARGET_COLUMNS]
             totals.observe(true_next * length, None, data.batch)
-            step_errors.append(_step_errors((prediction - target) * si,
-                                            (next_pos - true_next) * length,
-                                            (true_next - start_pos) * length, true_next * length,
-                                            data.loss_mask, data.batch, num_graphs,
-                                            target_std * si, given))
+            step_errors.append(torch.cat((
+                _step_errors((prediction - target) * si, (next_pos - true_next) * length,
+                             (true_next - start_pos) * length, true_next * length,
+                             data.loss_mask, data.batch, num_graphs, target_std * si, given),
+                _structure_errors(next_pos * length, true_next * length,
+                                  (prediction - target)[:, VELOCITY_TARGET_COLUMNS] * length,
+                                  data, num_graphs, num_bodies > 0))))
             totals.add("q_all", (next_pos - true_next) * length, data.batch, sizes)
             if stress is not None:
                 totals.add("stress_all", (prediction - target)[:, stress] * stress_si,
@@ -491,10 +512,12 @@ class RolloutRunner:
         cell_array = np.hstack([nodes_per_cell[:, None], cells])[keep]
         mesh = pv.UnstructuredGrid(cell_array, cell_types, points)
 
+        truth = getattr(self, "_ground_truth", True)   # prediction data: the prediction only
         true_points = true_pos.cpu().numpy().astype("float32")
-        mesh.point_data["world_pos_gt"] = true_points
-        mesh.point_data["position_error"] = np.linalg.norm(
-            points.astype("float32") - true_points, axis=1)
+        if truth:
+            mesh.point_data["world_pos_gt"] = true_points
+            mesh.point_data["position_error"] = np.linalg.norm(
+                points.astype("float32") - true_points, axis=1)
         prediction, target = prediction.cpu().numpy(), target.cpu().numpy()
         given = getattr(sample, "target_given", None)
         if given is not None:   # no value: empty in the file, not a number that looks real
@@ -502,9 +525,10 @@ class RolloutRunner:
             target = np.where(given.numpy(), target, np.nan)
         for i, name in enumerate(self._target_names):
             mesh.point_data[f"{name}_pred"] = prediction[:, i].astype("float32")
-            mesh.point_data[f"{name}_gt"] = target[:, i].astype("float32")
-            mesh.point_data[f"{name}_error"] = np.abs(
-                prediction[:, i] - target[:, i]).astype("float32")
+            if truth:
+                mesh.point_data[f"{name}_gt"] = target[:, i].astype("float32")
+                mesh.point_data[f"{name}_error"] = np.abs(
+                    prediction[:, i] - target[:, i]).astype("float32")
 
         out = self.output_dir / split / str(sequence_id)
         out.mkdir(parents=True, exist_ok=True)
@@ -603,13 +627,42 @@ def _step_errors(error: torch.Tensor, position_error: torch.Tensor, displacement
     return torch.cat((mean[:1], mean[1:4].sqrt(), mean[4:4 + fields].sqrt(), mean[4 + fields:]))
 
 
+def _structure_errors(position: torch.Tensor, true_position: torch.Tensor,
+                      velocity_error: torch.Tensor, data, num_graphs: int,
+                      with_bodies: bool) -> torch.Tensor:
+    """Errors of one step per graph that concern the structure -> (3, graphs), rows as
+    at the end of ``_step_rows``: RMSE of the length of the mesh edges between nodes of
+    ``loss_mask`` (prediction against ground truth: stretching of the predicted mesh), and
+    RMSE of the position and of the velocity over the nodes of the free rigid bodies (NaN
+    without them)."""
+    i, j = data.edge_index
+    keep = ((i < j) & data.loss_mask[i] & data.loss_mask[j]).double()
+    stretch = ((position[j] - position[i]).double().norm(dim=1)
+               - (true_position[j] - true_position[i]).double().norm(dim=1))
+    edge_graph = data.batch[i]
+    edge = (_per_graph(stretch.pow(2) * keep, edge_graph, num_graphs)
+            / _per_graph(keep, edge_graph, num_graphs).clamp(min=1)).sqrt()
+    if not with_bodies:
+        nan = torch.full_like(edge, float("nan"))
+        return torch.stack((edge, nan, nan))
+    member = (data.rigid_body >= 0).double()
+    count = _per_graph(member, data.batch, num_graphs).clamp(min=1)
+    body = [(_per_graph((error.double().pow(2).sum(1) * member), data.batch, num_graphs)
+             / count).sqrt() for error in (position - true_position, velocity_error)]
+    return torch.stack((edge, *body))
+
+
+STRUCTURE_ROWS = ["edge_length_rmse", "rigid_body_position_rmse", "rigid_body_velocity_rmse"]
+
+
 def _step_rows(target_names: List[str]) -> List[str]:
-    """Rows of one step of one sequence (``_step_errors``): normalized MSE, position
-    RMSE, RMS displacement of the ground truth since the initial state, RMS of the
-    ground-truth positions, then RMSE and MAE per target field."""
+    """Rows of one step of one sequence (``_step_errors``, ``_structure_errors``):
+    normalized MSE, position RMSE, RMS displacement of the ground truth since the initial
+    state, RMS of the ground-truth positions, RMSE and MAE per target field, then the
+    errors of the structure (``STRUCTURE_ROWS``)."""
     return (["mse_normalized", "position_rmse", "displacement_rms", "position_rms"]
             + [f"rmse_{name}" for name in target_names]
-            + [f"mae_{name}" for name in target_names])
+            + [f"mae_{name}" for name in target_names] + STRUCTURE_ROWS)
 
 
 class _StepMetrics:
@@ -623,6 +676,7 @@ class _StepMetrics:
         self.position_rel_l2 = defaultdict(list)
         self.rmse = defaultdict(lambda: defaultdict(list))     # field -> step -> [...]
         self.mae = defaultdict(lambda: defaultdict(list))
+        self.structure = {name: defaultdict(list) for name in STRUCTURE_ROWS}
 
     def add(self, step: int, values) -> None:
         """The errors of one sequence at ``step``, in the order of ``_step_rows``."""
@@ -636,12 +690,18 @@ class _StepMetrics:
         for i, name in enumerate(self.target_names):
             self.rmse[name][step].append(float(values[4 + i]))
             self.mae[name][step].append(float(values[4 + fields + i]))
+        for i, name in enumerate(STRUCTURE_ROWS):
+            value = float(values[4 + 2 * fields + i])
+            if not math.isnan(value):
+                self.structure[name][step].append(value)
 
     def merge(self, other: "_StepMetrics") -> None:
         for mine, theirs in ((self.mse_normalized, other.mse_normalized),
                              (self.position_rmse, other.position_rmse),
                              (self.displacement_rms, other.displacement_rms),
-                             (self.position_rel_l2, other.position_rel_l2)):
+                             (self.position_rel_l2, other.position_rel_l2),
+                             *((self.structure[name], other.structure[name])
+                               for name in STRUCTURE_ROWS)):
             for step, values in theirs.items():
                 mine[step].extend(values)
         for mine, theirs in ((self.rmse, other.rmse), (self.mae, other.mae)):
@@ -676,6 +736,10 @@ class _StepMetrics:
             "rmse_per_field": {n: self._overall(s) for n, s in self.rmse.items()},
             "mae_per_field": {n: self._overall(s) for n, s in self.mae.items()},
             "rmse_per_field_per_step": {n: self._per_step(s) for n, s in self.rmse.items()},
+            # stretching of the predicted mesh (edge lengths against the ground truth) and,
+            # with free rigid bodies, their position and velocity errors (m, m per step)
+            **{f"{name}_per_step": self._per_step(steps)
+               for name, steps in self.structure.items() if steps},
         }
 
     def sequence_summary(self) -> Dict:
@@ -823,6 +887,13 @@ def format_rollout_metrics(metrics: Dict, stress_unit: str = SI_STRESS) -> List[
 
 
 def _log_summary(summary: Dict, vtu_dir: Optional[Path], stress_unit: str = SI_STRESS) -> None:
+    if summary.get("ground_truth") is False:
+        steps = len(summary["frames"]) - 1 - summary["frames"].index(summary["initial_frame"])
+        logger.info(f"Prediction of {summary['num_sequences']} run(s) over {steps} steps, "
+                    "without ground truth: no errors")
+        if vtu_dir is not None:
+            logger.info(f"  .vtu files: {vtu_dir}")
+        return
     logger.info(f"Rollout of {summary['num_sequences']} sequence(s):")
     logger.info("  rollout metrics (as defined in MGN-T v4, Tab. 3; ± = standard error over trajectories):")
     for line in format_rollout_metrics(summary["rollout_metrics"], stress_unit):
@@ -956,11 +1027,12 @@ def _rollout_info(args, trained, checkpoint: Path, data_dir: Path) -> Dict:
         data_metadata = json.load(f)
     selected = current_names(select_metadata(data_metadata, trained.config.features))
     training = current_names(trained.metadata)                           # as in the training
+    prediction = data_metadata.get("ground_truth") is False
+    ignored = _MACHINE_SPECIFIC_METADATA | (_SELECTION_METADATA if prediction else set())
     differences = {
         key: {"training": training.get(key), "rollout": selected.get(key)}
         for key in sorted(set(training) | set(selected))
-        if key not in _MACHINE_SPECIFIC_METADATA
-        and training.get(key) != selected.get(key)}
+        if key not in ignored and training.get(key) != selected.get(key)}
     return {
         "status": "running",
         "started": now().isoformat(timespec="seconds"),
@@ -990,6 +1062,9 @@ def _rollout_info(args, trained, checkpoint: Path, data_dir: Path) -> Dict:
             # Same export settings as the dataset the model was trained on?
             "matches_training_dataset": not differences,
             "differences_to_training_dataset": differences,
+            # prediction data: the check of predict/prepare.py against the training data
+            **({"ground_truth": False, "applicability": data_metadata.get("applicability")}
+               if prediction else {}),
         },
         "settings": {"device": str(trained.device), "export_vtu": args.export_vtu,
                      "one_step": args.one_step, "config_file": args.config,
@@ -1093,8 +1168,25 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _without_ground_truth(data_dir: Path) -> bool:
+    """Prediction data (``predict/prepare.py``): no ground truth after the initial state."""
+    path = data_dir / "metadata.json"
+    if not path.exists():
+        return False
+    with open(path, encoding="utf-8") as f:
+        return json.load(f).get("ground_truth") is False
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
+    if _without_ground_truth(Path(args.data_dir)):
+        for option in ("evaluate", "animate"):
+            if getattr(args, option):
+                logger.warning(f"--{option}: {args.data_dir} holds prediction data without "
+                               "ground truth (predict/prepare.py), so there is nothing to "
+                               "compare with — left out; open the .vtu series in ParaView")
+                setattr(args, option, False)
+        args.one_step = False   # nothing to compare with
 
     from train.trainer import describe_config_source, load_trained_model
 
@@ -1141,18 +1233,22 @@ def main(argv=None) -> int:
         info.update(status="failed", error=repr(error))
         raise
     else:
-        position_rmse = summary["position_rmse_per_step"]
-        info.update(status="finished", results={
-            "summary_file": f"{args.split}_rollout_summary.json",
-            "initial_frame": summary["initial_frame"],
-            "sequences": list(summary["sequences"]),
-            "rollout_metrics": summary["rollout_metrics"],
-            "mean_mse_normalized": summary["mean_mse_normalized"],
-            "mean_position_rmse": float(np.mean(position_rmse)) if position_rmse else None,
-            "final_position_rmse": position_rmse[-1] if position_rmse else None,
-            "position_rel_l2": summary["position_rel_l2"],
-            "rmse_per_field": summary["rmse_per_field"],
-        })
+        results = {"summary_file": f"{args.split}_rollout_summary.json",
+                   "initial_frame": summary["initial_frame"],
+                   "sequences": list(summary["sequences"])}
+        if summary.get("ground_truth") is False:
+            results["ground_truth"] = False
+        else:
+            position_rmse = summary["position_rmse_per_step"]
+            results.update({
+                "rollout_metrics": summary["rollout_metrics"],
+                "mean_mse_normalized": summary["mean_mse_normalized"],
+                "mean_position_rmse": float(np.mean(position_rmse)) if position_rmse else None,
+                "final_position_rmse": position_rmse[-1] if position_rmse else None,
+                "position_rel_l2": summary["position_rel_l2"],
+                "rmse_per_field": summary["rmse_per_field"],
+            })
+        info.update(status="finished", results=results)
     finally:
         info.update(finished=now().isoformat(timespec="seconds"),
                     duration_seconds=round(time.time() - start, 1))

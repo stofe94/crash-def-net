@@ -8,7 +8,7 @@ graph_features.py
     world edges), shared by export, dataset, training and rollout.
 dataset.py
     ``TrajectoryDataset`` over a compact ``dataset.db`` and the
-    predecessor pairs used for scheduled sampling.
+    predecessor chains used for scheduled sampling and rollout training.
 export.py
     CLI: TFRecord -> ``dataset.db`` + ``normalizer.json`` + ``metadata.json``
     (``python -m dataset_preprocessor.export``).
@@ -28,8 +28,10 @@ vtk_reader.py
 from .dataset import (
     DeformingPlateDataset,
     PredecessorPairDataset,
+    RolloutWindowSampler,
     TrajectoryDataset,
     collate_with_predecessor,
 )
 
-__all__ = ["DeformingPlateDataset", "TrajectoryDataset", "PredecessorPairDataset", "collate_with_predecessor"]
+__all__ = ["DeformingPlateDataset", "TrajectoryDataset", "PredecessorPairDataset",
+           "RolloutWindowSampler", "collate_with_predecessor"]

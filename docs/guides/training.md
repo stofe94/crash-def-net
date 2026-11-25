@@ -28,15 +28,15 @@ or, without editing the file, on the command line:
 `python train/train.py --config examples/quick_start/train.toml --architecture meshgraphnets`.
 
 For own experiments, copy the example (e.g. to `configs/my_run.toml`) and adapt it. On
-the way to the paper setting, typically:
+the way to a full-size run on `deforming_plate`, typically:
 
 - `[data] data_dir`: a larger export (see [export](export.md)); `lazy = true` for splits
   that do not fit into RAM (static graph data then up to `static_cache_mb` per process,
   see [scaling](../concepts/scaling.md#loading-during-training))
-- `[model.mgn_t]`: the paper size of the results, `latent_size = 80`, `token_dim = 48`,
+- `[model.mgn_t]`: the size of the published results, `latent_size = 80`, `token_dim = 48`,
   `num_tokens = 16`, `num_pre_mp_steps = 2`, `num_post_mp_steps = 2`
   ([configuration](../results/deforming-plate.md#mgn-t-configuration));
-  `[model.meshgraphnets]`: paper size `latent_size = 128`, `num_message_passing_steps = 15`
+  `[model.meshgraphnets]`: the size of its paper, `latent_size = 128`, `num_message_passing_steps = 15`
 - `[training]`: more `epochs`, `device = "cuda"`, `num_dataloader_workers` 2–4 on a GPU
   machine
 - `[training.rollout_validation]`: `every_n_epochs` and `max_sequences` so that a
@@ -75,6 +75,8 @@ and neither static node features nor run parameters; for other data, change or r
 - With `--history 1`, the `<name>_prev` input of a result field follows that field.
 - The node type, `bc_velocity`, the velocity history (`--history`), rigid walls and the
   velocity target are always in: they are the state and the boundary conditions of a step.
+  So are the element properties on the mesh edges and the contact gap, where the export has
+  them (`--edge-fields`, `--contact-gap`).
 - The checkpoint stores the selection, so the rollout uses it by itself. `--resume` stops if
   the config selects other features than the checkpoint.
 - The [comparison protocol](../guides/comparison-protocol.md) fixes the features:
@@ -102,6 +104,37 @@ end_frame   = 100   # raw frame of the run: the last target
   in one pass over them, so that e.g. a jump at the first frame left out does not set the
   scale; static node features, run parameters, walls and edges keep those of the export. The
   checkpoint stores them.
+
+## Choose the training method
+
+Two methods ([training methods](../concepts/training.md#training-methods)), chosen by two
+sections of the config:
+
+```toml
+# One-step training: without both sections, or with both switched off.
+[noise]
+world_noise_std = 3e-3   # on the inputs, in the length unit of the data
+
+# One-step training with scheduled sampling (export with --history 1):
+[scheduled_sampling]
+enabled       = true
+start_ratio   = 1.0      # share of the nodes that keep the ground truth at the start
+end_ratio     = 0.3      # after the warmup
+warmup_epochs = 50
+steps         = 1        # predicted steps before the sample
+
+# Rollout training (export with --history 1), instead of scheduled sampling:
+[rollout_training]
+enabled = true
+steps   = 4              # steps of a window: the first from the ground truth
+```
+
+- Scheduled sampling and rollout training at once stop the training at its start.
+- With rollout training `batch_size` counts windows: with the same value an epoch has about
+  `steps` times fewer optimizer steps, each over about `steps` times as many samples. A
+  learning rate schedule per optimizer step (`exponential` with a fixed `decay_steps`) then
+  reaches the end of its decay later; `decay_steps = "auto"` and `cosine` follow the epochs.
+- The noise applies to both; with rollout training to the first step of every window.
 
 ## Output
 

@@ -1,7 +1,8 @@
 # Roll out a model
 
 A rollout applies a trained model to its own predictions, step after step over every
-trajectory of a split, and measures how far it drifts from the simulation. How a step is
+trajectory of a split, and measures how far it drifts from the simulation. New runs without
+a simulation result are prepared for it first ([predict new runs](prediction.md)). How a step is
 computed and which metrics it records: [rollout and metrics](../concepts/metrics.md). The
 [CrashDefNet app](app.md) runs it on the test split and shows the result.
 
@@ -115,4 +116,4 @@ Needs `pyvista`.
 ## Next steps
 
 - [Evaluate the run](evaluation.md#evaluate-a-run) from the rollout folder.
-- [Compare rollouts with the papers](evaluation.md#compare-with-the-papers).
+- [Compare rollouts with published results](evaluation.md#compare-with-published-results).

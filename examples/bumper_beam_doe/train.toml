@@ -1,0 +1,89 @@
+# ============================================================
+# CrashDefNet — bumper beam DoE (135 runs): training (MGN-T)
+# ============================================================
+# MGN-T in the size of the paper (v4, ~0.51 M parameters) on the export of
+# examples/bumper_beam_doe/export.toml, from the undeformed state over all 51 states. The
+# settings of the published results (docs/results/bumper-beam-doe.md): 25 epochs, batch 2,
+# ~7 h 20 min on one NVIDIA RTX A4000 (16 GB), GPU memory ~5.3 GB, RAM ~11.8 GB in the main
+# process.
+#
+#   python train/train.py --config examples/bumper_beam_doe/train.toml
+#
+# One sample has 18,712 nodes (4,880 of them the pole) and 74,640 mesh edges.
+# 108 runs x 50 samples = 5,400 samples per epoch. Every key: docs/reference/configuration.md.
+# ============================================================
+
+[data]
+data_dir               = "data/bumper_beam_doe"
+num_dataloader_workers = 3       # graphs built in 3 worker processes
+lazy                   = false   # the export (~3.7 GB) is held in memory
+# Features of the export this run uses: shell thickness and yield stress (each with its
+# marker *_given, as not every node has them) and every result field. No run parameters.
+local_features         = ["thickness", "yield_stress"]
+global_features        = []
+target_fields          = ["stress", "plastic_strain", "mean_stress", "bending_stress"]
+
+[model]
+architecture                = "mgn_t"
+residual_target             = true    # predict the change of velocity and of every result field
+world_edges                 = "self_contact_aware"
+world_edge_exclude_distance = 2.0
+
+[model.mgn_t]
+latent_size            = 80
+token_dim              = 48
+num_tokens             = 16
+num_heads              = 4
+num_transformer_blocks = 2
+num_pre_mp_steps       = 2
+num_post_mp_steps      = 2
+num_mlp_layers         = 2
+aggregation            = "sum"
+transformer_nodes      = "structure"   # the transformer sees the structure, not the pole
+tau_init               = 0.31
+pe_frequencies         = 4
+ffn_ratio              = 4
+
+[training]
+epochs        = 25
+batch_size    = 2
+learning_rate = 2e-4
+weight_decay  = 0.0
+max_grad_norm = 1.0
+seed          = 42
+device        = "auto"
+
+[training.scheduler]
+type   = "cosine"
+min_lr = 1e-6
+
+[training.rollout_validation]
+enabled        = true    # select the model by rollouts over whole val trajectories
+every_n_epochs = 1
+max_sequences  = 13      # all of val
+
+[training.early_stopping]
+enabled  = false         # no stop; the criteria select the model
+criteria = ["rollout_pos_rmse", "rollout_pos_rmse_final"]
+
+[loss]
+type                = "mse"
+edge_stretch_weight = 1.0   # length change of the mesh edges in a step, against the ground truth
+rigid_body_weight   = 1.0   # mean velocity of the rigid body: few nodes, most of the mass
+
+[noise]
+world_noise_std  = 0.05    # mm
+stress_noise_std = 0.005   # GPa
+
+[scheduled_sampling]
+enabled       = true
+start_ratio   = 1.0     # share of the samples that keep the ground truth at epoch 0
+end_ratio     = 0.3     # after the warmup
+warmup_epochs = 12
+steps         = 3       # inputs from a rollout of 3 steps
+
+[checkpointing]
+checkpoint_dir = "checkpoints/bumper_beam_doe_mgn_t"
+save_every     = 1
+log_every      = 1
+resume         = ""

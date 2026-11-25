@@ -16,11 +16,18 @@ Features per node and time step t (MeshGraphNets, Pfaff et al. 2021, App. A.1)
     data may have other fields, any number of them (e.g. plastic strain), or none.
 ``edge_attr`` (8), mesh edges from the cells (tetrahedra, or mixed VTK cell
 types: lines, triangles, quadrilaterals, tetrahedra, pyramids, wedges, hexahedra)
-    u_ij, |u_ij| (mesh space) + x_ij, |x_ij| (world space).
+    u_ij, |u_ij| (mesh space) + x_ij, |x_ij| (world space); with element properties on
+    the edges (export ``--edge-fields``, ``info.edge_static_names``) these follow, static,
+    e.g. the thickness and the yield stress of the elements next to the edge.
 ``world_edge_attr`` (4), world edges
     x_ij, |x_ij| for node pairs closer than the contact radius r_W. Which pairs
     qualify is selected by ``world_edges`` (see ``WORLD_EDGE_MODES``); the
-    paper takes all pairs that are not already mesh neighbours.
+    paper takes all pairs that are not already mesh neighbours. With the contact gap
+    (export ``--contact-gap``, ``info.contact_gap``) two more (6): the distance of the
+    receiver from the sender's surface along the sender's normal (``node_normals``), and
+    the clearance between the shell surfaces, that distance minus half of the two shell
+    thicknesses (``world_edge_features``). They need the shell faces (``data.face``) and
+    the thickness at the nodes (``data.contact_thickness``).
 ``loss_mask`` (N)
     every node except the actuator, whose motion is prescribed.
 ``target_given`` (N, T), only if nodes lack a result field
@@ -28,17 +35,19 @@ types: lines, triangles, quadrilaterals, tetrahedra, pyramids, wedges, hexahedra
 
 Relative vectors point from sender to receiver: v_ij = v[sender] - v[receiver].
 
-Optional history (``history = 1``, not in the paper)
-----------------------------------------------------
+Optional history (``history = 1``)
+----------------------------------
 Appends ``velocity_{x,y,z}_prev`` = x_t - x_{t-1} and, with ``prev_stress``,
 ``<field>_prev`` = the value of every result field at t (deforming_plate:
 ``stress_prev`` = σ_t). Each ``<name>_prev`` column pairs with the target
 ``<name>``; that pairing drives ``residual_target``, scheduled sampling and the
-rollout's feedback of predictions. The first frame has no predecessor, so
-samples start at t = 1.
+rollout's feedback of predictions. The first frame is a sample as well: its velocity
+input is the start velocity of the trajectory (``before_first_frame``), the initial
+velocity of the deck over one frame interval, at rest without one (exports without
+``first_frame``, up to v0.4.0, start at t = 1).
 
-Optional columns of general raw data (not in the paper), in this order
--------------------------------------------------------------------
+Optional columns of general raw data, in this order
+---------------------------------------------------
 * static node features of a run (e.g. ``thickness``, ``initial_velocity_x``),
   standardized over the train nodes;
 * run parameters (e.g. impact velocity) as constant columns ``global_<name>``,
@@ -87,6 +96,8 @@ MESH_EDGE_FEATURE_NAMES = [
     "world_dx", "world_dy", "world_dz", "world_dist",
 ]
 WORLD_EDGE_FEATURE_NAMES = ["world_dx", "world_dy", "world_dz", "world_dist"]
+# With the contact gap (export --contact-gap): the two columns after them.
+WORLD_GAP_FEATURE_NAMES = ["world_normal_dist", "world_clearance"]
 
 # ── cell types (VTK numbering, also used for the .vtu export) ───────────────
 CELL_LINE, CELL_TRIANGLE, CELL_QUAD = 3, 5, 9
@@ -575,8 +586,10 @@ def world_edges(world_pos: torch.Tensor, mesh_edge_index: torch.Tensor, radius: 
     pair set. With ``body_id`` only pairs of different bodies remain; with
     ``component`` (N,) and ``contact_pairs`` (P, 2) only pairs whose components
     are a listed pair, in either order. With ``batch`` (node -> graph index)
-    pairs are only formed inside the same graph.
+    pairs are only formed inside the same graph. The pairs are indices: positions that
+    carry gradients (rollout training) are searched without them.
     """
+    world_pos = world_pos.detach()
     device = world_pos.device
     num_nodes = world_pos.shape[0]
     edge_index = radius_pairs(world_pos, radius, batch)
@@ -609,19 +622,77 @@ def world_edges(world_pos: torch.Tensor, mesh_edge_index: torch.Tensor, radius: 
 
 def edge_features(mesh_edge_index: torch.Tensor, mesh_space_features: torch.Tensor,
                   world_pos: torch.Tensor, radius: float,
-                  batch: Optional[torch.Tensor] = None, **selection: torch.Tensor
+                  batch: Optional[torch.Tensor] = None, face: Optional[torch.Tensor] = None,
+                  contact_thickness: Optional[torch.Tensor] = None, **selection: torch.Tensor
                   ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Raw (unnormalized) edge features for the positions ``world_pos``.
 
     ``mesh_space_features`` (E_M, 4) is the static mesh-space part u_ij, |u_ij|
     of the mesh edges; ``selection`` the output of ``world_edge_selection``
-    (empty: paper variant). Returns ``mesh_edge_attr`` (E_M, 8),
-    ``world_edge_index`` (2, E_W) and ``world_edge_attr`` (E_W, 4).
+    (empty: paper variant); ``face`` and ``contact_thickness`` add the contact gap
+    (``world_edge_features``). Returns ``mesh_edge_attr`` (E_M, 8),
+    ``world_edge_index`` (2, E_W) and ``world_edge_attr`` (E_W, 4 or 6).
     """
     mesh_edge_attr = mesh_edge_features(mesh_edge_index, mesh_space_features, world_pos)
     world_edge_index = world_edges(world_pos, mesh_edge_index, radius, batch, **selection)
-    world_edge_attr = relative_features(world_pos, world_edge_index).float()
+    world_edge_attr = world_edge_features(world_pos, world_edge_index, face, contact_thickness)
     return mesh_edge_attr, world_edge_index, world_edge_attr
+
+
+def shell_faces(cells, cell_types=None) -> torch.Tensor:
+    """(3, F) triangles of the shell cells, quadrilaterals split in two, for the node
+    normals of the contact gap; empty without shells (tetrahedral meshes)."""
+    if cell_types is None:
+        return torch.empty(3, 0, dtype=torch.long)
+    cells = torch.from_numpy(np.array(cells, dtype=np.int64))   # a copy: DB buffers are read-only
+    cell_types = torch.from_numpy(np.array(cell_types))
+    triangles = cells[cell_types == CELL_TRIANGLE][:, :3]
+    quads = cells[cell_types == CELL_QUAD][:, :4]
+    faces = torch.cat((triangles, quads[:, [0, 1, 2]], quads[:, [0, 2, 3]]))
+    return faces.t().contiguous()
+
+
+def node_normals(pos: torch.Tensor, face: torch.Tensor) -> torch.Tensor:
+    """(N, 3) unit normal at every node: the dominant direction of the normals of the
+    shell faces around it, the eigenvector of the largest eigenvalue of their area-weighted
+    sum n n^T. Its sign is arbitrary, so faces of opposite orientation (parts meshed the
+    other way round) add up instead of cancelling. 0 at nodes without faces. Without
+    gradients: they flow through the edge vectors, not through the normals (``eigh`` has
+    none for repeated eigenvalues)."""
+    with torch.no_grad():
+        pos = pos.detach()
+        v0, v1, v2 = pos[face[0]], pos[face[1]], pos[face[2]]
+        doubled = torch.linalg.cross(v1 - v0, v2 - v0)           # length: twice the area
+        area = doubled.norm(dim=1)
+        unit = doubled / area.clamp(min=torch.finfo(pos.dtype).tiny)[:, None]
+        outer = area[:, None, None] * unit[:, :, None] * unit[:, None, :]   # (F, 3, 3)
+        moment = torch.zeros((pos.shape[0], 3, 3), dtype=pos.dtype, device=pos.device)
+        for corner in face:
+            moment.index_add_(0, corner, outer)
+        values, vectors = torch.linalg.eigh(moment)              # ascending eigenvalues
+        return vectors[:, :, -1] * (values[:, -1:] > 0)
+
+
+def world_edge_features(world_pos: torch.Tensor, world_edge_index: torch.Tensor,
+                        face: Optional[torch.Tensor] = None,
+                        contact_thickness: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Raw world edge features (E_W, 4): x_ij, |x_ij|; with the shell ``face`` (3, F) the
+    contact gap as well (E_W, 6): the distance of the receiver from the sender's surface
+    along the sender's normal (|x_ij . n_i|; |x_ij| at nodes without shell faces), and the
+    clearance between the shell surfaces, that distance minus half of the two thicknesses
+    ``contact_thickness`` (N,), 0 at nodes without one. Two nodes far apart on parallel
+    surfaces are close in it; a negative clearance is an overlap of the shells."""
+    relative = relative_features(world_pos, world_edge_index)
+    if face is None:
+        return relative.float()
+    sender, receiver = world_edge_index
+    normal = node_normals(world_pos, face)[sender]
+    distance = torch.where(normal.any(dim=1), (relative[:, :3] * normal).sum(dim=1).abs(),
+                           relative[:, 3])
+    clearance = distance
+    if contact_thickness is not None:
+        clearance = distance - 0.5 * (contact_thickness[sender] + contact_thickness[receiver])
+    return torch.cat((relative, distance[:, None], clearance[:, None]), dim=-1).float()
 
 
 def mesh_edge_features(mesh_edge_index: torch.Tensor, mesh_space_features: torch.Tensor,
@@ -645,7 +716,9 @@ def add_world_edges(data, normalizer, radius: float) -> None:
     index = world_edges(data.world_pos, data.edge_index, radius,
                         getattr(data, "batch", None), **selection)
     data.world_edge_index = index
-    data.world_edge_attr = (relative_features(data.world_pos, index).float()
+    data.world_edge_attr = (world_edge_features(data.world_pos, index,
+                                                getattr(data, "face", None),
+                                                getattr(data, "contact_thickness", None))
                             - world_mean) / world_std
 
 
@@ -719,8 +792,12 @@ def rebuild_edges(data, world_pos: torch.Tensor, normalizer, radius: float) -> N
                  if getattr(data, key, None) is not None}
     mesh_edge_attr, world_edge_index, world_edge_attr = edge_features(
         data.edge_index, mesh_space_features, world_pos, radius,
-        getattr(data, "batch", None), **selection)
-    data.edge_attr = (mesh_edge_attr - mesh_mean) / mesh_std
+        getattr(data, "batch", None), getattr(data, "face", None),
+        getattr(data, "contact_thickness", None), **selection)
+    # Columns after the geometric ones (element properties of the edges) do not move.
+    geometric = mesh_edge_attr.shape[1]
+    data.edge_attr = torch.cat(((mesh_edge_attr - mesh_mean[:geometric]) / mesh_std[:geometric],
+                                data.edge_attr[:, geometric:]), dim=-1)
     data.world_edge_index = world_edge_index
     data.world_edge_attr = (world_edge_attr - world_mean) / world_std
     wall_planes = getattr(data, "wall_planes", None)

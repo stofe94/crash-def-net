@@ -9,7 +9,8 @@ download to the trained model: [tutorial: bumper beam](../getting-started/bumper
 !!! warning "Early stage of development"
     The processing of OpenRadioss runs is at an early stage of development. It is verified on a
     real crash example, the runs of a bumper beam against a pole, exported, trained and rolled
-    out end to end ([results](../results/bumper-beam.md),
+    out end to end ([design of experiments](../results/bumper-beam-doe.md),
+    [results](../results/bumper-beam.md),
     [verification status](../concepts/graphs.md#general-meshes-and-run-parameters)).
 
 ## Export
@@ -39,7 +40,8 @@ Units follow the deck: kg, mm, ms give a stress in GPa.
 | Titles of `/RWALL` and `/RBODY` | parts of the d3plot with these titles are rigid parts: actuators, or predicted with `--free-rigid-parts` |
 | `/BCS` with all three translations fixed | clamped nodes |
 | `/INTER/TYPE2` on `/SURF/PART` | a mesh edge from every tied node to the nearest node of its surface |
-| `/INIVEL/TRA` | the initial velocity, also on `/GRNOD/PART`; a tied node takes that of its surface. With `--history 1` the velocity input of the first frame, so that a rollout starts from the undeformed state ([optional history](../concepts/graphs.md#optional-history-history-1-not-in-the-paper)) |
+| `/INIVEL/TRA` | the initial velocity, also on `/GRNOD/PART`; a tied node takes that of its surface. With `--history 1` the velocity input of the first frame, so that a rollout starts from the undeformed state ([optional history](../concepts/graphs.md#optional-history-history-1)) |
+| `/MAT/ELAST`, `/MAT/PLAS_JOHNS` (`LAW1`, `LAW2`) of every `/PART` | the static node features `density`, `youngs_modulus`, `poisson_ratio` and, for `PLAS_JOHNS`, `yield_stress` (first field of its third card), when `--static-fields` names them; averaged at the nodes over the elements of these parts |
 
 The conversion may give several parts the same ID; they are told apart by their titles. It may
 also write the display models of walls and sections as shells, which stay in the mesh: shells
@@ -49,20 +51,24 @@ e.g. `--exclude-parts "New SECT 1"`; a wall of the deck stays when its display m
 
 Not read: other wall types, moving walls, other kinds of `/INIVEL` and velocities in a skew
 frame, node groups other than `/GRNOD/NODE` and `/GRNOD/GRNOD` (for `/INIVEL` also
-`/GRNOD/PART`), surfaces other than `/SURF/PART` and `#include`. The deformation, the results,
-the elements and the parts come from the d3plot, read as for LS-DYNA runs
-([the d3plot reader](ls-dyna.md#the-d3plot-reader)).
+`/GRNOD/PART`), surfaces other than `/SURF/PART`, other material laws and `#include`. The
+deformation, the results, the elements and the parts come from the d3plot, read as for
+LS-DYNA runs ([the d3plot reader](ls-dyna.md#the-d3plot-reader)).
 
 ## A pole as contact partner
 
 A wall of the deck reaches the model through the node features. For a pole that acts through
 [contact edges](../concepts/graphs.md#world-edge-variants-model-world_edges) instead,
-`utils/remesh_pole.py` writes the runs of
-[BumperBeamCrashExample](https://huggingface.co/datasets/AIRBORNEPANDA/BumperBeamCrashExample)
-as a second raw dataset: a meshed cylinder surface takes the place of the display model of the
-pole. A run whose conversion left the display models out gets the surface as a new part, titled
-as the `/RWALL` of the deck. All else stays identical, and every run is read back and compared
-with the original; only a missing version in the header is set, as ParaView's LS-DYNA reader
-needs it. The data are then derived, no longer those of the solver. Export them with `--no-deck-walls`; options:
-[remesh_pole](../reference/cli.md#remesh_pole), the whole chain:
+`utils/remesh_pole.py` writes the runs as a second raw dataset: a meshed cylinder surface
+takes the place of the display model of the pole, as for
+[BumperBeamCrashExample](https://huggingface.co/datasets/AIRBORNEPANDA/BumperBeamCrashExample).
+A run whose conversion left the display models out, as those of
+[OpenRadioss-BumperBeam-DoE135](https://huggingface.co/datasets/stofe94/OpenRadioss-BumperBeam-DoE135),
+gets the surface as a new part, titled as the `/RWALL` of the deck. All else stays identical,
+and every run is read back and compared with the original; only a missing version in the
+header is set, as ParaView's LS-DYNA reader needs it. The data are then derived, no longer
+those of the solver. Export them with `--no-deck-walls`, or keep the walls: then the nodes
+also get the signed distance to the analytic cylinder of the deck
+([rigid walls](../concepts/graphs.md#general-meshes-and-run-parameters)), next to the contact
+edges to its mesh; options: [remesh_pole](../reference/cli.md#remesh_pole), the whole chain:
 [tutorial](../getting-started/bumper-beam.md#2-mesh-the-pole).
